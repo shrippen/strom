@@ -139,6 +139,10 @@ struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Address to bind the HTTP(S) listener to (default: 0.0.0.0, all interfaces)
+    #[arg(long, env = "STROM_HOST")]
+    host: Option<std::net::IpAddr>,
+
     /// Port to listen on
     #[arg(short, long, env = "STROM_PORT")]
     port: Option<u16>,
@@ -306,6 +310,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load configuration early to get log_file setting
     let config = Config::from_figment(
+        args.host,
         args.port,
         args.data_dir.clone(),
         args.flows_path.clone(),
@@ -566,7 +571,7 @@ fn run_with_gui(
         .await;
 
         // Start server - bind to 0.0.0.0 to be accessible from all interfaces
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        let addr = SocketAddr::from((config.host, config.port));
 
         let tls_config = setup_tls(&config).await;
 
@@ -787,7 +792,7 @@ async fn run_headless(
     .await;
 
     // Start server - bind to 0.0.0.0 to be accessible from all interfaces (Docker, network, etc.)
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = SocketAddr::from((config.host, config.port));
 
     let tls_config = setup_tls(&config).await;
 
