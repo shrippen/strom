@@ -37,6 +37,9 @@ static VIDEO_CONVERT_MODE: OnceLock<VideoConvertMode> = OnceLock::new();
 /// Global GL renderer info, probed once at startup.
 static GL_RENDERER_INFO: OnceLock<Option<GlRendererInfo>> = OnceLock::new();
 
+/// Set to `1` to skip GPU detection and always use software conversion.
+const FORCE_SOFTWARE_CONVERT_ENV: &str = "STROM_FORCE_SOFTWARE_CONVERT";
+
 /// Get the detected video conversion mode.
 /// Panics if called before `detect_gpu_capabilities()`.
 pub fn video_convert_mode() -> VideoConvertMode {
@@ -229,6 +232,19 @@ pub fn detect_gpu_capabilities() -> VideoConvertMode {
     if is_wsl() {
         info!("WSL detected - using software video conversion (CUDA-GL interop unsupported)");
         // deprioritize_nv_decoders();
+        let mode = VideoConvertMode::Software;
+        let _ = VIDEO_CONVERT_MODE.set(mode);
+        return mode;
+    }
+
+    // Explicit override, for hosts where the CUDA-GL probe passes but
+    // autovideoconvert then fails to negotiate (not-negotiated on every
+    // vision mixer input with GStreamer 1.28).
+    if std::env::var(FORCE_SOFTWARE_CONVERT_ENV).is_ok_and(|v| v == "1") {
+        info!(
+            "{}=1 - using software video conversion",
+            FORCE_SOFTWARE_CONVERT_ENV
+        );
         let mode = VideoConvertMode::Software;
         let _ = VIDEO_CONVERT_MODE.set(mode);
         return mode;
