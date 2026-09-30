@@ -19,7 +19,7 @@ fn vision_mixer_definition() -> BlockDefinition {
             name: "compositor_preference".to_string(),
             label: "Backend".to_string(),
             description:
-                "Compositor backend: Auto (GPU first, fallback to CPU), GPU Only, or CPU Only"
+                "Compositor backend: Auto (GPU first, fallback to CPU), GPU Only, CUDA (NVIDIA), or CPU Only"
                     .to_string(),
             property_type: PropertyType::Enum {
                 values: vec![
@@ -30,6 +30,10 @@ fn vision_mixer_definition() -> BlockDefinition {
                     EnumValue {
                         value: "gpu".to_string(),
                         label: Some("GPU Only (OpenGL)".to_string()),
+                    },
+                    EnumValue {
+                        value: "cuda".to_string(),
+                        label: Some("CUDA (NVIDIA)".to_string()),
                     },
                     EnumValue {
                         value: "cpu".to_string(),

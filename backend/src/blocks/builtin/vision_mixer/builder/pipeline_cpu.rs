@@ -1,4 +1,9 @@
-//! CPU pipeline build path: compositor-based, no GL.
+//! CPU and CUDA pipeline build path: compositor-based, no GL.
+//!
+//! Both backends share one topology. CPU: `compositor` in system memory,
+//! `videoconvert` on inputs. CUDA: `cudacompositor` in CUDA memory,
+//! `cudaupload` on inputs (passthrough for NVDEC's CUDA frames), optional
+//! `cudadownload` on the outputs when `gl_download` is set.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -6,6 +11,7 @@ use gstreamer_app as gst_app;
 use strom_types::element::ElementPadRef;
 use tracing::info;
 
+use super::super::elements::CompositorBackend;
 use super::super::{elements, layout};
 use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
@@ -73,10 +79,14 @@ pub(super) fn build_cpu_pipeline(
         ElementPadRef::pad(&cf_dist_id, "src"),
         ElementPadRef::pad(&tee_pgm_id, "sink"),
     ));
-    links.push((
-        ElementPadRef::pad(&tee_pgm_id, "src_0"),
-        ElementPadRef::pad(&q_dist_out_id, "sink"),
-    ));
+    push_output_link(
+        p,
+        &tee_pgm_id,
+        "cudadownload_dist",
+        &q_dist_out_id,
+        &mut elems,
+        &mut links,
+    )?;
 
     // Queue + capsfilter to decouple tee_pgm from the multiview compositor.
     // The capsfilter breaks the caps negotiation cycle: PGM compositor → tee →
@@ -98,7 +108,12 @@ pub(super) fn build_cpu_pipeline(
     elems.push((cf_pgm_mv_id.clone(), capsfilter_pgm_mv));
 
     // DSK input element chains (links to mixer added later after video inputs)
-    let vc_factory = gpu::video_convert_mode().element_name();
+    let vc_factory = match p.backend {
+        CompositorBackend::Cuda => CUDA_UPLOAD,
+        CompositorBackend::OpenGL | CompositorBackend::Software => {
+            gpu::video_convert_mode().element_name()
+        }
+    };
     for i in 0..p.num_dsk_inputs {
         let q_id = p.id(&format!("queue_dsk_{}", i));
         let vc_id_dsk = p.id(&format!("videoconvert_dsk_{}", i));
@@ -123,12 +138,7 @@ pub(super) fn build_cpu_pipeline(
             let cf_dsk_id = p.id(&format!("capsfilter_dsk_{}", i));
             let capsfilter_dsk = gst::ElementFactory::make("capsfilter")
                 .name(&cf_dsk_id)
-                .property(
-                    "caps",
-                    gst::Caps::builder("video/x-raw")
-                        .field("format", fmt.as_str())
-                        .build(),
-                )
+                .property("caps", p.format_caps(fmt))
                 .build()
                 .map_err(|e| {
                     BlockBuildError::ElementCreation(format!("capsfilter_dsk_{}: {}", i, e))
@@ -141,7 +151,7 @@ pub(super) fn build_cpu_pipeline(
         }
     }
 
-    // --- Multiview output chain (no gldownload needed for CPU) ---
+    // --- Multiview output chain (download only for CUDA with gl_download) ---
     // Overlay is composited by mv_comp via appsrc pad (see below).
     // capsfilter_mv forces resolution (and optional pixel format) on the mv compositor output.
     let cf_mv_id = p.id("capsfilter_mv");
@@ -167,12 +177,17 @@ pub(super) fn build_cpu_pipeline(
         ElementPadRef::pad(&cf_mv_id, "src"),
         ElementPadRef::pad(&tee_mv_id, "sink"),
     ));
-    links.push((
-        ElementPadRef::pad(&tee_mv_id, "src_0"),
-        ElementPadRef::pad(&q_mv_out_id, "sink"),
-    ));
+    push_output_link(
+        p,
+        &tee_mv_id,
+        "cudadownload_mv",
+        &q_mv_out_id,
+        &mut elems,
+        &mut links,
+    )?;
 
-    // --- Overlay appsrc → mv_comp (CPU compositor accepts raw BGRA directly) ---
+    // --- Overlay appsrc → mv_comp (CPU compositor accepts raw BGRA directly;
+    // CUDA uploads it through vc_factory) ---
     let appsrc_overlay_id = p.id("appsrc_overlay");
     let overlay_caps_str = format!(
         "video/x-raw,format=RGBA,width={},height={},pixel-aspect-ratio=1/1,framerate={}/{},interlace-mode=progressive,multiview-mode=mono",
@@ -205,12 +220,7 @@ pub(super) fn build_cpu_pipeline(
         let cf_overlay_id = p.id("capsfilter_overlay");
         let capsfilter_overlay = gst::ElementFactory::make("capsfilter")
             .name(&cf_overlay_id)
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("format", fmt.as_str())
-                    .build(),
-            )
+            .property("caps", p.format_caps(fmt))
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("capsfilter_overlay: {}", e)))?;
         elems.push((cf_overlay_id.clone(), capsfilter_overlay));
@@ -287,6 +297,14 @@ pub(super) fn build_cpu_pipeline(
                 ElementPadRef::pad(&src_id, "src"),
                 ElementPadRef::pad(&cf_id, "sink"),
             ));
+            if p.backend == CompositorBackend::Cuda {
+                let up_id = p.id(&format!("{}_upload", name));
+                elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
+                links.push((
+                    ElementPadRef::pad(&cf_id, "src"),
+                    ElementPadRef::pad(&up_id, "sink"),
+                ));
+            }
         }
     }
     // Links to the compositor pads are added below in pad-index order.
@@ -310,12 +328,7 @@ pub(super) fn build_cpu_pipeline(
             let cf_in_id = p.id(&format!("capsfilter_in_{}", i));
             let capsfilter_in = gst::ElementFactory::make("capsfilter")
                 .name(&cf_in_id)
-                .property(
-                    "caps",
-                    gst::Caps::builder("video/x-raw")
-                        .field("format", fmt.as_str())
-                        .build(),
-                )
+                .property("caps", p.format_caps(fmt))
                 .build()
                 .map_err(|e| {
                     BlockBuildError::ElementCreation(format!("capsfilter_in_{}: {}", i, e))
@@ -419,7 +432,7 @@ pub(super) fn build_cpu_pipeline(
     // lands at sink_{num_inputs + num_dsk_inputs + i}.
     if p.num_pips > 0 {
         for i in 0..p.num_inputs {
-            let cf_id = p.id(&format!("underlay_dist_{}_caps", i));
+            let cf_id = underlay_out(p, &format!("underlay_dist_{}", i));
             links.push((
                 ElementPadRef::pad(&cf_id, "src"),
                 ElementPadRef::pad(
@@ -500,7 +513,7 @@ pub(super) fn build_cpu_pipeline(
     if p.num_pips > 0 {
         let mv_underlay_base = overlay_pad_idx + 1;
         for i in 0..p.num_inputs {
-            let cf_id = p.id(&format!("underlay_pvw_{}_caps", i));
+            let cf_id = underlay_out(p, &format!("underlay_pvw_{}", i));
             links.push((
                 ElementPadRef::pad(&cf_id, "src"),
                 ElementPadRef::pad(&mv_comp_id, format!("sink_{}", mv_underlay_base + i)),
@@ -508,7 +521,7 @@ pub(super) fn build_cpu_pipeline(
         }
         for pip_idx in 0..p.num_pips {
             for i in 0..p.num_inputs {
-                let cf_id = p.id(&format!("underlay_pip_{}_{}_caps", pip_idx, i));
+                let cf_id = underlay_out(p, &format!("underlay_pip_{}_{}", pip_idx, i));
                 let sink_idx = mv_underlay_base + p.num_inputs * (1 + pip_idx) + i;
                 links.push((
                     ElementPadRef::pad(&cf_id, "src"),
@@ -563,8 +576,8 @@ pub(super) fn build_cpu_pipeline(
     ));
 
     info!(
-        "Vision mixer CPU pipeline built: {} inputs, PGM={}x{}, MV={}x{}",
-        p.num_inputs, p.pgm_w, p.pgm_h, p.mv_w, p.mv_h
+        "Vision mixer {:?} pipeline built: {} inputs, PGM={}x{}, MV={}x{}",
+        p.backend, p.num_inputs, p.pgm_w, p.pgm_h, p.mv_w, p.mv_h
     );
 
     Ok(BlockBuildResult {
@@ -573,4 +586,52 @@ pub(super) fn build_cpu_pipeline(
         bus_message_handler,
         pad_properties,
     })
+}
+
+/// Uploads system (and passes through CUDA) memory for `cudacompositor`.
+const CUDA_UPLOAD: &str = "cudaupload";
+
+/// Last element of a border underlay chain: the upload on CUDA, else the
+/// capsfilter.
+fn underlay_out(p: &PipelineParams, name: &str) -> String {
+    match p.backend {
+        CompositorBackend::Cuda => p.id(&format!("{}_upload", name)),
+        CompositorBackend::OpenGL | CompositorBackend::Software => p.id(&format!("{}_caps", name)),
+    }
+}
+
+/// Link an output tee to its external queue.
+///
+/// CUDA with `gl_download` splices a `cudadownload` in between, so the
+/// output carries system memory. Everything else links directly.
+fn push_output_link(
+    p: &PipelineParams,
+    tee_id: &str,
+    download_name: &str,
+    queue_id: &str,
+    elems: &mut Vec<(String, gst::Element)>,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) -> Result<(), BlockBuildError> {
+    if p.backend != CompositorBackend::Cuda || !p.gl_download {
+        links.push((
+            ElementPadRef::pad(tee_id, "src_0"),
+            ElementPadRef::pad(queue_id, "sink"),
+        ));
+        return Ok(());
+    }
+
+    let dl_id = p.id(download_name);
+    elems.push((
+        dl_id.clone(),
+        elements::make_element("cudadownload", &dl_id)?,
+    ));
+    links.push((
+        ElementPadRef::pad(tee_id, "src_0"),
+        ElementPadRef::pad(&dl_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&dl_id, "src"),
+        ElementPadRef::pad(queue_id, "sink"),
+    ));
+    Ok(())
 }

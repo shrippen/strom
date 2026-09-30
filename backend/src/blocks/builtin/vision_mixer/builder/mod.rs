@@ -2,7 +2,8 @@
 //!
 //! Sub-modules:
 //!   - [`pipeline_gpu`] — `build_gpu_pipeline` (glvideomixer-based)
-//!   - [`pipeline_cpu`] — `build_cpu_pipeline` (compositor-based, no GL)
+//!   - [`pipeline_cpu`] — `build_cpu_pipeline` (compositor-based, no GL; also
+//!     the CUDA backend, which has the same topology in CUDA memory)
 //!   - [`audio_meter`] — per-input + PGM `level` element chains and bus handler
 //!   - [`pad_layout`]  — compositor sink-pad initial geometry/zorder/alpha
 
@@ -26,6 +27,9 @@ mod audio_meter;
 mod pad_layout;
 mod pipeline_cpu;
 mod pipeline_gpu;
+
+/// Caps feature of CUDA device memory (NVIDIA `nvcodec` elements).
+const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
 
 /// Vision Mixer block builder.
 pub struct VisionMixerBuilder;
@@ -198,7 +202,9 @@ impl BlockBuilder for VisionMixerBuilder {
 
         match backend {
             CompositorBackend::OpenGL => pipeline_gpu::build_gpu_pipeline(&p, ctx),
-            CompositorBackend::Software => pipeline_cpu::build_cpu_pipeline(&p, ctx),
+            CompositorBackend::Software | CompositorBackend::Cuda => {
+                pipeline_cpu::build_cpu_pipeline(&p, ctx)
+            }
         }
     }
 }
@@ -243,9 +249,38 @@ impl<'a> PipelineParams<'a> {
         format!("{}:{}", self.instance_id, name)
     }
 
+    /// Caps feature of the compositor's native memory, if not system memory.
+    /// Only the CUDA backend needs one here: the GL builder spells out its
+    /// GL-memory caps itself.
+    fn memory_feature(&self) -> Option<&'static str> {
+        match self.backend {
+            CompositorBackend::Cuda => Some(CUDA_MEMORY_FEATURE),
+            CompositorBackend::OpenGL | CompositorBackend::Software => None,
+        }
+    }
+
+    /// Raw video caps in the compositor's native memory.
+    fn raw_caps(&self) -> gst::caps::Builder<gst::caps::NoFeature> {
+        gst::Caps::builder("video/x-raw")
+    }
+
+    /// Finish a caps builder, tagging it with the backend's memory feature.
+    fn finish_caps(&self, builder: gst::caps::Builder<gst::caps::NoFeature>) -> gst::Caps {
+        match self.memory_feature() {
+            Some(feature) => builder.features([feature]).build(),
+            None => builder.build(),
+        }
+    }
+
+    /// Caps pinning only the pixel format (input, DSK and overlay chains).
+    pub(super) fn format_caps(&self, format: &str) -> gst::Caps {
+        self.finish_caps(self.raw_caps().field("format", format))
+    }
+
     /// Build PGM output caps with resolution, framerate, and optional pixel format.
     pub(super) fn pgm_caps(&self) -> gst::Caps {
-        let mut builder = gst::Caps::builder("video/x-raw")
+        let mut builder = self
+            .raw_caps()
             .field("width", self.pgm_w as i32)
             .field("height", self.pgm_h as i32)
             .field(
@@ -256,12 +291,13 @@ impl<'a> PipelineParams<'a> {
         if let Some(ref fmt) = self.output_format {
             builder = builder.field("format", fmt.as_str());
         }
-        builder.build()
+        self.finish_caps(builder)
     }
 
     /// Build multiview output caps with resolution, framerate, and optional pixel format.
     pub(super) fn mv_caps(&self) -> gst::Caps {
-        let mut builder = gst::Caps::builder("video/x-raw")
+        let mut builder = self
+            .raw_caps()
             .field("width", self.mv_w as i32)
             .field("height", self.mv_h as i32)
             .field(
@@ -272,7 +308,7 @@ impl<'a> PipelineParams<'a> {
         if let Some(ref fmt) = self.output_format {
             builder = builder.field("format", fmt.as_str());
         }
-        builder.build()
+        self.finish_caps(builder)
     }
 
     /// Build PGM output caps for the GL-memory passthrough path.

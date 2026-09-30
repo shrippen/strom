@@ -10,7 +10,25 @@ use tracing::{debug, info, trace};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompositorBackend {
     OpenGL,
+    /// NVIDIA `cudacompositor`. Frames stay in CUDA memory from NVDEC to
+    /// NVENC; no shader FX (wipes fall back to fade, like the CPU backend).
+    Cuda,
     Software,
+}
+
+/// Compositor factory per backend.
+const GL_COMPOSITOR: &str = "glvideomixerelement";
+const CUDA_COMPOSITOR: &str = "cudacompositor";
+const CPU_COMPOSITOR: &str = "compositor";
+
+impl CompositorBackend {
+    fn compositor_factory(self) -> &'static str {
+        match self {
+            CompositorBackend::OpenGL => GL_COMPOSITOR,
+            CompositorBackend::Cuda => CUDA_COMPOSITOR,
+            CompositorBackend::Software => CPU_COMPOSITOR,
+        }
+    }
 }
 
 /// Determine which compositor backend to use.
@@ -23,6 +41,16 @@ pub fn select_backend(preference: &str) -> Result<CompositorBackend, BlockBuildE
                 Err(BlockBuildError::ElementCreation(
                     "GPU backend requested but glvideomixerelement not available".to_string(),
                 ))
+            }
+        }
+        "cuda" => {
+            if gst::ElementFactory::find(CUDA_COMPOSITOR).is_some() {
+                Ok(CompositorBackend::Cuda)
+            } else {
+                Err(BlockBuildError::ElementCreation(format!(
+                    "CUDA backend requested but {} not available",
+                    CUDA_COMPOSITOR
+                )))
             }
         }
         "cpu" => Ok(CompositorBackend::Software),
@@ -47,10 +75,7 @@ pub fn make_dist_compositor(
     latency_ms: u64,
     min_upstream_latency_ms: u64,
 ) -> Result<gst::Element, BlockBuildError> {
-    let element_type = match backend {
-        CompositorBackend::OpenGL => "glvideomixerelement",
-        CompositorBackend::Software => "compositor",
-    };
+    let element_type = backend.compositor_factory();
 
     let mixer = gst::ElementFactory::make(element_type)
         .name("mixer")
@@ -76,10 +101,7 @@ pub fn make_mv_compositor(
     latency_ms: u64,
     min_upstream_latency_ms: u64,
 ) -> Result<gst::Element, BlockBuildError> {
-    let element_type = match backend {
-        CompositorBackend::OpenGL => "glvideomixerelement",
-        CompositorBackend::Software => "compositor",
-    };
+    let element_type = backend.compositor_factory();
 
     let mixer = gst::ElementFactory::make(element_type)
         .name("mv_comp")
@@ -219,6 +241,7 @@ pub fn suppress_latency_query(queue: &gst::Element) {
 fn backend_name(backend: CompositorBackend) -> &'static str {
     match backend {
         CompositorBackend::OpenGL => "OpenGL",
+        CompositorBackend::Cuda => "CUDA",
         CompositorBackend::Software => "Software",
     }
 }
