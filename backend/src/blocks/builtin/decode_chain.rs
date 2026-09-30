@@ -120,23 +120,42 @@ pub(crate) fn link_raw_video_through_deinterlace(
     Ok(())
 }
 
+/// One element of a deinterlace chain; `caps` makes it a capsfilter.
+type Step = (&'static str, Option<&'static str>);
+
+/// RGBA in CUDA memory: `glcolorconvert` rejects interlaced input, so the
+/// conversion for `gldeinterlace` happens in CUDA.
+const CUDA_RGBA: &str = "video/x-raw(memory:CUDAMemory),format=RGBA";
+/// `cudadownload` copies into GL on the GPU when asked for GL memory.
+const GL_RGBA: &str = "video/x-raw(memory:GLMemory),format=RGBA";
+
 /// Deinterlace chain for frames in `caps`' memory.
 ///
 /// VA surfaces stay on the GPU (`vadeinterlace`, unverified: no AMD/Intel
-/// test hardware yet). There is no CUDA deinterlacer in GStreamer, so CUDA
-/// and GL frames are downloaded first — only for interlaced sources.
-fn deinterlace_chain(caps: &gst::CapsRef) -> Vec<&'static str> {
+/// test hardware yet). There is no CUDA deinterlacer in GStreamer; CUDA
+/// frames go to GL on the GPU and through `gldeinterlace` (greedyh):
+/// measured ~0% CPU vs ~24% of a core for download + yadif per 1080i
+/// stream. Unlike yadif it keeps the frame rate (no field doubling). GL
+/// frames are downloaded for yadif (glcolorconvert rejects interlaced
+/// caps). Only interlaced sources get a chain at all.
+fn deinterlace_chain(caps: &gst::CapsRef) -> Vec<Step> {
     let has = |feature: &str| caps.features(0).is_some_and(|f| f.contains(feature));
     if has(VA_MEMORY_FEATURE) {
-        return vec!["vadeinterlace"];
+        return vec![("vadeinterlace", None)];
     }
     if has(CUDA_MEMORY_FEATURE) {
-        return vec!["cudadownload", "deinterlace"];
+        return vec![
+            ("cudaconvert", None),
+            ("capsfilter", Some(CUDA_RGBA)),
+            ("cudadownload", None),
+            ("capsfilter", Some(GL_RGBA)),
+            ("gldeinterlace", None),
+        ];
     }
     if has(GL_MEMORY_FEATURE) {
-        return vec!["gldownload", "deinterlace"];
+        return vec![("gldownload", None), ("deinterlace", None)];
     }
-    vec!["deinterlace"]
+    vec![("deinterlace", None)]
 }
 
 /// Insert the deinterlace chain between `src_pad` and its current peer.
@@ -149,11 +168,17 @@ fn splice_deinterlace(
     let peer = src_pad.peer().ok_or("source pad has no peer")?;
 
     let mut chain = Vec::new();
-    for factory in deinterlace_chain(caps) {
+    for (i, (factory, filter)) in deinterlace_chain(caps).into_iter().enumerate() {
         let element = gst::ElementFactory::make(factory)
-            .name(format!("{}_{}", name_prefix, factory))
+            .name(format!("{}_{}{}", name_prefix, factory, i))
             .build()
             .map_err(|e| format!("{}: {}", factory, e))?;
+        if let Some(filter) = filter {
+            let filter: gst::Caps = filter
+                .parse()
+                .map_err(|e| format!("caps {}: {}", filter, e))?;
+            element.set_property("caps", filter);
+        }
         if element.find_property("mode").is_some() {
             element.set_property_from_str("mode", "interlaced");
         }
@@ -161,6 +186,9 @@ fn splice_deinterlace(
         // detail and leaves residual artifacts on broadcast content.
         if factory == "deinterlace" {
             element.set_property_from_str("method", "yadif");
+        }
+        if factory == "gldeinterlace" {
+            element.set_property_from_str("method", "greedyh");
         }
         chain.push(element);
     }
@@ -239,7 +267,12 @@ mod tests {
 
     #[test]
     fn deinterlacer_follows_the_memory_type() {
-        let chain = |s: &str| deinterlace_chain(&caps(s));
+        let chain = |s: &str| {
+            deinterlace_chain(&caps(s))
+                .into_iter()
+                .map(|(factory, _)| factory)
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(chain("video/x-raw,format=NV12"), ["deinterlace"]);
         assert_eq!(
@@ -248,7 +281,13 @@ mod tests {
         );
         assert_eq!(
             chain("video/x-raw(memory:CUDAMemory),format=NV12"),
-            ["cudadownload", "deinterlace"]
+            [
+                "cudaconvert",
+                "capsfilter",
+                "cudadownload",
+                "capsfilter",
+                "gldeinterlace"
+            ]
         );
         assert_eq!(
             chain("video/x-raw(memory:GLMemory),format=RGBA"),
