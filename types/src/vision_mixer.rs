@@ -82,7 +82,7 @@ pub const DEFAULT_NUM_INPUTS: usize = 4;
 /// ceiling. The multiview thumbnail grid scales rows dynamically so any value
 /// in `[MIN_NUM_INPUTS, MAX_NUM_INPUTS]` produces a usable layout (smaller
 /// thumbnails for larger N).
-pub const MAX_NUM_INPUTS: usize = 16;
+pub const MAX_NUM_INPUTS: usize = 32;
 
 /// Minimum number of video inputs.
 pub const MIN_NUM_INPUTS: usize = 2;
