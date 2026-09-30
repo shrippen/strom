@@ -340,18 +340,12 @@ fn test_encoder_property_setting_nvenc() {
         let bitrate: u32 = encoder.property("bitrate");
         assert_eq!(bitrate, 4000, "Bitrate should be set for {}", encoder_name);
 
-        // Verify rate control property exists and is set correctly
-        let rc_property = if encoder_name.starts_with("nvautogpu") {
-            "rate-control"
-        } else {
-            "rc-mode"
-        };
-
+        // Verify a rate control property exists ("rate-control" on
+        // nvautogpu* before GStreamer 1.28, "rc-mode" everywhere else)
         assert!(
-            encoder.has_property(rc_property),
-            "{} should have {} property",
-            encoder_name,
-            rc_property
+            encoder.has_property("rc-mode") || encoder.has_property("rate-control"),
+            "{} should have a rate control property",
+            encoder_name
         );
     }
 }

@@ -492,11 +492,12 @@ fn set_encoder_properties(
         };
         encoder.set_property_from_str("preset", preset_nick);
 
-        // Rate control property name differs between nvautogpu* and regular nv* encoders
-        let rc_property = if encoder_name.starts_with("nvautogpu") {
-            "rate-control"
-        } else {
+        // Rate control property name differs between encoder generations:
+        // nvautogpu* used "rate-control" before GStreamer 1.28, "rc-mode" since.
+        let rc_property = if encoder.find_property("rc-mode").is_some() {
             "rc-mode"
+        } else {
+            "rate-control"
         };
         let rc_nick = match rate_control {
             RateControl::CQP => "cqp",
