@@ -117,8 +117,12 @@ fn detect_gl_renderer() -> Option<GlRendererInfo> {
     const GL_VERSION: u32 = 0x1F02;
     const GL_SHADING_LANGUAGE_VERSION: u32 = 0x8B8C;
 
+    // The GLMemory capsfilter is required: without it, GStreamer 1.28's
+    // glupload negotiates DMABuf output towards an unconstrained appsink,
+    // the buffer carries no GL context and the probe reports "no GL".
     let pipeline = gst::parse::launch(
-        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! glupload ! appsink name=sink",
+        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! glupload ! \
+         video/x-raw(memory:GLMemory) ! appsink name=sink",
     )
     .map_err(|e| warn!("GL probe: failed to create pipeline: {}", e))
     .ok()?;
@@ -367,5 +371,13 @@ mod tests {
             "autovideoconvert"
         );
         assert_eq!(VideoConvertMode::Software.element_name(), "videoconvert");
+    }
+
+    /// Run with `cargo test -- --ignored` on a host with a hardware GL driver.
+    #[test]
+    #[ignore = "needs a hardware GL driver"]
+    fn test_gl_probe_finds_renderer() {
+        gst::init().unwrap();
+        assert!(detect_gl_renderer().is_some());
     }
 }
