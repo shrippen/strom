@@ -12,6 +12,12 @@
 //!            → capsfilter(GL,RGBA,WxH) → gldownload
 //!            → capsfilter(RGBA,WxH) → appsink
 //!
+//! CUDA path:
+//! [tee] ─┬─ (passthrough)
+//!         └─ queue ─[pad probe: rate limit]─→ cudaconvertscale
+//!            → capsfilter(CUDA,RGBA,WxH) → cudadownload
+//!            → capsfilter(RGBA,WxH) → appsink
+//!
 //! Non-GL path:
 //! [tee] ─┬─ (passthrough)
 //!         └─ queue ─[pad probe: rate limit]─→ videoconvertscale
@@ -35,6 +41,32 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use crate::gst::thumbnail::ThumbnailError;
+
+const GL_MEMORY_FEATURE: &str = "memory:GLMemory";
+const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
+
+/// Where the tapped frames live; picks the branch's scaler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapMemory {
+    System,
+    Gl,
+    Cuda,
+}
+
+impl TapMemory {
+    fn of(caps: &gst::CapsRef) -> Self {
+        let Some(features) = caps.features(0) else {
+            return Self::System;
+        };
+        if features.contains(GL_MEMORY_FEATURE) {
+            return Self::Gl;
+        }
+        if features.contains(CUDA_MEMORY_FEATURE) {
+            return Self::Cuda;
+        }
+        Self::System
+    }
+}
 
 /// Configuration for a thumbnail tap.
 #[derive(Debug, Clone)]
@@ -227,17 +259,17 @@ impl ThumbnailTap {
             .build()
             .map_err(|e| ThumbnailError::FrameMapping(format!("queue: {}", e)))?;
 
-        // Check if the tee outputs GL memory — if so, scale on GPU before downloading.
-        let is_gl = self
-            .tee
-            .static_pad("sink")
-            .and_then(|p| p.current_caps())
-            .map(|caps| caps.to_string().contains("memory:GLMemory"))
-            .unwrap_or(false);
+        // GPU memory on the tee: scale on the GPU, download only the small frame.
+        let memory = tee_caps
+            .as_ref()
+            .map(|caps| TapMemory::of(caps))
+            .unwrap_or(TapMemory::System);
 
         let mut branch_elements: Vec<gst::Element> = Vec::new();
 
-        if is_gl {
+        if memory == TapMemory::Cuda {
+            branch_elements.extend(self.cuda_scale_elements()?);
+        } else if memory == TapMemory::Gl {
             // GL path: scale on GPU, then download the small frame.
             // glcolorscale requires RGBA — the compositor tee already carries RGBA.
             let scale = gst::ElementFactory::make("glcolorscale")
@@ -354,6 +386,7 @@ impl ThumbnailTap {
 
         // Build the full element chain:
         //   GL:     queue [pad probe] → glcolorscale → glcaps → gldownload → capsfilter → appsink
+        //   CUDA:   queue [pad probe] → cudaconvertscale → cudacaps → cudadownload → capsfilter → appsink
         //   non-GL: queue [pad probe] → videoconvertscale → capsfilter → appsink
         let mut elements: Vec<gst::Element> = vec![queue.clone()];
         elements.extend(branch_elements.iter().cloned());
@@ -455,6 +488,34 @@ impl ThumbnailTap {
 
         debug!("Thumbnail branch activated for {}", self.name_prefix);
         Ok(())
+    }
+
+    /// `cudaconvertscale → capsfilter(CUDA,RGBA,WxH) → cudadownload`.
+    fn cuda_scale_elements(&self) -> Result<Vec<gst::Element>, ThumbnailError> {
+        let prefix = &self.name_prefix;
+        let scale = gst::ElementFactory::make("cudaconvertscale")
+            .name(format!("{}_thumb_cudascale", prefix))
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cudaconvertscale: {}", e)))?;
+
+        let caps_str = format!(
+            "video/x-raw({}),format=RGBA,width={},height={}",
+            CUDA_MEMORY_FEATURE, self.config.width, self.config.height
+        );
+        let caps = gst::Caps::from_str(&caps_str)
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cuda caps: {}", e)))?;
+        let capsfilter = gst::ElementFactory::make("capsfilter")
+            .name(format!("{}_thumb_cudacaps", prefix))
+            .property("caps", &caps)
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cuda capsfilter: {}", e)))?;
+
+        let download = gst::ElementFactory::make("cudadownload")
+            .name(format!("{}_thumb_cudadownload", prefix))
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cudadownload: {}", e)))?;
+
+        Ok(vec![scale, capsfilter, download])
     }
 
     /// Detach the processing branch from the tee.
@@ -560,6 +621,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_tap_memory_from_caps() {
+        gst::init().unwrap();
+        let of = |s: &str| TapMemory::of(&gst::Caps::from_str(s).unwrap());
+
+        assert_eq!(of("video/x-raw,format=NV12"), TapMemory::System);
+        assert_eq!(
+            of("video/x-raw(memory:GLMemory),format=RGBA"),
+            TapMemory::Gl
+        );
+        assert_eq!(
+            of("video/x-raw(memory:CUDAMemory),format=NV12"),
+            TapMemory::Cuda
+        );
+    }
+
+    #[test]
     fn test_thumbnail_tap_config_default() {
         let config = ThumbnailTapConfig::default();
         assert_eq!(config.width, 320);
@@ -568,5 +645,38 @@ mod tests {
         assert_eq!(config.idle_timeout, Duration::from_secs(10));
         assert_eq!(config.update_interval, Duration::from_secs(1));
         assert_eq!(config.cache_ttl, Duration::from_millis(500));
+    }
+
+    /// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+    #[test]
+    #[ignore = "needs NVIDIA CUDA (cudaupload)"]
+    fn test_thumbnail_from_cuda_memory() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! video/x-raw,width=640,height=360,framerate=30/1 ! \
+             cudaupload ! video/x-raw(memory:CUDAMemory) ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tee = pipeline.by_name("t").unwrap();
+        let config = ThumbnailTapConfig {
+            update_interval: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let tap = ThumbnailTap::new_with_tee(&pipeline, "cuda_test", tee, config);
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut result = tap.get_thumbnail();
+        while result.is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            result = tap.get_thumbnail();
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let jpeg = result.expect("no thumbnail from a CUDA-memory tee");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
     }
 }
