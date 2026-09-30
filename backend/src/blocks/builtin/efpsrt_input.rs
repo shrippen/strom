@@ -615,7 +615,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 }
 
 /// Dynamically insert h264parse + video decoder between an efpdemux video pad and identity.
-/// efpdemux pad -> h264parse -> nvh264dec/avdec_h264 -> deinterlace -> identity
+/// efpdemux pad -> h264parse -> nvh264dec/avdec_h264 -> [deinterlace if interlaced] -> identity
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
@@ -661,9 +661,9 @@ fn link_decoded_video(
         .sync_state_with_parent()
         .map_err(|e| format!("sync decoder: {}", e))?;
 
-    // decoder -> deinterlace -> identity. Interlaced broadcast feeds (e.g.
+    // decoder -> [deinterlace] -> identity. Interlaced broadcast feeds (e.g.
     // 1080i50) must be deinterlaced before the GL vision mixer; the helper's
-    // caps probe forces deinterlacing only when the source is interlaced/mixed.
+    // caps probe inserts a deinterlacer only when the source is interlaced/mixed.
     let decoder_src = decoder.static_pad("src").ok_or("decoder has no src pad")?;
     super::decode_chain::link_raw_video_through_deinterlace(
         &bin,

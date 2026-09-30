@@ -5,7 +5,7 @@
 //!
 //! Pipeline structure (decode=true, default):
 //! ```text
-//! srtsrc -> decodebin -> deinterlace -> video_output (identity) -> [external video_out]
+//! srtsrc -> decodebin -> [deinterlace if interlaced] -> video_output (identity) -> [external video_out]
 //!                     -> audioconvert -> audioresample -> audio_output_0 (identity) -> [external audio_out_0]
 //! ```
 //!
@@ -471,12 +471,12 @@ impl BlockBuilder for MpegTsSrtInputBuilder {
     }
 }
 
-/// decodebin (raw) pad -> deinterlace -> identity
+/// decodebin (raw) pad -> [deinterlace if interlaced] -> identity
 ///
 /// The GL-based vision mixer rejects interlaced frames at `glupload`, so
 /// interlaced broadcast feeds (e.g. 1080i50) are deinterlaced here. See
-/// [`super::decode_chain::link_raw_video_through_deinterlace`] for how the
-/// deinterlace mode is chosen from the negotiated caps.
+/// [`super::decode_chain::link_raw_video_through_deinterlace`] for how that
+/// is decided from the negotiated caps.
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
