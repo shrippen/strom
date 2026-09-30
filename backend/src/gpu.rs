@@ -111,6 +111,17 @@ pub fn has_hardware_gl() -> bool {
     }
 }
 
+/// True when `glupload`'s udmabuf path yields empty textures on this host.
+///
+/// GStreamer 1.28's `glupload` offers upstream a udmabuf allocator and
+/// imports the frames as DMABuf into EGL. The NVIDIA driver imports them
+/// as empty textures: a system-memory source linked straight into a GL
+/// mixer composites as black (seen on an RTX 3090, driver 615). Mesa
+/// (AMD/Intel) is what the udmabuf path was built for and is left alone.
+pub fn udmabuf_upload_broken() -> bool {
+    gl_renderer_info().is_some_and(|info| info.vendor.to_lowercase().contains("nvidia"))
+}
+
 /// Probe the OpenGL renderer via GStreamer's GL context API.
 ///
 /// Creates a minimal in-process pipeline (`videotestsrc ! glupload ! appsink`),

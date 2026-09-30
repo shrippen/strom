@@ -596,8 +596,25 @@ pub(super) fn build_gpu_pipeline(
 
 /// Hardware decoders deliver CUDA or VA frames, which `glupload` cannot
 /// take; bridge them on the input queue (see `gst::gl_bridge`).
+///
+/// Where `glupload`'s udmabuf path is broken (see
+/// `gpu::udmabuf_upload_broken`), the queue also stops upstream from
+/// seeing its allocation proposal, so sources keep their own memory and
+/// `glupload` does a plain texture upload.
 fn install_upload_bridge(queue: &gst::Element, queue_id: &str) {
-    if let Some(src) = queue.static_pad("src") {
-        crate::gst::gl_bridge::install_gl_upload_bridge(&src, queue_id);
+    let Some(src) = queue.static_pad("src") else {
+        return;
+    };
+    crate::gst::gl_bridge::install_gl_upload_bridge(&src, queue_id);
+
+    if crate::gpu::udmabuf_upload_broken() {
+        // Per allocation query (each negotiation), not per buffer.
+        src.add_probe(
+            gst::PadProbeType::QUERY_DOWNSTREAM,
+            |_pad, info| match info.query() {
+                Some(q) if q.type_() == gst::QueryType::Allocation => gst::PadProbeReturn::Drop,
+                _ => gst::PadProbeReturn::Ok,
+            },
+        );
     }
 }

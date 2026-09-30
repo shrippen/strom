@@ -269,6 +269,9 @@ async fn wipe_between_letterboxed_sources_animates() {
         eprintln!("SKIP: GL environment unavailable (no context or GL elements missing)");
         return;
     }
+    // As at server startup: the GL builder adapts to the detected driver
+    // (see gpu::udmabuf_upload_broken).
+    strom::gpu::detect_gpu_capabilities();
 
     let mut flow = Flow::new("vm_letterbox_wipe");
     flow.blocks.push(strom_types::BlockInstance {
