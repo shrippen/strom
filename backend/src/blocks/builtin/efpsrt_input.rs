@@ -6,7 +6,7 @@
 //!
 //! Pipeline structure (decode=true, default):
 //! ```text
-//! srtsrc -> efpdemux -> h264parse -> nvh264dec/avdec_h264 -> video_output (identity)
+//! srtsrc -> efpdemux -> h264parse -> H.264 decoder -> video_output (identity)
 //!                    -> opusdec -> audioconvert -> audioresample -> audio_output_0 (identity)
 //! ```
 //!
@@ -417,7 +417,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 
                     if let Some(identity) = weak_identity.upgrade() {
                         if decode {
-                            // Decode mode: h264parse -> nvh264dec/avdec_h264 -> identity
+                            // Decode mode: h264parse -> H.264 decoder -> identity
                             // No videoconvert to preserve GPU memory from hardware decoders.
                             if let Err(e) =
                                 link_decoded_video(element, pad, &identity, &instance_id_clone)
@@ -615,7 +615,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 }
 
 /// Dynamically insert h264parse + video decoder between an efpdemux video pad and identity.
-/// efpdemux pad -> h264parse -> nvh264dec/avdec_h264 -> [deinterlace if interlaced] -> identity
+/// efpdemux pad -> h264parse -> H.264 decoder -> [deinterlace if interlaced] -> identity
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
@@ -634,17 +634,9 @@ fn link_decoded_video(
         .build()
         .map_err(|e| format!("h264parse: {}", e))?;
 
-    // Try hardware decoder first (nvh264dec), fall back to software (avdec_h264)
+    // Hardware decoder of this host's vendor first, software otherwise.
     let decoder_name = format!("{}:video_decoder_{}", instance_id, src_pad.name());
-    let decoder = gst::ElementFactory::make("nvh264dec")
-        .name(&decoder_name)
-        .build()
-        .or_else(|_| {
-            gst::ElementFactory::make("avdec_h264")
-                .name(&decoder_name)
-                .build()
-        })
-        .map_err(|e| format!("video decoder (nvh264dec/avdec_h264): {}", e))?;
+    let decoder = super::decode_chain::make_h264_decoder(&decoder_name)?;
 
     bin.add_many([&parser, &decoder])
         .map_err(|e| format!("add video decode chain: {}", e))?;

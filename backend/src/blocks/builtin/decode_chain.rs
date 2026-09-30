@@ -13,6 +13,29 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use tracing::{debug, info, warn};
 
+/// Build the highest-ranked H.264 decoder on this host, as `decodebin` would
+/// pick it: NVDEC on NVIDIA, VA on AMD/Intel (strom promotes the VA ranks
+/// at startup), a software decoder elsewhere. Falls through to the next
+/// candidate if one cannot be instantiated (e.g. no device).
+#[cfg(feature = "efp")]
+pub(crate) fn make_h264_decoder(name: &str) -> Result<gst::Element, String> {
+    let caps = gst::Caps::builder("video/x-h264").build();
+    let decoders = gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+        gst::Rank::MARGINAL,
+    );
+    // Sorted by decreasing rank.
+    let candidates = decoders.into_iter().filter(|f| f.can_sink_any_caps(&caps));
+
+    for factory in candidates {
+        match factory.create().name(name).build() {
+            Ok(decoder) => return Ok(decoder),
+            Err(e) => debug!("{}: {} unusable: {}", name, factory.name(), e),
+        }
+    }
+    Err("no usable H.264 decoder".to_string())
+}
+
 /// Caps feature of VA-API surfaces (`va` plugin, AMD/Intel).
 const VA_MEMORY_FEATURE: &str = "memory:VAMemory";
 /// Caps feature of CUDA device memory (`nvcodec`).
@@ -192,6 +215,26 @@ mod tests {
     fn caps(s: &str) -> gst::Caps {
         let _ = gst::init();
         gst::Caps::from_str(s).expect("valid caps")
+    }
+
+    #[test]
+    #[cfg(feature = "efp")]
+    fn h264_decoder_is_the_highest_ranked() {
+        let _ = gst::init();
+        let decoder = make_h264_decoder("dec").expect("some H.264 decoder");
+        let factory = decoder.factory().unwrap();
+
+        let caps = gst::Caps::builder("video/x-h264").build();
+        let best = gst::ElementFactory::factories_with_type(
+            gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+            gst::Rank::MARGINAL,
+        )
+        .into_iter()
+        .filter(|f| f.can_sink_any_caps(&caps))
+        .map(|f| f.rank())
+        .max()
+        .unwrap();
+        assert_eq!(factory.rank(), best, "picked {}", factory.name());
     }
 
     #[test]
