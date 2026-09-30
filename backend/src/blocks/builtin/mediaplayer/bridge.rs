@@ -26,6 +26,7 @@ pub fn create_decode_pipeline(
 ) -> Result<gst::Pipeline, BlockBuildError> {
     let pipeline_name = format!("mediaplayer-internal-{}", instance_id);
     let pipeline = gst::Pipeline::builder().name(&pipeline_name).build();
+    crate::gpu::share_gpu_contexts(&pipeline);
 
     let source_id = format!("{}_uridecodebin", instance_id);
     let source = gst::ElementFactory::make("uridecodebin")
@@ -136,6 +137,7 @@ pub fn create_passthrough_pipeline(
 ) -> Result<gst::Pipeline, BlockBuildError> {
     let pipeline_name = format!("mediaplayer-internal-{}", instance_id);
     let pipeline = gst::Pipeline::builder().name(&pipeline_name).build();
+    crate::gpu::share_gpu_contexts(&pipeline);
 
     let source_id = format!("{}_urisourcebin", instance_id);
     let source = gst::ElementFactory::make("urisourcebin")

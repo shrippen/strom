@@ -37,6 +37,15 @@ static VIDEO_CONVERT_MODE: OnceLock<VideoConvertMode> = OnceLock::new();
 /// Global GL renderer info, probed once at startup.
 static GL_RENDERER_INFO: OnceLock<Option<GlRendererInfo>> = OnceLock::new();
 
+/// GPU contexts every pipeline shares, captured once at startup.
+static SHARED_CONTEXTS: OnceLock<Vec<gst::Context>> = OnceLock::new();
+
+/// GStreamer context type of a CUDA device context (`nvcodec`).
+const CUDA_CONTEXT_TYPE: &str = "gst.cuda.context";
+
+/// Creates a CUDA context and posts it as HAVE_CONTEXT.
+const CUDA_CONTEXT_PROBE: &str = "videotestsrc num-buffers=1 ! cudaupload ! fakesink";
+
 /// Set to `1` to skip GPU detection and always use software conversion.
 const FORCE_SOFTWARE_CONVERT_ENV: &str = "STROM_FORCE_SOFTWARE_CONVERT";
 
@@ -220,6 +229,52 @@ fn detect_gl_renderer() -> Option<GlRendererInfo> {
     Some(gl_info)
 }
 
+/// Hand the process-wide GPU contexts to `pipeline`.
+///
+/// Without this every pipeline (each flow, and each media player's internal
+/// decode pipeline) creates its own CUDA context: measured ~250 MB host
+/// memory and ~300 MB VRAM per pipeline with 16 NVDEC inputs. A bin answers
+/// its elements' NEED_CONTEXT from contexts set on it, so setting them here
+/// before the pipeline starts is enough. No-op when no GPU context exists.
+pub fn share_gpu_contexts(pipeline: &gst::Pipeline) {
+    for context in SHARED_CONTEXTS.get().into_iter().flatten() {
+        pipeline.set_context(context);
+    }
+}
+
+/// Run `description` to completion and return the contexts of `context_type`
+/// its elements announced (HAVE_CONTEXT). Empty if an element is missing.
+fn capture_contexts(description: &str, context_type: &str) -> Vec<gst::Context> {
+    let Ok(pipeline) = gst::parse::launch(description) else {
+        return Vec::new();
+    };
+    let Some(bus) = pipeline.bus() else {
+        return Vec::new();
+    };
+    if pipeline.set_state(gst::State::Playing).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Vec::new();
+    }
+
+    let mut contexts = Vec::new();
+    let wanted = [
+        gst::MessageType::HaveContext,
+        gst::MessageType::Eos,
+        gst::MessageType::Error,
+    ];
+    while let Some(msg) = bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &wanted) {
+        let gst::MessageView::HaveContext(have) = msg.view() else {
+            break;
+        };
+        let context = have.context();
+        if context.context_type() == context_type {
+            contexts.push(context);
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    contexts
+}
+
 /// Detect GPU capabilities and set the global video conversion mode.
 /// This should be called once at startup after GStreamer is initialized.
 ///
@@ -231,6 +286,10 @@ pub fn detect_gpu_capabilities() -> VideoConvertMode {
     // Probe GL renderer info early (best-effort, independent of CUDA-GL interop)
     let gl_info = detect_gl_renderer();
     let _ = GL_RENDERER_INFO.set(gl_info);
+
+    let cuda = capture_contexts(CUDA_CONTEXT_PROBE, CUDA_CONTEXT_TYPE);
+    info!("Shared GPU contexts: {} CUDA", cuda.len());
+    let _ = SHARED_CONTEXTS.set(cuda.into_iter().take(1).collect());
 
     // Fast path: WSL has broken CUDA-GL interop, skip expensive test
     if is_wsl() {

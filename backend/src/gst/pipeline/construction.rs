@@ -59,6 +59,7 @@ impl PipelineManager {
         let pipeline = gst::Pipeline::builder()
             .name(format!("flow-{}", flow.id))
             .build();
+        crate::gpu::share_gpu_contexts(&pipeline);
         info!("Created GStreamer pipeline object");
 
         // Create shared storage for dynamically created webrtcbins (from consumer-added callbacks)
