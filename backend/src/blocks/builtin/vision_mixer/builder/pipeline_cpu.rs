@@ -15,7 +15,6 @@ use super::super::elements::CompositorBackend;
 use super::super::{elements, layout};
 use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
-use crate::gpu;
 
 pub(super) fn build_cpu_pipeline(
     p: &PipelineParams,
@@ -110,19 +109,16 @@ pub(super) fn build_cpu_pipeline(
     // DSK input element chains (links to mixer added later after video inputs)
     let vc_factory = match p.backend {
         CompositorBackend::Cuda => CUDA_UPLOAD,
-        CompositorBackend::OpenGL | CompositorBackend::Software => {
-            gpu::video_convert_mode().element_name()
-        }
+        CompositorBackend::OpenGL | CompositorBackend::Software => CPU_CONVERT,
     };
     for i in 0..p.num_dsk_inputs {
         let q_id = p.id(&format!("queue_dsk_{}", i));
         let vc_id_dsk = p.id(&format!("videoconvert_dsk_{}", i));
 
         let queue = elements::make_queue(&q_id)?;
-        // Uses autovideoconvert on hosts with working CUDA-GL interop, plain
-        // videoconvert elsewhere — same pattern as videoenc/videoformat. Needed
-        // so that upstream GPU-memory sources (e.g. nvh264dec from efpsrt_input)
-        // negotiate correctly against the CPU compositor backend.
+        // GPU-memory sources (e.g. nvh264dec from efpsrt_input) are
+        // downloaded by a bridge on the queue, see install_cpu_bridge.
+        install_cpu_bridge(p, &queue, &q_id);
         let videoconvert = elements::make_element(vc_factory, &vc_id_dsk)?;
 
         elems.push((q_id.clone(), queue));
@@ -316,6 +312,7 @@ pub(super) fn build_cpu_pipeline(
         let tee_id = p.id(&format!("tee_{}", i));
 
         let queue = elements::make_queue(&q_id)?;
+        install_cpu_bridge(p, &queue, &q_id);
         let videoconvert = elements::make_element(vc_factory, &vc_in_id)?;
         let tee = elements::make_tee(&tee_id)?;
 
@@ -590,6 +587,26 @@ pub(super) fn build_cpu_pipeline(
 
 /// Uploads system (and passes through CUDA) memory for `cudacompositor`.
 const CUDA_UPLOAD: &str = "cudaupload";
+
+/// Format conversion for the CPU `compositor`. Not `autovideoconvert`: on
+/// GStreamer 1.28 it fails to negotiate against the compositor
+/// (not-negotiated on every input); GPU memory is bridged instead.
+const CPU_CONVERT: &str = "videoconvert";
+
+/// CPU backend only: download GPU-memory input (CUDA, VA, GL) on the queue
+/// in front of `videoconvert`, which takes system memory only.
+fn install_cpu_bridge(p: &PipelineParams, queue: &gst::Element, queue_id: &str) {
+    if p.backend != CompositorBackend::Software {
+        return;
+    }
+    if let Some(src) = queue.static_pad("src") {
+        crate::gst::gl_bridge::install_memory_bridge(
+            &src,
+            queue_id,
+            crate::gst::gl_bridge::Consumer::System,
+        );
+    }
+}
 
 /// Last element of a border underlay chain: the upload on CUDA, else the
 /// capsfilter.

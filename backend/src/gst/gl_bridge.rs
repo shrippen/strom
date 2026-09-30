@@ -35,40 +35,70 @@ const GL_MEMORY_FEATURE: &str = "memory:GLMemory";
 /// The caps feature of plain system memory (implicit when absent).
 const SYSTEM_MEMORY_FEATURE: &str = "memory:SystemMemory";
 
+/// What an input feeds: `glupload` (takes system, DMABuf and GL memory) or
+/// a system-memory element such as `videoconvert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consumer {
+    Gl,
+    System,
+}
+
 /// Hardware-decoder memory `glupload` cannot take, and its bridge element.
 const UPLOAD_BRIDGES: [(&str, &str); 2] = [
     ("memory:CUDAMemory", "cudadownload"),
     ("memory:VAMemory", "vapostproc"),
 ];
 
-/// The element that turns `caps`' frames into something `glupload` takes,
+/// GPU memory a system-memory consumer cannot take, and its bridge.
+const DOWNLOAD_BRIDGES: [(&str, &str); 3] = [
+    ("memory:CUDAMemory", "cudadownload"),
+    ("memory:VAMemory", "vapostproc"),
+    (GL_MEMORY_FEATURE, "gldownload"),
+];
+
+impl Consumer {
+    fn bridges(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Consumer::Gl => &UPLOAD_BRIDGES,
+            Consumer::System => &DOWNLOAD_BRIDGES,
+        }
+    }
+}
+
+/// The element that turns `caps`' frames into something `consumer` takes,
 /// or `None` if it takes them as they are.
-pub fn upload_bridge_for(caps: &gst::CapsRef) -> Option<&'static str> {
+pub fn bridge_for(caps: &gst::CapsRef, consumer: Consumer) -> Option<&'static str> {
     let structure = caps.structure(0)?;
     if structure.name() != "video/x-raw" {
         return None;
     }
     let features = caps.features(0)?;
-    UPLOAD_BRIDGES
+    consumer
+        .bridges()
         .iter()
         .find(|(feature, _)| features.contains(*feature))
         .map(|(_, bridge)| *bridge)
 }
 
-/// Watch `src_pad` (linked towards a `glupload`) and splice the bridge from
-/// [`upload_bridge_for`] in front of its peer on the first CAPS event that
-/// needs one.
+/// [`install_memory_bridge`] for an input linked towards a `glupload`.
+pub fn install_gl_upload_bridge(src_pad: &gst::Pad, name_prefix: &str) {
+    install_memory_bridge(src_pad, name_prefix, Consumer::Gl);
+}
+
+/// Watch `src_pad` (linked towards `consumer`) and splice the bridge from
+/// [`bridge_for`] in front of its peer on the first CAPS event that needs
+/// one.
 ///
 /// Upstream only sends that CAPS event if negotiation succeeds, and it asks
-/// first: a CAPS query, answered by `glupload`, lists no CUDA or VA memory.
+/// first: a CAPS query, answered by the consumer, lists no foreign memory.
 /// A query probe therefore adds the bridgeable memory variants to the
 /// answer (and accepts them in ACCEPT_CAPS) until the first CAPS event has
 /// been classified; then both probes are removed. Query and event probes
 /// fire per negotiation, not per buffer.
-pub fn install_gl_upload_bridge(src_pad: &gst::Pad, name_prefix: &str) {
+pub fn install_memory_bridge(src_pad: &gst::Pad, name_prefix: &str, consumer: Consumer) {
     let name_prefix = name_prefix.to_string();
 
-    let query_probe = src_pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |pad, info| {
+    let query_probe = src_pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |pad, info| {
         // Only after the peer answered (PULL); PUSH is the way down.
         if !info.mask.contains(gst::PadProbeType::PULL) {
             return gst::PadProbeReturn::Ok;
@@ -84,7 +114,7 @@ pub fn install_gl_upload_bridge(src_pad: &gst::Pad, name_prefix: &str) {
                 let Some(peer) = pad.peer() else {
                     return gst::PadProbeReturn::Ok;
                 };
-                let answer = with_bridgeable_memory(&peer.query_caps(None));
+                let answer = with_bridgeable_memory(&peer.query_caps(None), consumer);
                 let answer = match q.filter_owned() {
                     Some(filter) => {
                         filter.intersect_with_mode(&answer, gst::CapsIntersectMode::First)
@@ -94,7 +124,7 @@ pub fn install_gl_upload_bridge(src_pad: &gst::Pad, name_prefix: &str) {
                 q.set_result(&answer);
             }
             gst::QueryViewMut::AcceptCaps(q)
-                if !q.result() && upload_bridge_for(q.caps()).is_some() =>
+                if !q.result() && bridge_for(q.caps(), consumer).is_some() =>
             {
                 q.set_result(true);
             }
@@ -116,25 +146,25 @@ pub fn install_gl_upload_bridge(src_pad: &gst::Pad, name_prefix: &str) {
         if let Some(id) = query_probe.lock().ok().and_then(|mut id| id.take()) {
             pad.remove_probe(id);
         }
-        let Some(bridge) = upload_bridge_for(caps_event.caps()) else {
+        let Some(bridge) = bridge_for(caps_event.caps(), consumer) else {
             return gst::PadProbeReturn::Remove;
         };
         if let Err(e) = splice(pad, bridge, &name_prefix) {
             warn!(
-                "{}: GPU-memory input could not be bridged to GL ({}), glupload will not negotiate",
-                name_prefix, e
+                "{}: GPU-memory input could not be bridged for {:?} ({}), it will not negotiate",
+                name_prefix, consumer, e
             );
         }
         gst::PadProbeReturn::Remove
     });
 }
 
-/// `caps` plus a CUDA and a VA memory copy of each system-memory structure
-/// (the formats `glupload` can take once bridged), for the bridges whose
-/// element exists on this host.
-fn with_bridgeable_memory(caps: &gst::Caps) -> gst::Caps {
+/// `caps` plus a copy of each system-memory structure (the formats the
+/// consumer takes once bridged) per bridgeable memory type, for the bridges
+/// whose element exists on this host.
+fn with_bridgeable_memory(caps: &gst::Caps, consumer: Consumer) -> gst::Caps {
     let mut out = caps.copy();
-    for (feature, bridge) in UPLOAD_BRIDGES {
+    for (feature, bridge) in consumer.bridges() {
         if gst::ElementFactory::find(bridge).is_none() {
             continue;
         }
@@ -146,7 +176,7 @@ fn with_bridgeable_memory(caps: &gst::Caps) -> gst::Caps {
             if features.is_any() || gpu_memory {
                 continue;
             }
-            out.append_structure_full(s.to_owned(), Some(gst::CapsFeatures::new([feature])));
+            out.append_structure_full(s.to_owned(), Some(gst::CapsFeatures::new([*feature])));
         }
     }
     out
@@ -279,13 +309,39 @@ mod tests {
     #[test]
     fn foreign_gpu_memory_needs_an_upload_bridge() {
         assert_eq!(
-            upload_bridge_for(&caps("video/x-raw(memory:CUDAMemory), format=NV12")),
+            bridge_for(
+                &caps("video/x-raw(memory:CUDAMemory), format=NV12"),
+                Consumer::Gl
+            ),
             Some("cudadownload")
         );
         assert_eq!(
-            upload_bridge_for(&caps("video/x-raw(memory:VAMemory), format=NV12")),
+            bridge_for(
+                &caps("video/x-raw(memory:VAMemory), format=NV12"),
+                Consumer::Gl
+            ),
             Some("vapostproc")
         );
+    }
+
+    /// A system-memory consumer also needs GL frames downloaded.
+    #[test]
+    fn system_consumer_downloads_every_gpu_memory() {
+        let bridge = |c: &str| bridge_for(&caps(c), Consumer::System);
+
+        assert_eq!(
+            bridge("video/x-raw(memory:CUDAMemory), format=NV12"),
+            Some("cudadownload")
+        );
+        assert_eq!(
+            bridge("video/x-raw(memory:VAMemory), format=NV12"),
+            Some("vapostproc")
+        );
+        assert_eq!(
+            bridge("video/x-raw(memory:GLMemory), format=RGBA"),
+            Some("gldownload")
+        );
+        assert_eq!(bridge("video/x-raw, format=NV12"), None);
     }
 
     /// glupload takes these itself.
@@ -297,7 +353,7 @@ mod tests {
             "video/x-raw(memory:DMABuf), format=DMA_DRM",
             "video/x-h264, stream-format=avc",
         ] {
-            assert_eq!(upload_bridge_for(&caps(c)), None, "{}", c);
+            assert_eq!(bridge_for(&caps(c), Consumer::Gl), None, "{}", c);
         }
     }
 
