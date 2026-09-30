@@ -159,6 +159,7 @@ pub(super) fn build_gpu_pipeline(
         let queue = elements::make_queue(&q_id)?;
         let glupload = elements::make_element("glupload", &up_id)?;
         let glcolorconvert = elements::make_element("glcolorconvert", &cc_id)?;
+        install_upload_bridge(&queue, &q_id);
 
         elems.push((q_id.clone(), queue));
         elems.push((up_id.clone(), glupload));
@@ -349,6 +350,7 @@ pub(super) fn build_gpu_pipeline(
         let glupload = elements::make_element("glupload", &up_id)?;
         let glcolorconvert = elements::make_element("glcolorconvert", &cc_id)?;
         let tee = elements::make_tee(&tee_id)?;
+        install_upload_bridge(&queue, &q_id);
 
         elems.push((q_id.clone(), queue));
         elems.push((up_id.clone(), glupload));
@@ -590,4 +592,12 @@ pub(super) fn build_gpu_pipeline(
         bus_message_handler,
         pad_properties,
     })
+}
+
+/// Hardware decoders deliver CUDA or VA frames, which `glupload` cannot
+/// take; bridge them on the input queue (see `gst::gl_bridge`).
+fn install_upload_bridge(queue: &gst::Element, queue_id: &str) {
+    if let Some(src) = queue.static_pad("src") {
+        crate::gst::gl_bridge::install_gl_upload_bridge(&src, queue_id);
+    }
 }
