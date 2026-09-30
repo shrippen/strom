@@ -34,9 +34,8 @@ fn main() {
     println!("cargo:rerun-if-changed=static");
     // Rerun if icon assets change (favicons, app icons)
     println!("cargo:rerun-if-changed=../assets");
-    // Rerun if .git/HEAD changes (new commits)
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs");
+    // Rerun if HEAD or refs change (new commits)
+    watch_git_head();
     // Rerun if the included version-field helper changes
     println!("cargo:rerun-if-changed=build_version.rs");
     // Rerun if the Docker build args carrying git provenance change
@@ -117,6 +116,24 @@ fn set_version_info() {
         },
         git_hash
     );
+}
+
+/// Watch the repository's HEAD and refs for new commits.
+///
+/// The git directory is asked from git: in a submodule or worktree `.git`
+/// is a file pointing elsewhere, and a `rerun-if-changed` path that does
+/// not exist makes cargo rebuild the crate on every build. Without git
+/// (Docker builds) nothing is watched; the GIT_* env vars cover that case.
+fn watch_git_head() {
+    let Some(git_dir) = git_value(&["rev-parse", "--git-dir"]) else {
+        return;
+    };
+    for name in ["HEAD", "refs"] {
+        let path = Path::new(&git_dir).join(name);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 /// Run `git` with `args` and return its trimmed output, or `None` if it did not succeed.
