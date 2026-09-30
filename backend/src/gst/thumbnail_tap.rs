@@ -18,6 +18,11 @@
 //!            → capsfilter(CUDA,RGBA,WxH) → cudadownload
 //!            → capsfilter(RGBA,WxH) → appsink
 //!
+//! VA path (AMD/Intel decoders; unverified, no VA hardware tested):
+//! [tee] ─┬─ (passthrough)
+//!         └─ queue ─[pad probe: rate limit]─→ vapostproc
+//!            → capsfilter(RGBA,WxH) → appsink
+//!
 //! Non-GL path:
 //! [tee] ─┬─ (passthrough)
 //!         └─ queue ─[pad probe: rate limit]─→ videoconvertscale
@@ -44,6 +49,7 @@ use crate::gst::thumbnail::ThumbnailError;
 
 const GL_MEMORY_FEATURE: &str = "memory:GLMemory";
 const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
+const VA_MEMORY_FEATURE: &str = "memory:VAMemory";
 
 /// Where the tapped frames live; picks the branch's scaler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +57,7 @@ enum TapMemory {
     System,
     Gl,
     Cuda,
+    Va,
 }
 
 impl TapMemory {
@@ -63,6 +70,9 @@ impl TapMemory {
         }
         if features.contains(CUDA_MEMORY_FEATURE) {
             return Self::Cuda;
+        }
+        if features.contains(VA_MEMORY_FEATURE) {
+            return Self::Va;
         }
         Self::System
     }
@@ -269,6 +279,14 @@ impl ThumbnailTap {
 
         if memory == TapMemory::Cuda {
             branch_elements.extend(self.cuda_scale_elements()?);
+        } else if memory == TapMemory::Va {
+            // Scales on the GPU and maps out only the small RGBA frame
+            // (the system-memory capsfilter below).
+            let scale = gst::ElementFactory::make("vapostproc")
+                .name(format!("{}_thumb_vascale", prefix))
+                .build()
+                .map_err(|e| ThumbnailError::FrameMapping(format!("vapostproc: {}", e)))?;
+            branch_elements.push(scale);
         } else if memory == TapMemory::Gl {
             // GL path: scale on GPU, then download the small frame.
             // glcolorscale requires RGBA — the compositor tee already carries RGBA.
@@ -636,6 +654,10 @@ mod tests {
         assert_eq!(
             of("video/x-raw(memory:CUDAMemory),format=NV12"),
             TapMemory::Cuda
+        );
+        assert_eq!(
+            of("video/x-raw(memory:VAMemory),format=NV12"),
+            TapMemory::Va
         );
     }
 
