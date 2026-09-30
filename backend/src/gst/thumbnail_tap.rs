@@ -317,11 +317,14 @@ impl ThumbnailTap {
             .build()
             .map_err(|e| ThumbnailError::FrameMapping(format!("capsfilter: {}", e)))?;
 
+        // async=false: a new async sink would make the live pipeline lose
+        // PLAYING until it prerolls, stalling every other tap's activation.
         let appsink = gst_app::AppSink::builder()
             .name(format!("{}_thumb_sink", prefix))
             .max_buffers(1)
             .drop(true)
             .sync(false)
+            .async_(false)
             .build();
 
         // Set up appsink callback — pad probe on queue src limits fps,
@@ -645,6 +648,39 @@ mod tests {
         assert_eq!(config.idle_timeout, Duration::from_secs(10));
         assert_eq!(config.update_interval, Duration::from_secs(1));
         assert_eq!(config.cache_ttl, Duration::from_millis(500));
+    }
+
+    /// Attaching a branch must not make a live pipeline lose PLAYING:
+    /// other taps refuse to activate until it is back (serial startup),
+    /// and the running output goes through a state change.
+    #[test]
+    fn test_activation_keeps_pipeline_playing() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! video/x-raw,width=320,height=180,framerate=30/1 ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink sync=true",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tee = pipeline.by_name("t").unwrap();
+        let tap = ThumbnailTap::new_with_tee(&pipeline, "state_test", tee, Default::default());
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert!(res.is_ok() && state == gst::State::Playing);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tap.state.lock().unwrap().active && Instant::now() < deadline {
+            let _ = tap.get_thumbnail();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (_, state, pending) = pipeline.state(gst::ClockTime::ZERO);
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert_eq!(
+            (state, pending),
+            (gst::State::Playing, gst::State::VoidPending)
+        );
     }
 
     /// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
