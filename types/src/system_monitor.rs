@@ -59,4 +59,10 @@ pub struct GpuStats {
     pub temperature: Option<f32>,
     /// Power usage in watts (if available)
     pub power_usage: Option<f32>,
+    /// Hardware video decoder (e.g. NVDEC) utilization percentage (if available)
+    #[serde(default)]
+    pub decoder_utilization: Option<f32>,
+    /// Hardware video encoder (e.g. NVENC) utilization percentage (if available)
+    #[serde(default)]
+    pub encoder_utilization: Option<f32>,
 }

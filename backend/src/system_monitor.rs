@@ -193,6 +193,14 @@ impl SystemMonitor {
                                 .map(|t| t as f32);
 
                             let power_usage = device.power_usage().ok().map(|p| p as f32 / 1000.0);
+                            let decoder_utilization = device
+                                .decoder_utilization()
+                                .ok()
+                                .map(|u| u.utilization as f32);
+                            let encoder_utilization = device
+                                .encoder_utilization()
+                                .ok()
+                                .map(|u| u.utilization as f32);
 
                             gpu_stats.push(GpuStats {
                                 index: i,
@@ -203,6 +211,8 @@ impl SystemMonitor {
                                 used_memory,
                                 temperature,
                                 power_usage,
+                                decoder_utilization,
+                                encoder_utilization,
                             });
                         }
                         Err(e) => {
@@ -276,6 +286,9 @@ impl SystemMonitor {
                     used_memory,
                     temperature,
                     power_usage,
+                    // Not queried in the nvidia-smi fallback.
+                    decoder_utilization: None,
+                    encoder_utilization: None,
                 });
             }
         }

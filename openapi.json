@@ -6413,6 +6413,22 @@
           "used_memory"
         ],
         "properties": {
+          "decoder_utilization": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Hardware video decoder (e.g. NVDEC) utilization percentage (if available)"
+          },
+          "encoder_utilization": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Hardware video encoder (e.g. NVENC) utilization percentage (if available)"
+          },
           "index": {
             "type": "integer",
             "format": "int32",
