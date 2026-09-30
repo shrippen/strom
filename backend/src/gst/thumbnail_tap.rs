@@ -12,11 +12,11 @@
 //!            → capsfilter(GL,RGBA,WxH) → gldownload
 //!            → capsfilter(RGBA,WxH) → appsink
 //!
-//! CUDA path:
+//! CUDA path (JPEG on the GPU; without `nvjpegenc` like GL, via cudadownload):
 //! [tee] ─┬─ (passthrough)
 //!         └─ queue ─[pad probe: rate limit]─→ cudaconvertscale
-//!            → capsfilter(CUDA,RGBA,WxH) → cudadownload
-//!            → capsfilter(RGBA,WxH) → appsink
+//!            → capsfilter(CUDA,NV12,WxH) → nvjpegenc
+//!            → capsfilter(image/jpeg) → appsink
 //!
 //! VA path (AMD/Intel decoders; unverified, no VA hardware tested):
 //! [tee] ─┬─ (passthrough)
@@ -77,6 +77,18 @@ impl TapMemory {
         Self::System
     }
 }
+
+/// What the branch hands to the appsink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapOutput {
+    /// Scaled RGBA frame, JPEG-encoded in the appsink callback.
+    Rgba,
+    /// Finished JPEG from a GPU encoder.
+    Jpeg,
+}
+
+/// Caps of GPU-encoded thumbnails.
+const JPEG_CAPS: &str = "image/jpeg";
 
 /// Configuration for a thumbnail tap.
 #[derive(Debug, Clone)]
@@ -276,9 +288,12 @@ impl ThumbnailTap {
             .unwrap_or(TapMemory::System);
 
         let mut branch_elements: Vec<gst::Element> = Vec::new();
+        let mut output = TapOutput::Rgba;
 
         if memory == TapMemory::Cuda {
-            branch_elements.extend(self.cuda_scale_elements()?);
+            let (elements, cuda_output) = self.cuda_scale_elements()?;
+            branch_elements.extend(elements);
+            output = cuda_output;
         } else if memory == TapMemory::Va {
             // Scales on the GPU and maps out only the small RGBA frame
             // (the system-memory capsfilter below).
@@ -323,10 +338,13 @@ impl ThumbnailTap {
             branch_elements.push(convert);
         }
 
-        let caps_str = format!(
-            "video/x-raw,format=RGBA,width={},height={}",
-            self.config.width, self.config.height
-        );
+        let caps_str = match output {
+            TapOutput::Rgba => format!(
+                "video/x-raw,format=RGBA,width={},height={}",
+                self.config.width, self.config.height
+            ),
+            TapOutput::Jpeg => JPEG_CAPS.to_string(),
+        };
         let caps = gst::Caps::from_str(&caps_str)
             .map_err(|e| ThumbnailError::FrameMapping(format!("caps: {}", e)))?;
         let capsfilter = gst::ElementFactory::make("capsfilter")
@@ -377,6 +395,14 @@ impl ThumbnailTap {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+
+                    // Encoded on the GPU already: keep the bytes.
+                    if caps.structure(0).is_some_and(|s| s.name() == JPEG_CAPS) {
+                        let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                        let mut state = callback_state.lock().unwrap();
+                        state.cached_jpeg = Some((map.to_vec(), Instant::now()));
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
 
                     let video_info =
                         gst_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
@@ -512,16 +538,29 @@ impl ThumbnailTap {
     }
 
     /// `cudaconvertscale → capsfilter(CUDA,RGBA,WxH) → cudadownload`.
-    fn cuda_scale_elements(&self) -> Result<Vec<gst::Element>, ThumbnailError> {
+    fn cuda_scale_elements(&self) -> Result<(Vec<gst::Element>, TapOutput), ThumbnailError> {
         let prefix = &self.name_prefix;
         let scale = gst::ElementFactory::make("cudaconvertscale")
             .name(format!("{}_thumb_cudascale", prefix))
             .build()
             .map_err(|e| ThumbnailError::FrameMapping(format!("cudaconvertscale: {}", e)))?;
 
+        // nvjpegenc takes NV12 in CUDA memory; the RGBA download path is
+        // the fallback for hosts without it.
+        let jpeg_encoder = gst::ElementFactory::make("nvjpegenc")
+            .name(format!("{}_thumb_nvjpegenc", prefix))
+            .property("quality", u32::from(self.config.jpeg_quality))
+            .build()
+            .ok();
+        let format = if jpeg_encoder.is_some() {
+            "NV12"
+        } else {
+            "RGBA"
+        };
+
         let caps_str = format!(
-            "video/x-raw({}),format=RGBA,width={},height={}",
-            CUDA_MEMORY_FEATURE, self.config.width, self.config.height
+            "video/x-raw({}),format={},width={},height={}",
+            CUDA_MEMORY_FEATURE, format, self.config.width, self.config.height
         );
         let caps = gst::Caps::from_str(&caps_str)
             .map_err(|e| ThumbnailError::FrameMapping(format!("cuda caps: {}", e)))?;
@@ -531,12 +570,16 @@ impl ThumbnailTap {
             .build()
             .map_err(|e| ThumbnailError::FrameMapping(format!("cuda capsfilter: {}", e)))?;
 
+        if let Some(encoder) = jpeg_encoder {
+            return Ok((vec![scale, capsfilter, encoder], TapOutput::Jpeg));
+        }
+
         let download = gst::ElementFactory::make("cudadownload")
             .name(format!("{}_thumb_cudadownload", prefix))
             .build()
             .map_err(|e| ThumbnailError::FrameMapping(format!("cudadownload: {}", e)))?;
 
-        Ok(vec![scale, capsfilter, download])
+        Ok((vec![scale, capsfilter, download], TapOutput::Rgba))
     }
 
     /// Detach the processing branch from the tee.
@@ -732,9 +775,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             result = tap.get_thumbnail();
         }
+        // JPEG encoded on the GPU, not on the CPU after a download.
+        let encoded_on_gpu = pipeline.by_name("cuda_test_thumb_nvjpegenc").is_some();
         pipeline.set_state(gst::State::Null).unwrap();
 
         let jpeg = result.expect("no thumbnail from a CUDA-memory tee");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        assert!(encoded_on_gpu);
     }
 }
