@@ -126,12 +126,17 @@ fn measure_buffer_age(
     }
     let pipeline_rt = clock_time - base_time;
 
-    if pipeline_rt >= buffer_rt {
-        let age_ns = (pipeline_rt - buffer_rt).nseconds();
-        Some(age_ns / 1_000_000)
-    } else {
-        None
-    }
+    Some(age_ms(pipeline_rt, buffer_rt))
+}
+
+/// Age in ms of a buffer with running time `buffer_rt` at `pipeline_rt`.
+///
+/// A buffer ahead of the clock is not late: age 0. Such buffers are normal
+/// downstream of sources with configured latency (SRT, tsdemux), where
+/// timestamps lead the clock until the sink; dropping them would also drop
+/// them from the sample count, i.e. the frame rate.
+fn age_ms(pipeline_rt: gst::ClockTime, buffer_rt: gst::ClockTime) -> u64 {
+    pipeline_rt.saturating_sub(buffer_rt).mseconds()
 }
 
 /// Resolve a pad on an element by name, with fallback to first sink pad.
@@ -714,6 +719,15 @@ impl Drop for ProbeManager {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn early_buffers_have_age_zero() {
+        let ms = gst::ClockTime::from_mseconds;
+
+        assert_eq!(age_ms(ms(150), ms(100)), 50);
+        assert_eq!(age_ms(ms(100), ms(100)), 0);
+        assert_eq!(age_ms(ms(100), ms(225)), 0);
+    }
+
     use super::*;
     use crate::events::EventBroadcaster;
     use crate::gst::pipeline::test_utils::poll_until;
