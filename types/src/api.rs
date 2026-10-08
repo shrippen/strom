@@ -1323,6 +1323,9 @@ pub struct DskToggleRequest {
     pub dsk: usize,
     /// Enable or disable the DSK layer
     pub enabled: bool,
+    /// Fade duration in milliseconds (0 = instant, the default)
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 /// Response after toggling a DSK layer.
