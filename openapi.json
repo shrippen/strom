@@ -6220,6 +6220,13 @@
             ],
             "description": "Force direct media timing (`base_time=0`, `start_time=NONE`) so buffer\nPTS corresponds to absolute pipeline-clock time.\n\n- `Some(true)`: explicitly on.\n- `Some(false)`: explicitly off.\n- `None` (default): follow the clock-type default — `true` for `Ptp`\n  (AES67 contract, RFC 7273 `mediaclk:direct=0`), `false` otherwise.\n\nUse this for narrow pipelines where every element cooperates with\nwall-clock timing (PTP+AES67, or TAI disciplined by `ptp4l`/`phc2sys`\nfeeding AES67 with TAI timestamps). Avoid for general pipelines\n(MPEG-TS demuxers, RTP jitter buffers, WHEP session sinks) that assume\n`running_time` starts near 0."
           },
+          "eos_on_stop": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On stop, send EOS and wait (bounded) for it to pass before tearing\nthe pipeline down, so muxers finalize their files (recordings).\nOff by default: stopping stays immediate."
+          },
           "ephemeral": {
             "type": "boolean",
             "description": "When true, the flow is not persisted to storage. Useful for temporary or\nAPI-created flows that should not survive a server restart."
