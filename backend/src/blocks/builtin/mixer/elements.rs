@@ -65,6 +65,26 @@ pub(crate) fn make_audiomixer(
     Ok(mixer)
 }
 
+/// Create a capsfilter that pins raw audio to `rate` Hz.
+pub(super) fn make_rate_filter(name: &str, rate: i32) -> Result<gst::Element, BlockBuildError> {
+    let caps = gst::Caps::builder("audio/x-raw")
+        .field("rate", rate)
+        .build();
+    gst::ElementFactory::make("capsfilter")
+        .name(name)
+        .property("caps", &caps)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("capsfilter {}: {}", name, e)))
+}
+
+/// Create an audioresample element.
+pub(super) fn make_resample(name: &str) -> Result<gst::Element, BlockBuildError> {
+    gst::ElementFactory::make("audioresample")
+        .name(name)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("audioresample {}: {}", name, e)))
+}
+
 /// Create a gate element, falling back to identity passthrough if unavailable.
 pub(super) fn make_gate_element(
     name: &str,
