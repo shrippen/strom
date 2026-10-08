@@ -69,11 +69,23 @@ pub fn select_backend(preference: &str) -> Result<CompositorBackend, BlockBuildE
     }
 }
 
+/// Where the compositors' output running time starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartTime {
+    /// At zero: flows with their own base time (default).
+    Zero,
+    /// At the first input buffer: flows with base time 0
+    /// (`direct_media_timing`), e.g. inputs coupled over `inter`, whose
+    /// timestamps are clock time.
+    First,
+}
+
 /// Create the distribution (PGM) compositor element.
 pub fn make_dist_compositor(
     backend: CompositorBackend,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) -> Result<gst::Element, BlockBuildError> {
     let element_type = backend.compositor_factory();
 
@@ -83,7 +95,7 @@ pub fn make_dist_compositor(
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", element_type, e)))?;
 
-    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms);
+    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms, start);
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
     }
@@ -100,6 +112,7 @@ pub fn make_mv_compositor(
     backend: CompositorBackend,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) -> Result<gst::Element, BlockBuildError> {
     let element_type = backend.compositor_factory();
 
@@ -109,7 +122,7 @@ pub fn make_mv_compositor(
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", element_type, e)))?;
 
-    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms);
+    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms, start);
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
     }
@@ -128,6 +141,7 @@ fn apply_post_build_properties(
     mixer: &gst::Element,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) {
     if mixer.find_property("latency").is_some() {
         let latency_ns = latency_ms * 1_000_000;
@@ -144,7 +158,14 @@ fn apply_post_build_properties(
         // causing the compositor to wait for an impossibly far deadline (2× system uptime).
         // With "zero" and force-live=true, running time starts at 0 which is correct
         // for live pipelines using monotonic clock.
-        mixer.set_property_from_str("start-time-selection", "zero");
+        // With base time 0, running time is clock time and "zero" would make
+        // the compositor catch up from 0 forever; "first" is right there
+        // (and the race above is harmless: clock time is the start time).
+        let selection = match start {
+            StartTime::Zero => "zero",
+            StartTime::First => "first",
+        };
+        mixer.set_property_from_str("start-time-selection", selection);
     }
 }
 

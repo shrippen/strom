@@ -579,3 +579,17 @@ fn overlay_timer_exits_when_its_appsrc_is_orphaned() {
     let _ = appsrc.set_state(gst::State::Null);
     unregister_flow(&flow_id);
 }
+
+#[test]
+fn start_time_defaults_to_zero() {
+    use super::elements::StartTime;
+
+    let mut props = HashMap::new();
+    assert_eq!(properties::parse_start_time(&props), StartTime::Zero);
+
+    props.insert(
+        "start_time_selection".to_string(),
+        PropertyValue::String("first".to_string()),
+    );
+    assert_eq!(properties::parse_start_time(&props), StartTime::First);
+}

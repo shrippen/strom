@@ -159,6 +159,32 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Output start time
+        ExposedProperty {
+            name: "start_time_selection".to_string(),
+            label: "Start Time".to_string(),
+            description: "Where output running time starts: Zero (default) or First buffer (for flows with direct media timing, e.g. inputs over inter)".to_string(),
+            property_type: PropertyType::Enum {
+                values: vec![
+                    EnumValue {
+                        value: "zero".to_string(),
+                        label: Some("Zero".to_string()),
+                    },
+                    EnumValue {
+                        value: "first".to_string(),
+                        label: Some("First buffer".to_string()),
+                    },
+                ],
+            },
+            default_value: Some(PropertyValue::String("zero".to_string())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: "start_time_selection".to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Min upstream latency
         ExposedProperty {
             name: "min_upstream_latency".to_string(),

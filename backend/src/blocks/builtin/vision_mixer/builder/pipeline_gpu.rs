@@ -18,8 +18,10 @@ pub(super) fn build_gpu_pipeline(
     let mut links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
 
     // --- Create compositors (no pre-requested pads — the linker auto-creates them) ---
-    let dist_comp = elements::make_dist_compositor(p.backend, p.latency_ms, p.min_upstream_ms)?;
-    let mv_comp = elements::make_mv_compositor(p.backend, p.latency_ms, p.min_upstream_ms)?;
+    let dist_comp =
+        elements::make_dist_compositor(p.backend, p.latency_ms, p.min_upstream_ms, p.start_time)?;
+    let mv_comp =
+        elements::make_mv_compositor(p.backend, p.latency_ms, p.min_upstream_ms, p.start_time)?;
 
     dist_comp.set_property("name", p.id("mixer"));
     mv_comp.set_property("name", p.id("mv_comp"));
