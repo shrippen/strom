@@ -400,6 +400,9 @@ fn connect_main_pipeline_handler(
     );
 
     // Return a no-op handler on the main bus — all real work is on the internal bus.
-    // We must return a valid SignalHandlerId per BusMessageConnectFn contract.
+    // We must return a valid SignalHandlerId per BusMessageConnectFn contract,
+    // and that contract includes one add_signal_watch: teardown removes one
+    // watch per handler, so without it the last removal is a CRITICAL.
+    main_bus.add_signal_watch();
     main_bus.connect_message(None, |_bus, _msg| {})
 }
