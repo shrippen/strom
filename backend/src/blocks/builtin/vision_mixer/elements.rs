@@ -69,16 +69,7 @@ pub fn select_backend(preference: &str) -> Result<CompositorBackend, BlockBuildE
     }
 }
 
-/// Where the compositors' output running time starts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartTime {
-    /// At zero: flows with their own base time (default).
-    Zero,
-    /// At the first input buffer: flows with base time 0
-    /// (`direct_media_timing`), e.g. inputs coupled over `inter`, whose
-    /// timestamps are clock time.
-    First,
-}
+pub use crate::blocks::builtin::start_time::StartTime;
 
 /// Create the distribution (PGM) compositor element.
 pub fn make_dist_compositor(
@@ -161,11 +152,7 @@ fn apply_post_build_properties(
         // With base time 0, running time is clock time and "zero" would make
         // the compositor catch up from 0 forever; "first" is right there
         // (and the race above is harmless: clock time is the start time).
-        let selection = match start {
-            StartTime::Zero => "zero",
-            StartTime::First => "first",
-        };
-        mixer.set_property_from_str("start-time-selection", selection);
+        mixer.set_property_from_str("start-time-selection", start.nick());
     }
 }
 

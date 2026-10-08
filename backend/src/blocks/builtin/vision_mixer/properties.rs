@@ -311,10 +311,4 @@ mod tests {
     }
 }
 
-/// `start_time_selection`: "first" for flows with base time 0, else zero.
-pub fn parse_start_time(properties: &HashMap<String, PropertyValue>) -> super::elements::StartTime {
-    match properties.get("start_time_selection") {
-        Some(PropertyValue::String(s)) if s == "first" => super::elements::StartTime::First,
-        _ => super::elements::StartTime::Zero,
-    }
-}
+pub use crate::blocks::builtin::start_time::parse_start_time;

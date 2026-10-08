@@ -151,6 +151,7 @@ pub(super) fn mixer_definition() -> BlockDefinition {
         live: false,
         persist: None,
     });
+    exposed_properties.push(crate::blocks::builtin::start_time::start_time_property());
     exposed_properties.push(ExposedProperty {
         name: "latency".to_string(),
         label: "Latency".to_string(),

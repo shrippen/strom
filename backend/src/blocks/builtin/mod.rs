@@ -25,6 +25,7 @@ pub mod mpegtssrt_input;
 pub mod ndi;
 pub mod recorder;
 pub mod spectrum;
+pub mod start_time;
 pub mod tams_output;
 pub mod thumbnail;
 pub mod time_offset;

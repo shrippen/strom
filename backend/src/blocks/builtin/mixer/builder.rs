@@ -1179,6 +1179,17 @@ impl BlockBuilder for MixerBuilder {
             },
         ) as crate::blocks::BusMessageConnectFn);
 
+        // All buses of this block start alike (see `start_time`).
+        let start = crate::blocks::builtin::start_time::parse_start_time(properties);
+        if start != crate::blocks::builtin::start_time::StartTime::Zero {
+            for (_, element) in &elements {
+                let is_audiomixer = element.factory().is_some_and(|f| f.name() == "audiomixer");
+                if is_audiomixer {
+                    element.set_property_from_str("start-time-selection", start.nick());
+                }
+            }
+        }
+
         Ok(BlockBuildResult {
             elements,
             internal_links,
