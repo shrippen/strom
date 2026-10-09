@@ -109,7 +109,7 @@ pub const PGM_BORDER_WIDTH: f64 = 4.0;
 pub const THUMBNAIL_BORDER_WIDTH: f64 = 4.0;
 
 /// Maximum number of DSK (Downstream Keyer) inputs.
-pub const MAX_DSK_INPUTS: usize = 4;
+pub const MAX_DSK_INPUTS: usize = 8;
 
 /// Default number of DSK inputs (0 = no DSK).
 pub const DEFAULT_DSK_INPUTS: usize = 0;
