@@ -95,6 +95,7 @@ mod tests {
             audio_linked: AtomicBool::new(false),
             decode: false,
             sync: true,
+            system_memory: false,
             media_path: std::path::PathBuf::from("/media"),
             ts_offset: Arc::new(AtomicI64::new(i64::MIN)),
             main_pipeline: gst::glib::WeakRef::new(),

@@ -47,6 +47,21 @@ pub fn media_player_definition() -> BlockDefinition {
                 persist: None,
             },
             ExposedProperty {
+                name: "system_memory".to_string(),
+                label: "System memory".to_string(),
+                description: "With Decode: hand video over in system memory. Hardware decoders (NVDEC, VA-API) otherwise keep frames in GPU memory, which elements reading on the CPU cannot take."
+                    .to_string(),
+                property_type: PropertyType::Bool,
+                default_value: Some(PropertyValue::Bool(false)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "system_memory".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
                 name: "loop_playlist".to_string(),
                 label: "Loop Playlist".to_string(),
                 description: "Loop back to the first file when reaching the end of the playlist"

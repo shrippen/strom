@@ -55,6 +55,14 @@ impl BlockBuilder for MediaPlayerBuilder {
             })
             .unwrap_or(true);
 
+        let system_memory = properties
+            .get("system_memory")
+            .and_then(|v| match v {
+                PropertyValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         let position_update_interval_ms = properties
             .get("position_update_interval")
             .and_then(|v| match v {
@@ -116,6 +124,7 @@ impl BlockBuilder for MediaPlayerBuilder {
             loop_playlist,
             decode,
             sync,
+            system_memory,
             position_update_interval_ms,
             initial_playlist,
             media_path,
@@ -135,6 +144,7 @@ fn build_media_player(
     loop_playlist: bool,
     decode: bool,
     sync: bool,
+    system_memory: bool,
     position_update_interval_ms: u64,
     initial_playlist: Vec<String>,
     media_path: std::path::PathBuf,
@@ -198,6 +208,7 @@ fn build_media_player(
         audio_linked: AtomicBool::new(false),
         decode,
         sync,
+        system_memory,
         media_path: media_path.clone(),
         ts_offset,
         main_pipeline: gst::glib::WeakRef::new(),
