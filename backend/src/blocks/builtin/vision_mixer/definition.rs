@@ -159,6 +159,8 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Output start time
+        crate::blocks::builtin::start_time::start_time_property(),
         // Min upstream latency
         ExposedProperty {
             name: "min_upstream_latency".to_string(),

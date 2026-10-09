@@ -151,6 +151,7 @@ pub(super) fn mixer_definition() -> BlockDefinition {
         live: false,
         persist: None,
     });
+    exposed_properties.push(crate::blocks::builtin::start_time::start_time_property());
     exposed_properties.push(ExposedProperty {
         name: "latency".to_string(),
         label: "Latency".to_string(),
@@ -174,6 +175,21 @@ pub(super) fn mixer_definition() -> BlockDefinition {
         mapping: PropertyMapping {
             element_id: "_block".to_string(),
             property_name: "min_upstream_latency".to_string(),
+            transform: None,
+        },
+        live: false,
+        persist: None,
+    });
+
+    exposed_properties.push(ExposedProperty {
+        name: "sample_rate".to_string(),
+        label: "Sample Rate".to_string(),
+        description: "Sample rate of all buses in Hz; inputs at other rates are resampled. 0 lets the mixer take the rate it negotiates first (44.1 kHz if it starts before any input). Construction-time only.".to_string(),
+        property_type: PropertyType::UInt,
+        default_value: Some(PropertyValue::UInt(0)),
+        mapping: PropertyMapping {
+            element_id: "_block".to_string(),
+            property_name: "sample_rate".to_string(),
             transform: None,
         },
         live: false,

@@ -310,3 +310,5 @@ mod tests {
         assert_eq!(parse_framerate(&props, "fps", "30/1"), (30, 1));
     }
 }
+
+pub use crate::blocks::builtin::start_time::parse_start_time;

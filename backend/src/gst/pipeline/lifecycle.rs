@@ -3,7 +3,10 @@ use crate::gst::thread_priority;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use strom_types::PipelineState;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Upper bound for `eos_on_stop`: a stuck element must not block a stop.
+const EOS_ON_STOP_TIMEOUT_MS: u64 = 5000;
 
 impl PipelineManager {
     /// Start the pipeline (set to PLAYING state).
@@ -187,6 +190,33 @@ impl PipelineManager {
     }
 
     /// Stop the pipeline (set to NULL state).
+    /// Send EOS and wait until it reached the sinks (or an error, or
+    /// `EOS_ON_STOP_TIMEOUT`), so muxers write their trailers.
+    fn drain_with_eos(&self) {
+        let playing = self.pipeline.current_state() == gst::State::Playing;
+        let Some(bus) = self.pipeline.bus().filter(|_| playing) else {
+            return;
+        };
+        if !self.pipeline.send_event(gst::event::Eos::new()) {
+            warn!("Pipeline '{}': EOS on stop not accepted", self.flow_name);
+            return;
+        }
+        let done = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(EOS_ON_STOP_TIMEOUT_MS),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        match done {
+            Some(_) => info!(
+                "Pipeline '{}': drained with EOS before stop",
+                self.flow_name
+            ),
+            None => warn!(
+                "Pipeline '{}': EOS did not pass within {} ms",
+                self.flow_name, EOS_ON_STOP_TIMEOUT_MS
+            ),
+        }
+    }
+
     pub fn stop(&mut self) -> Result<PipelineState, PipelineError> {
         info!("Stopping pipeline: {}", self.flow_name);
 
@@ -199,6 +229,11 @@ impl PipelineManager {
 
         // Remove bus watch when stopped to free resources
         self.remove_bus_watch();
+
+        // After the watch is gone, so the bus queues the EOS for us.
+        if self.properties.eos_on_stop == Some(true) {
+            self.drain_with_eos();
+        }
 
         // Stop QoS broadcast task
         self.stop_qos_broadcast_task();

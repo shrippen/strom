@@ -322,6 +322,11 @@ pub struct FlowProperties {
     /// `running_time` starts near 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_media_timing: Option<bool>,
+    /// On stop, send EOS and wait (bounded) for it to pass before tearing
+    /// the pipeline down, so muxers finalize their files (recordings).
+    /// Off by default: stopping stays immediate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eos_on_stop: Option<bool>,
     /// Clock synchronization status (updated by backend for running pipelines)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_sync_status: Option<ClockSyncStatus>,

@@ -163,6 +163,7 @@ impl BlockBuilder for VisionMixerBuilder {
             })
             .unwrap_or("auto");
         let backend = super::elements::select_backend(pref)?;
+        let start_time = properties::parse_start_time(props);
 
         info!(
             "Building vision mixer: {} inputs, PGM={}x{}@{}/{}, MV={}x{}@{}/{}, backend={:?}, pgm={}, pvw={}",
@@ -186,6 +187,7 @@ impl BlockBuilder for VisionMixerBuilder {
             labels: &labels,
             latency_ms,
             min_upstream_ms,
+            start_time,
             pgm_w,
             pgm_h,
             mv_w,
@@ -227,6 +229,7 @@ pub(super) struct PipelineParams<'a> {
     pub(super) labels: &'a [String],
     pub(super) latency_ms: u64,
     pub(super) min_upstream_ms: u64,
+    pub(super) start_time: super::elements::StartTime,
     pub(super) pgm_w: u32,
     pub(super) pgm_h: u32,
     pub(super) mv_w: u32,
