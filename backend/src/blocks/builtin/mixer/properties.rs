@@ -48,6 +48,18 @@ pub(super) fn parse_num_groups(properties: &HashMap<String, PropertyValue>) -> u
         .clamp(0, MAX_GROUPS)
 }
 
+/// Highest bus sample rate the mixer accepts (Hz).
+const MAX_SAMPLE_RATE: u64 = 384_000;
+
+/// Parse the bus sample rate in Hz; 0 (default) leaves it to the aggregators.
+/// Values above [`MAX_SAMPLE_RATE`] fall back to 0.
+pub(super) fn parse_sample_rate(properties: &HashMap<String, PropertyValue>) -> i32 {
+    match get_u64_prop(properties, "sample_rate", 0) {
+        rate @ 1..=MAX_SAMPLE_RATE => rate as i32,
+        _ => 0,
+    }
+}
+
 /// Get a float property with default.
 pub(super) fn get_float_prop(
     properties: &HashMap<String, PropertyValue>,
