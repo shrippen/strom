@@ -344,10 +344,13 @@ fn link_pad_through_clocksync(
         .build()
         .map_err(|e| format!("clocksync: {}", e))?;
 
-    let appsink = gst_app::AppSink::builder()
-        .name(appsink_name)
-        .sync(false)
-        .build();
+    // Restricting the caps here makes a hardware decoder negotiate system memory.
+    let system_caps = gst::Caps::builder("video/x-raw").build();
+    let mut appsink = gst_app::AppSink::builder().name(appsink_name).sync(false);
+    if state.system_memory && state.decode && media_type == "video" {
+        appsink = appsink.caps(&system_caps);
+    }
+    let appsink = appsink.build();
 
     let appsink_element = appsink.upcast_ref::<gst::Element>();
 

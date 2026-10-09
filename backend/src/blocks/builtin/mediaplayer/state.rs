@@ -60,6 +60,8 @@ pub struct MediaPlayerState {
     pub decode: bool,
     /// Whether clocksync pacing is enabled
     pub sync: bool,
+    /// Hand decoded video over in system memory (hardware decoders download)
+    pub system_memory: bool,
     /// Configured media files directory (for resolving relative playlist paths)
     pub media_path: std::path::PathBuf,
     /// Shared timestamp offset (ns) for the appsink→appsrc bridge.
