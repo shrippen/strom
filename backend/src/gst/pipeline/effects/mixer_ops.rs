@@ -229,6 +229,7 @@ impl PipelineManager {
         dsk_index: usize,
         num_inputs: usize,
         enabled: bool,
+        duration_ms: u64,
     ) -> Result<(), PipelineError> {
         // DSK pads are on the dist compositor (mixer) at sink_{num_inputs + dsk_index}
         let mixer_id = format!("{}:mixer", block_instance_id);
@@ -240,7 +241,11 @@ impl PipelineManager {
         let pad_name = format!("sink_{}", num_inputs + dsk_index);
         if let Some(pad) = find_pad(mixer, &pad_name) {
             let alpha = if enabled { 1.0f64 } else { 0.0f64 };
-            pad.set_property("alpha", alpha);
+            if duration_ms == 0 {
+                pad.set_property("alpha", alpha);
+            } else {
+                fade_pad_alpha(mixer, &pad, alpha, duration_ms);
+            }
             // Update overlay state for DSK tracking
             if let Some(state) =
                 crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(block_instance_id)
@@ -983,4 +988,45 @@ impl PipelineManager {
         );
         Ok(())
     }
+}
+
+/// Fade a compositor pad's alpha from its current value to `target` over
+/// `duration_ms` (ease-in-out, mixer stream time like transitions). The
+/// binding is neutralized afterwards so later direct alpha writes stick.
+fn fade_pad_alpha(mixer: &gst::Element, pad: &gst::Pad, target: f64, duration_ms: u64) {
+    use gstreamer_controller::prelude::*;
+    use gstreamer_controller::InterpolationMode;
+
+    let start = pad.property::<f64>("alpha");
+    let Some(cs) = crate::gst::control_bindings::fresh_control_source(
+        pad.upcast_ref(),
+        "alpha",
+        InterpolationMode::Linear,
+    ) else {
+        pad.set_property("alpha", target);
+        return;
+    };
+    let now = mixer
+        .query_position::<gst::ClockTime>()
+        .unwrap_or(gst::ClockTime::ZERO);
+    let duration_ns = (duration_ms * 1_000_000) as f64;
+    let keyframes = strom_types::vision_mixer::TRANSITION_KEYFRAMES as u32;
+    for i in 0..=keyframes {
+        let t = i as f64 / keyframes as f64;
+        let eased = (1.0 - (t * std::f64::consts::PI).cos()) / 2.0;
+        cs.set(
+            now + gst::ClockTime::from_nseconds((duration_ns * t) as u64),
+            start + (target - start) * eased,
+        );
+    }
+
+    let pad = pad.clone();
+    gst::glib::timeout_add_once(
+        std::time::Duration::from_millis(duration_ms + 100),
+        move || {
+            crate::gst::control_bindings::wipe_control_binding(pad.upcast_ref(), "alpha");
+            pad.set_property("alpha", target);
+            drop(cs);
+        },
+    );
 }

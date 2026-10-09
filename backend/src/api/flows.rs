@@ -2259,7 +2259,7 @@ pub async fn toggle_dsk(
     let dsk_index = req.dsk - 1;
 
     state
-        .set_dsk_enabled(&flow_id, &block_id, dsk_index, req.enabled)
+        .set_dsk_enabled(&flow_id, &block_id, dsk_index, req.enabled, req.duration_ms)
         .await
         .map_err(|e| {
             error!("Failed to toggle DSK: {}", e);

@@ -834,7 +834,7 @@ impl PipelineManager {
 
         // Controllable properties can generally be changed at runtime
         // They're designed for dynamic updates via GstController
-        let can_change_at_runtime = controllable;
+        let can_change_at_runtime = controllable || is_live_safe(element, property_name);
 
         match current_state {
             PipelineState::Playing => {
@@ -1171,6 +1171,20 @@ fn enum_choices(class: &glib::EnumClass) -> String {
     format!("valid: {}", listed.join(", "))
 }
 
+/// Properties without the MUTABLE_PLAYING flag that are still safe to
+/// change while playing, as (element type, property).
+const LIVE_SAFE_PROPERTIES: &[(&str, &str)] = &[
+    // Shifts buffer timestamps only, e.g. an audio delay for lip sync.
+    ("GstIdentity", "ts-offset"),
+];
+
+fn is_live_safe(element: &gst::Element, property_name: &str) -> bool {
+    let type_name = element.type_().name();
+    LIVE_SAFE_PROPERTIES
+        .iter()
+        .any(|(t, p)| *t == type_name && *p == property_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1401,3 +1415,4 @@ mod tests {
         assert_eq!(value.get::<f64>().expect("not a gdouble"), 1.0);
     }
 }
+

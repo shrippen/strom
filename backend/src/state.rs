@@ -2354,6 +2354,7 @@ impl AppState {
         block_instance_id: &str,
         dsk_index: usize,
         enabled: bool,
+        duration_ms: u64,
     ) -> Result<(), PipelineError> {
         let num_inputs = self
             .get_vision_mixer_num_inputs(flow_id, block_instance_id)
@@ -2362,7 +2363,13 @@ impl AppState {
         let manager = pipelines.get(flow_id).ok_or_else(|| {
             PipelineError::InvalidFlow(format!("Pipeline not running for flow: {}", flow_id))
         })?;
-        manager.set_dsk_enabled(block_instance_id, dsk_index, num_inputs, enabled)?;
+        manager.set_dsk_enabled(
+            block_instance_id,
+            dsk_index,
+            num_inputs,
+            enabled,
+            duration_ms,
+        )?;
         drop(pipelines);
 
         // Broadcast DSK state change (1-based dsk number)
