@@ -252,6 +252,29 @@ impl<'a> PipelineParams<'a> {
         format!("{}:{}", self.instance_id, name)
     }
 
+    /// Border underlay sources: live or not, and their caps.
+    ///
+    /// Non-live (the default) adds no latency, but a non-live
+    /// `videotestsrc` stamps its buffers from 0 and pushes them while the
+    /// pipeline prerolls. With `start_time_selection=first` (base time 0,
+    /// inputs carry clock time) the compositors take the earliest first
+    /// buffer as output start, so the underlays would start the output at
+    /// running time 0 — far behind the live inputs, whose frames then wait
+    /// as "future" buffers (content pads show nothing) until the
+    /// compositor has caught up with clock time. Live underlays stamp
+    /// running time instead; at the program frame rate they add at most
+    /// one output frame of latency.
+    pub(super) fn underlay_source(&self) -> (bool, String) {
+        let live = self.start_time == super::elements::StartTime::First;
+        let (n, d) = if live { self.pgm_framerate } else { (5, 1) };
+        (
+            live,
+            format!(
+                "video/x-raw,format=RGBA,width=16,height=16,framerate={n}/{d},pixel-aspect-ratio=1/1"
+            ),
+        )
+    }
+
     /// Caps feature of the compositor's native memory, if not system memory.
     /// Only the CUDA backend needs one here: the GL builder spells out its
     /// GL-memory caps itself.

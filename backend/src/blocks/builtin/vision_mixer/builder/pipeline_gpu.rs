@@ -307,17 +307,17 @@ pub(super) fn build_gpu_pipeline(
             .collect();
         // Low framerate: the color only changes on border edits and the
         // mixer keeps compositing the latest buffer between pushes.
-        let underlay_caps: gst::Caps =
-            "video/x-raw,format=RGBA,width=16,height=16,framerate=5/1,pixel-aspect-ratio=1/1"
-                .parse()
-                .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
+        let (underlay_live, underlay_caps_str) = p.underlay_source();
+        let underlay_caps: gst::Caps = underlay_caps_str
+            .parse()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
         for name in &underlay_chains {
             let src_id = p.id(&format!("{}_src", name));
             let cf_id = p.id(&format!("{}_caps", name));
             let up_id = p.id(&format!("{}_upload", name));
             let src = gst::ElementFactory::make("videotestsrc")
                 .name(&src_id)
-                .property("is-live", false)
+                .property("is-live", underlay_live)
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", src_id, e)))?;
             src.set_property_from_str("pattern", "solid-color");

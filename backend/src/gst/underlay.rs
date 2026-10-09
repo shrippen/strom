@@ -10,8 +10,11 @@
 //! covers a lower zone's border like a stacked framed card.
 //!
 //! Each underlay pad is fed by a tiny `videotestsrc pattern=solid-color`
-//! (16×16, non-live so it adds no latency); the border color is changed by
-//! writing the source's `foreground-color` (`0xAARRGGBB`).
+//! (16×16); the border color is changed by writing the source's
+//! `foreground-color` (`0xAARRGGBB`). It is non-live so it adds no latency,
+//! except with start time "first": there it is live at the program frame
+//! rate, or its buffers stamped from 0 would start the compositor's output
+//! far behind the live inputs (see `PipelineParams::underlay_source`).
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
