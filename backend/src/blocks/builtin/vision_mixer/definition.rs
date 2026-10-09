@@ -337,7 +337,7 @@ fn vision_mixer_definition() -> BlockDefinition {
         ExposedProperty {
             name: "num_dsk_inputs".to_string(),
             label: "DSK Inputs".to_string(),
-            description: "Number of Downstream Keyer inputs for graphics overlay (0-4)".to_string(),
+            description: "Number of Downstream Keyer inputs for graphics overlay (0-8)".to_string(),
             property_type: PropertyType::Enum {
                 values: vec![
                     EnumValue {
@@ -359,6 +359,22 @@ fn vision_mixer_definition() -> BlockDefinition {
                     EnumValue {
                         value: "4".to_string(),
                         label: Some("4 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "5".to_string(),
+                        label: Some("5 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "6".to_string(),
+                        label: Some("6 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "7".to_string(),
+                        label: Some("7 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "8".to_string(),
+                        label: Some("8 DSK".to_string()),
                     },
                 ],
             },
