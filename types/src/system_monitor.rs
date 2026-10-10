@@ -31,6 +31,9 @@ pub struct SystemStats {
     pub total_memory: u64,
     /// Used system memory in bytes
     pub used_memory: u64,
+    /// Resident memory of the strom process in bytes (if available)
+    #[serde(default)]
+    pub process_memory: Option<u64>,
     /// GPU statistics (if available)
     pub gpu_stats: Vec<GpuStats>,
     /// OpenGL renderer info from GStreamer (if available)
