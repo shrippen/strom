@@ -25,7 +25,7 @@ use tracing::info;
 
 mod audio_meter;
 mod pad_layout;
-mod pipeline_cpu;
+pub(crate) mod pipeline_cpu;
 mod pipeline_gpu;
 
 /// Caps feature of CUDA device memory (NVIDIA `nvcodec` elements).
