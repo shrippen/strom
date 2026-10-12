@@ -579,3 +579,20 @@ fn overlay_timer_exits_when_its_appsrc_is_orphaned() {
     let _ = appsrc.set_state(gst::State::Null);
     unregister_flow(&flow_id);
 }
+
+/// Idle DSK layers must not hold program back: the compositors ignore pads
+/// that never got a buffer.
+#[test]
+fn test_compositors_ignore_inactive_pads() {
+    use super::elements::{make_dist_compositor, make_mv_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+
+    gst::init().unwrap();
+    let dist = make_dist_compositor(CompositorBackend::Software, 20, 20, StartTime::First).unwrap();
+    let mv = make_mv_compositor(CompositorBackend::Software, 20, 20, StartTime::First).unwrap();
+    for mixer in [dist, mv] {
+        assert!(mixer.property::<bool>("ignore-inactive-pads"));
+    }
+}
