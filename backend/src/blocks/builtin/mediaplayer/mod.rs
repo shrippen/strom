@@ -12,6 +12,7 @@ mod bridge;
 mod builder;
 mod definition;
 mod state;
+mod still;
 
 pub use builder::MediaPlayerBuilder;
 pub use definition::get_blocks;
@@ -100,6 +101,7 @@ mod tests {
             ts_offset: Arc::new(AtomicI64::new(i64::MIN)),
             main_pipeline: gst::glib::WeakRef::new(),
             bus_watch: std::sync::Mutex::new(None),
+            still: Default::default(),
         }
     }
 
@@ -215,7 +217,7 @@ mod tests {
         assert_eq!(def.id, "builtin.media_player");
         assert_eq!(def.category, "Inputs");
         assert!(def.built_in);
-        assert_eq!(def.exposed_properties.len(), 4);
+        assert_eq!(def.exposed_properties.len(), 5);
 
         let decode = def
             .exposed_properties
