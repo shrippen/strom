@@ -17,7 +17,7 @@
 //! - capsfilter: Sets output caps for proper codec negotiation
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
-use crate::gpu::video_convert_mode;
+use crate::gpu::{video_convert_mode, VideoConvertMode};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
@@ -123,12 +123,7 @@ impl BlockBuilder for VideoEncBuilder {
         let encoder_id = format!("{}:encoder", instance_id);
         let capsfilter_id = format!("{}:capsfilter", instance_id);
 
-        let videoconvert = gst::ElementFactory::make(convert_element_name)
-            .name(&convert_id)
-            .build()
-            .map_err(|e| {
-                BlockBuildError::ElementCreation(format!("{}: {}", convert_element_name, e))
-            })?;
+        let videoconvert = build_convert(convert_mode, &convert_id)?;
 
         let encoder = gst::ElementFactory::make(&encoder_name)
             .name(&encoder_id)
@@ -204,6 +199,42 @@ impl BlockBuilder for VideoEncBuilder {
             pad_properties: HashMap::new(),
         })
     }
+}
+
+/// Build the converter in front of the encoder, named `name`.
+///
+/// `videoconvert` (software mode) only takes system memory, but a CUDA
+/// producer such as the vision mixer's CUDA compositor hands over
+/// `memory:CUDAMemory` and the link fails with not-negotiated. In software
+/// mode the converter is therefore a bin `cudadownload ! videoconvert`
+/// when `cudadownload` exists; it passes system memory through unchanged.
+fn build_convert(mode: VideoConvertMode, name: &str) -> Result<gst::Element, BlockBuildError> {
+    let make = |factory: &str, name: &str| {
+        gst::ElementFactory::make(factory)
+            .name(name)
+            .build()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", factory, e)))
+    };
+
+    if mode != VideoConvertMode::Software || gst::ElementFactory::find("cudadownload").is_none() {
+        return make(mode.element_name(), name);
+    }
+
+    let download = make("cudadownload", &format!("{}-download", name))?;
+    let convert = make(mode.element_name(), &format!("{}-convert", name))?;
+    let bin = gst::Bin::builder().name(name).build();
+    let to_err = |e: gst::glib::BoolError| BlockBuildError::ElementCreation(e.to_string());
+    bin.add_many([&download, &convert]).map_err(to_err)?;
+    download.link(&convert).map_err(to_err)?;
+    let ghost = |element: &gst::Element, pad: &str| {
+        let target = element.static_pad(pad).expect("static pad");
+        gst::GhostPad::builder_with_target(&target)
+            .map(|b| b.name(pad).build())
+            .map_err(to_err)
+    };
+    bin.add_pad(&ghost(&download, "sink")?).map_err(to_err)?;
+    bin.add_pad(&ghost(&convert, "src")?).map_err(to_err)?;
+    Ok(bin.upcast())
 }
 
 /// Get the parser element name for the given codec.
