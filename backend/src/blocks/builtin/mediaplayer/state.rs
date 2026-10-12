@@ -79,6 +79,8 @@ pub struct MediaPlayerState {
     /// holding its file descriptors — for the life of the process. Keeping the
     /// id is what lets [`MediaPlayerState::shutdown`] break it.
     pub bus_watch: Mutex<Option<gst::glib::SignalHandlerId>>,
+    /// Last video frame, repeated while paused or at the end of the playlist.
+    pub still: Arc<super::still::StillFrame>,
 }
 
 impl MediaPlayerState {
@@ -244,6 +246,7 @@ impl MediaPlayerState {
         source_element.set_property("uri", &uri);
 
         // Start playing again
+        self.still.release();
         pipeline.set_state(gst::State::Playing).map_err(|e| {
             error!("Failed to start internal pipeline: {:?}", e);
             "Failed to start playback".to_string()
@@ -266,6 +269,7 @@ impl MediaPlayerState {
         // Reset timestamp offset so the bridge recomputes from the first buffer
         // after resume — prevents accumulated drift from pause duration.
         self.ts_offset.store(i64::MIN, Ordering::SeqCst);
+        self.still.release();
         pipeline.set_state(gst::State::Playing).map_err(|e| {
             error!("Failed to resume playback: {:?}", e);
             "Failed to resume playback".to_string()
@@ -288,7 +292,15 @@ impl MediaPlayerState {
             "Failed to pause playback".to_string()
         })?;
         self.is_paused.store(true, Ordering::SeqCst);
+        self.hold_still();
         Ok(())
+    }
+
+    /// Repeat the last video frame until playback goes on (see `still`).
+    pub fn hold_still(&self) {
+        if let Some(appsrc) = &self.video_appsrc {
+            self.still.hold(appsrc, self.main_pipeline.clone());
+        }
     }
 
     /// Stop playback: pause and seek to the beginning.

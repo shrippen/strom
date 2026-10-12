@@ -142,6 +142,12 @@ fn apply_post_build_properties(
         let latency_ns = min_upstream_latency_ms * 1_000_000;
         mixer.set_property("min-upstream-latency", latency_ns);
     }
+    // Pads that never got a buffer (a DSK layer or input nobody feeds yet)
+    // would make the live aggregator wait for its deadline on every
+    // frame, adding the whole latency budget to program (~50 ms).
+    if mixer.find_property("ignore-inactive-pads").is_some() {
+        mixer.set_property("ignore-inactive-pads", true);
+    }
     if mixer.find_property("start-time-selection").is_some() {
         // Use "zero" instead of "first" to avoid a race condition in GStreamer 1.26:
         // with "first", if the aggregator srcpad task runs before any buffer arrives,

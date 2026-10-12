@@ -527,3 +527,103 @@ fn test_block_encoder_preference() {
         }
     }
 }
+
+/// Software conversion must take GPU memory from a CUDA producer (the vision
+/// mixer's CUDA compositor); plain videoconvert fails with not-negotiated.
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload)"]
+fn test_software_convert_accepts_cuda_memory() {
+    init_gst();
+    let pipeline = gst::parse::launch(
+        "videotestsrc num-buffers=3 ! cudaupload ! video/x-raw(memory:CUDAMemory) ! \
+         identity name=from_gpu",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    let convert = build_convert(VideoConvertMode::Software, "x264enc", "convert").expect("convert");
+    // System memory only, like a software encoder.
+    let to_cpu = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            "video/x-raw,format=I420".parse::<gst::Caps>().unwrap(),
+        )
+        .build()
+        .unwrap();
+    let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+    pipeline.add_many([&convert, &to_cpu, &sink]).unwrap();
+    let from_gpu = pipeline.by_name("from_gpu").unwrap();
+    gst::Element::link_many([&from_gpu, &convert, &to_cpu, &sink])
+        .expect("software convert links GPU to system memory");
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let msg = pipeline
+        .bus()
+        .unwrap()
+        .timed_pop_filtered(
+            gst::ClockTime::from_seconds(10),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        )
+        .expect("EOS or error within 10 s");
+    pipeline.set_state(gst::State::Null).unwrap();
+    if let gst::MessageView::Error(err) = msg.view() {
+        panic!("software convert rejected CUDA memory: {}", err.error());
+    }
+}
+
+/// NVENC gets `cudaupload ! cudaconvert` in every mode: autovideoconvert
+/// would take system memory through OpenGL (strom grew ~30 MB/h there).
+#[test]
+fn test_nvenc_skips_autovideoconvert() {
+    init_gst();
+    for mode in [VideoConvertMode::GpuAccelerated, VideoConvertMode::Software] {
+        let chain = convert_chain(mode, "nvh264enc");
+        assert!(!chain.contains(&"autovideoconvert"), "{:?}", chain);
+    }
+    assert_eq!(
+        convert_chain(VideoConvertMode::GpuAccelerated, "x264enc"),
+        vec!["autovideoconvert"]
+    );
+}
+
+/// In front of NVENC the converter takes I420 in CUDA memory (the CUDA
+/// mixer's program), which NVENC itself and videoconvert both reject, and
+/// I420 in system memory (an ISO recording).
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA and NVENC"]
+fn test_nvenc_convert_takes_cuda_and_system_memory() {
+    init_gst();
+    for upload in ["cudaupload ! video/x-raw(memory:CUDAMemory) !", ""] {
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=3 ! video/x-raw,format=I420 ! {} identity name=from",
+            upload
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let convert = build_convert(VideoConvertMode::GpuAccelerated, "nvh264enc", "convert")
+            .expect("convert");
+        let encoder = gst::ElementFactory::make("nvh264enc").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline.add_many([&convert, &encoder, &sink]).unwrap();
+        let from = pipeline.by_name("from").unwrap();
+        gst::Element::link_many([&from, &convert, &encoder, &sink])
+            .expect("convert links to NVENC");
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let msg = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("EOS or error within 10 s");
+        pipeline.set_state(gst::State::Null).unwrap();
+        if let gst::MessageView::Error(err) = msg.view() {
+            panic!("NVENC path failed ({}): {}", upload, err.error());
+        }
+    }
+}
