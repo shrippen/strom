@@ -588,11 +588,26 @@ fn test_compositors_ignore_inactive_pads() {
     use crate::blocks::builtin::start_time::StartTime;
     use gstreamer as gst;
     use gstreamer::prelude::*;
+    use gstreamer_video::gst_base::prelude::*;
+    use gstreamer_video::gst_base::Aggregator;
 
     gst::init().unwrap();
-    let dist = make_dist_compositor(CompositorBackend::Software, 20, 20, StartTime::First).unwrap();
-    let mv = make_mv_compositor(CompositorBackend::Software, 20, 20, StartTime::First).unwrap();
-    for mixer in [dist, mv] {
-        assert!(mixer.property::<bool>("ignore-inactive-pads"));
+    // GL and CUDA only where their plugins exist; glvideomixerelement has
+    // no ignore-inactive-pads property, the aggregator API still applies.
+    let backends = [
+        (CompositorBackend::Software, "compositor"),
+        (CompositorBackend::OpenGL, "glvideomixerelement"),
+        (CompositorBackend::Cuda, "cudacompositor"),
+    ];
+    for (backend, factory) in backends {
+        if gst::ElementFactory::find(factory).is_none() {
+            continue;
+        }
+        let dist = make_dist_compositor(backend, 20, 20, StartTime::First).unwrap();
+        let mv = make_mv_compositor(backend, 20, 20, StartTime::First).unwrap();
+        for mixer in [dist, mv] {
+            let aggregator = mixer.downcast_ref::<Aggregator>().unwrap();
+            assert!(aggregator.ignores_inactive_pads(), "{}", factory);
+        }
     }
 }

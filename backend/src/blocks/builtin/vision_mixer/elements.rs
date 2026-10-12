@@ -4,6 +4,8 @@ use crate::blocks::BlockBuildError;
 use crate::gpu;
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video::gst_base;
+use gstreamer_video::gst_base::prelude::*;
 use tracing::{debug, info, trace};
 
 /// Compositor backend selection result.
@@ -145,8 +147,10 @@ fn apply_post_build_properties(
     // Pads that never got a buffer (a DSK layer or input nobody feeds yet)
     // would make the live aggregator wait for its deadline on every
     // frame, adding the whole latency budget to program (~50 ms).
-    if mixer.find_property("ignore-inactive-pads").is_some() {
-        mixer.set_property("ignore-inactive-pads", true);
+    // glvideomixerelement has no property for it, so set it through the
+    // aggregator API, which every compositor backend has.
+    if let Some(aggregator) = mixer.downcast_ref::<gst_base::Aggregator>() {
+        aggregator.set_ignore_inactive_pads(true);
     }
     if mixer.find_property("start-time-selection").is_some() {
         // Use "zero" instead of "first" to avoid a race condition in GStreamer 1.26:
