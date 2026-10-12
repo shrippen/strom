@@ -579,3 +579,46 @@ fn overlay_timer_exits_when_its_appsrc_is_orphaned() {
     let _ = appsrc.set_state(gst::State::Null);
     unregister_flow(&flow_id);
 }
+
+/// CUDA inputs take formats `cudaupload` has no caps for: ProRes 4444
+/// decodes to A444_10LE, VP9 with alpha to A420 (stingers with alpha).
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_input_takes_alpha_formats() {
+    use super::builder::pipeline_cpu::{make_input_convert, CUDA_UPLOAD};
+    use super::elements::CompositorBackend;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+
+    gst::init().unwrap();
+    for format in ["A444_10LE", "A420"] {
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=3 ! video/x-raw,format={} ! identity name=from \
+             cudacompositor name=mix ! fakesink",
+            format
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let convert = make_input_convert(CompositorBackend::Cuda, CUDA_UPLOAD, "convert").unwrap();
+        pipeline.add(&convert).unwrap();
+        let from = pipeline.by_name("from").unwrap();
+        let mix = pipeline.by_name("mix").unwrap();
+        gst::Element::link_many([&from, &convert, &mix]).expect(format);
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let msg = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("EOS or error within 10 s");
+        pipeline.set_state(gst::State::Null).unwrap();
+        if let gst::MessageView::Error(err) = msg.view() {
+            panic!("{} into the CUDA mixer: {}", format, err.error());
+        }
+    }
+}

@@ -121,7 +121,7 @@ pub(super) fn build_cpu_pipeline(
         // GPU-memory sources (e.g. nvh264dec from efpsrt_input) are
         // downloaded by a bridge on the queue, see install_cpu_bridge.
         install_cpu_bridge(p, &queue, &q_id);
-        let videoconvert = elements::make_element(vc_factory, &vc_id_dsk)?;
+        let videoconvert = make_input_convert(p.backend, vc_factory, &vc_id_dsk)?;
 
         elems.push((q_id.clone(), queue));
         elems.push((vc_id_dsk.clone(), videoconvert));
@@ -315,7 +315,7 @@ pub(super) fn build_cpu_pipeline(
 
         let queue = elements::make_queue(&q_id)?;
         install_cpu_bridge(p, &queue, &q_id);
-        let videoconvert = elements::make_element(vc_factory, &vc_in_id)?;
+        let videoconvert = make_input_convert(p.backend, vc_factory, &vc_in_id)?;
         let tee = elements::make_tee(&tee_id)?;
 
         elems.push((q_id.clone(), queue));
@@ -588,12 +588,44 @@ pub(super) fn build_cpu_pipeline(
 }
 
 /// Uploads system (and passes through CUDA) memory for `cudacompositor`.
-const CUDA_UPLOAD: &str = "cudaupload";
+pub(crate) const CUDA_UPLOAD: &str = "cudaupload";
 
 /// Format conversion for the CPU `compositor`. Not `autovideoconvert`: on
 /// GStreamer 1.28 it fails to negotiate against the compositor
 /// (not-negotiated on every input); GPU memory is bridged instead.
 const CPU_CONVERT: &str = "videoconvert";
+
+/// Converter in front of the compositor for an input or DSK layer.
+///
+/// On CUDA a `videoconvert` comes first: `cudaupload` takes neither
+/// `A444_10LE` (ProRes 4444) nor `A420` (VP9 with alpha), so a stinger
+/// with alpha failed with not-negotiated. `videoconvert` turns those into
+/// an alpha format CUDA takes and passes everything else through,
+/// CUDA memory included.
+pub(crate) fn make_input_convert(
+    backend: CompositorBackend,
+    factory: &str,
+    name: &str,
+) -> Result<gst::Element, BlockBuildError> {
+    if backend != CompositorBackend::Cuda {
+        return elements::make_element(factory, name);
+    }
+    let convert = elements::make_element(CPU_CONVERT, &format!("{}-convert", name))?;
+    let upload = elements::make_element(factory, &format!("{}-upload", name))?;
+    let bin = gst::Bin::builder().name(name).build();
+    let to_err = |e: gst::glib::BoolError| BlockBuildError::ElementCreation(e.to_string());
+    bin.add_many([&convert, &upload]).map_err(to_err)?;
+    convert.link(&upload).map_err(to_err)?;
+    let ghost = |element: &gst::Element, pad: &str| {
+        let target = element.static_pad(pad).expect("static pad");
+        gst::GhostPad::builder_with_target(&target)
+            .map(|b| b.name(pad).build())
+            .map_err(to_err)
+    };
+    bin.add_pad(&ghost(&convert, "sink")?).map_err(to_err)?;
+    bin.add_pad(&ghost(&upload, "src")?).map_err(to_err)?;
+    Ok(bin.upcast())
+}
 
 /// CPU backend only: download GPU-memory input (CUDA, VA, GL) on the queue
 /// in front of `videoconvert`, which takes system memory only.
