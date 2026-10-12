@@ -384,6 +384,7 @@ fn link_pad_through_clocksync(
     let ts_offset = Arc::clone(&state.ts_offset);
     let main_pipeline_weak = state.main_pipeline.clone();
     let pushed_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let still = (media_type == "video").then(|| Arc::clone(&state.still));
 
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
@@ -427,7 +428,7 @@ fn link_pad_through_clocksync(
                 };
 
                 // Build the sample to push, applying timestamp offset if needed
-                let push_result = if offset_ns != 0 {
+                let sample = if offset_ns != 0 {
                     if let Some(pts_val) = pts {
                         let adjusted = (pts_val.nseconds() as i64 + offset_ns).max(0) as u64;
                         let mut new_buf = buffer.copy();
@@ -444,13 +445,17 @@ fn link_pad_through_clocksync(
                         if let Some(ref caps) = owned_caps {
                             builder = builder.caps(caps);
                         }
-                        appsrc.push_sample(&builder.build())
+                        builder.build()
                     } else {
-                        appsrc.push_sample(&sample)
+                        sample
                     }
                 } else {
-                    appsrc.push_sample(&sample)
+                    sample
                 };
+                if let Some(still) = &still {
+                    still.store(&sample);
+                }
+                let push_result = appsrc.push_sample(&sample);
 
                 // Don't kill the appsink on transient errors (e.g. FLUSHING while
                 // the main pipeline is still starting). Drop the sample and retry
@@ -548,6 +553,7 @@ pub fn watch_internal_bus(
                     }
                     Err(e) => {
                         info!("Media Player {}: End of playlist: {}", block_id_for_bus, e);
+                        state_for_bus.hold_still();
                         events.broadcast(StromEvent::MediaPlayerStateChanged {
                             flow_id,
                             block_id: block_id_for_bus.clone(),
