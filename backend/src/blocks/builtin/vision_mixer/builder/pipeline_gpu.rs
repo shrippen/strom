@@ -326,6 +326,11 @@ pub(super) fn build_gpu_pipeline(
                 .property("caps", &underlay_caps)
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", cf_id, e)))?;
+            // The underlay feeds glupload without a queue in between: without
+            // this, borders are empty textures on NVIDIA (no frame around boxes).
+            if let Some(src_pad) = cf.static_pad("src") {
+                keep_own_memory(&src_pad);
+            }
             elems.push((src_id.clone(), src));
             elems.push((cf_id.clone(), cf));
             elems.push((up_id.clone(), elements::make_element("glupload", &up_id)?));
@@ -608,10 +613,17 @@ fn install_upload_bridge(queue: &gst::Element, queue_id: &str) {
         return;
     };
     crate::gst::gl_bridge::install_gl_upload_bridge(&src, queue_id);
+    keep_own_memory(&src);
+}
 
+/// Where `glupload`'s udmabuf path is broken (see
+/// `gpu::udmabuf_upload_broken`), hide its allocation proposal from
+/// everything upstream of `pad`, so the source keeps its own memory and
+/// `glupload` does a plain texture upload.
+fn keep_own_memory(pad: &gst::Pad) {
     if crate::gpu::udmabuf_upload_broken() {
         // Per allocation query (each negotiation), not per buffer.
-        src.add_probe(
+        pad.add_probe(
             gst::PadProbeType::QUERY_DOWNSTREAM,
             |_pad, info| match info.query() {
                 Some(q) if q.type_() == gst::QueryType::Allocation => gst::PadProbeReturn::Drop,
