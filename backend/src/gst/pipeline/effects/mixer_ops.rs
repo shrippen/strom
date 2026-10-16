@@ -5,6 +5,8 @@
 use super::super::{PipelineError, PipelineManager};
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use tracing::{info, warn};
 
 use crate::gst::crop::set_pad_crop;
@@ -241,10 +243,14 @@ impl PipelineManager {
         let pad_name = format!("sink_{}", num_inputs + dsk_index);
         if let Some(pad) = find_pad(mixer, &pad_name) {
             let alpha = if enabled { 1.0f64 } else { 0.0f64 };
+            let key = format!("{}:{}", mixer.name(), pad_name);
+            let generation = next_alpha_command(&key);
             if duration_ms == 0 {
+                // A running fade's keyframes would override the write.
+                crate::gst::control_bindings::wipe_control_binding(pad.upcast_ref(), "alpha");
                 pad.set_property("alpha", alpha);
             } else {
-                fade_pad_alpha(mixer, &pad, alpha, duration_ms);
+                fade_pad_alpha(mixer, &pad, alpha, duration_ms, key, generation);
             }
             // Update overlay state for DSK tracking
             if let Some(state) =
@@ -990,10 +996,38 @@ impl PipelineManager {
     }
 }
 
+/// Latest alpha command per DSK pad (`mixer:pad`). The end of a fade
+/// applies its target only while no newer command came: a DSK switched
+/// back on during a fade off must stay on.
+static ALPHA_COMMANDS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Count a new alpha command for `key` and return its number.
+fn next_alpha_command(key: &str) -> u64 {
+    let mut commands = ALPHA_COMMANDS.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = commands.entry(key.to_string()).or_default();
+    *generation += 1;
+    *generation
+}
+
+/// Whether `generation` is still the latest alpha command for `key`.
+fn is_latest_alpha_command(key: &str, generation: u64) -> bool {
+    let commands = ALPHA_COMMANDS.lock().unwrap_or_else(|e| e.into_inner());
+    commands.get(key) == Some(&generation)
+}
+
 /// Fade a compositor pad's alpha from its current value to `target` over
 /// `duration_ms` (ease-in-out, mixer stream time like transitions). The
-/// binding is neutralized afterwards so later direct alpha writes stick.
-fn fade_pad_alpha(mixer: &gst::Element, pad: &gst::Pad, target: f64, duration_ms: u64) {
+/// binding is neutralized afterwards so later direct alpha writes stick,
+/// unless a newer command for the pad (`key`, `generation`) took over.
+fn fade_pad_alpha(
+    mixer: &gst::Element,
+    pad: &gst::Pad,
+    target: f64,
+    duration_ms: u64,
+    key: String,
+    generation: u64,
+) {
     use gstreamer_controller::prelude::*;
     use gstreamer_controller::InterpolationMode;
 
@@ -1024,6 +1058,9 @@ fn fade_pad_alpha(mixer: &gst::Element, pad: &gst::Pad, target: f64, duration_ms
     gst::glib::timeout_add_once(
         std::time::Duration::from_millis(duration_ms + 100),
         move || {
+            if !is_latest_alpha_command(&key, generation) {
+                return;
+            }
             crate::gst::control_bindings::wipe_control_binding(pad.upcast_ref(), "alpha");
             pad.set_property("alpha", target);
             drop(cs);
