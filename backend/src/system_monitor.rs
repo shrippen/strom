@@ -40,6 +40,7 @@ impl SystemMonitor {
             num_cores,
             total_memory: 0,
             used_memory: 0,
+            process_memory: None,
             gpu_stats: Vec::new(),
             gl_renderer: None,
             timestamp: 0,
@@ -114,6 +115,11 @@ impl SystemMonitor {
             let cpu_usage = system.global_cpu_usage();
             let total_memory = system.total_memory();
             let used_memory = system.used_memory();
+            // Own resident memory, to spot leaks over long runs.
+            let process_memory = sysinfo::get_current_pid().ok().and_then(|pid| {
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), false);
+                system.process(pid).map(|p| p.memory())
+            });
 
             // Collect GPU stats
             #[allow(unused_mut)]
@@ -143,6 +149,7 @@ impl SystemMonitor {
                     num_cores,
                     total_memory,
                     used_memory,
+                    process_memory,
                     gpu_stats,
                     gl_renderer: gl_renderer.clone(),
                     timestamp,
