@@ -261,7 +261,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
 
 /// The crosspoints of `routes` as mix matrices, per zone: rows are zone
 /// channels, columns file channels. No routes: the file's channels to the
-/// same channels of the first zone.
+/// same channels of the first zone, a mono file to all of them.
 pub(crate) fn matrices(
     routes: &[SoundRoute],
     file_channels: u32,
@@ -270,9 +270,14 @@ pub(crate) fn matrices(
     let default_routes: Vec<SoundRoute>;
     let routes = if routes.is_empty() {
         let first = zone_channels.first().copied().unwrap_or(0);
-        default_routes = (0..file_channels.min(first))
+        let channels = if file_channels == 1 {
+            first
+        } else {
+            file_channels.min(first)
+        };
+        default_routes = (0..channels)
             .map(|c| SoundRoute {
-                channel: c,
+                channel: c.min(file_channels - 1),
                 zone: 0,
                 zone_channel: c,
                 gain_db: 0.0,
@@ -639,8 +644,8 @@ mod tests {
         let m = matrices(&[], 2, &[2, 4]);
         assert_eq!(m.len(), 1);
         assert_eq!(m[&0], vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
-        // Mono into stereo: the first channel only.
-        assert_eq!(matrices(&[], 1, &[2])[&0], vec![vec![1.0], vec![0.0]]);
+        // Mono into stereo: both channels.
+        assert_eq!(matrices(&[], 1, &[2])[&0], vec![vec![1.0], vec![1.0]]);
     }
 
     #[test]

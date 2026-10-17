@@ -341,6 +341,11 @@ mod tests {
         ));
         assert_eq!(zones.len(), 2);
         assert_eq!(zones[1].channels, MAX_ZONE_CHANNELS);
+        let many: Vec<String> = (0..20)
+            .map(|i| format!(r#"{{"name":"Z{i}","channels":1}}"#))
+            .collect();
+        let many = parse_zones(&props(&format!("[{}]", many.join(","))));
+        assert_eq!(many.len(), 16, "lmix shows have up to 16 zones");
         assert_eq!(parse_zones(&props("nope")), default_zones());
         assert_eq!(parse_zones(&props("[]")), default_zones());
         assert_eq!(parse_zones(&HashMap::new()), default_zones());
