@@ -25,6 +25,9 @@ pub struct StillFrame {
     last: Mutex<Option<gst::Sample>>,
     /// Bumped by every hold and release; a repeat runs while it matches.
     generation: AtomicU64,
+    /// Held by a repeat while it has the appsrc and the main pipeline in
+    /// hand, so [`release`](Self::release) can wait until it lets go.
+    busy: Mutex<()>,
 }
 
 impl StillFrame {
@@ -48,25 +51,32 @@ impl StillFrame {
             .name("player-still".into())
             .spawn(move || loop {
                 let Some(this) = this.upgrade() else { break };
-                if this.generation.load(Ordering::SeqCst) != generation {
-                    break;
-                }
-                let (Some(appsrc), Some(main)) = (appsrc.upgrade(), main.upgrade()) else {
-                    break;
-                };
-                let sample = this.last.lock().ok().and_then(|last| last.clone());
-                drop(this);
-                let interval = sample
-                    .as_ref()
-                    .and_then(|s| s.caps().and_then(frame_interval))
-                    .unwrap_or(DEFAULT_INTERVAL);
-                if let (Some(sample), Some(now)) = (sample, running_time(&main)) {
-                    if let Some(repeat) = restamp(&sample, now, interval) {
-                        // FLUSHING while the main pipeline (re)starts is
-                        // transient; the next round tries again.
-                        let _ = appsrc.push_sample(&repeat);
+                let interval = {
+                    // The strong references live only inside this block: one
+                    // held across the sleep keeps a torn-down main pipeline
+                    // alive, and strom reports its elements as leaked.
+                    let _busy = this.busy.lock().unwrap_or_else(|e| e.into_inner());
+                    if this.generation.load(Ordering::SeqCst) != generation {
+                        break;
                     }
-                }
+                    let (Some(appsrc), Some(main)) = (appsrc.upgrade(), main.upgrade()) else {
+                        break;
+                    };
+                    let sample = this.last.lock().ok().and_then(|last| last.clone());
+                    let interval = sample
+                        .as_ref()
+                        .and_then(|s| s.caps().and_then(frame_interval))
+                        .unwrap_or(DEFAULT_INTERVAL);
+                    if let (Some(sample), Some(now)) = (sample, running_time(&main)) {
+                        if let Some(repeat) = restamp(&sample, now, interval) {
+                            // FLUSHING while the main pipeline (re)starts is
+                            // transient; the next round tries again.
+                            let _ = appsrc.push_sample(&repeat);
+                        }
+                    }
+                    interval
+                };
+                drop(this);
                 std::thread::sleep(interval);
             });
         if let Err(e) = spawned {
@@ -74,9 +84,11 @@ impl StillFrame {
         }
     }
 
-    /// Stop repeating (play, file switch).
+    /// Stop repeating (play, file switch, teardown). Returns once no
+    /// repeat holds the appsrc or the main pipeline any more.
     pub fn release(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        drop(self.busy.lock());
     }
 }
 

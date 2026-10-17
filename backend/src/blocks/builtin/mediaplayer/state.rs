@@ -421,6 +421,9 @@ impl MediaPlayerState {
     /// callback — which reads the same lock — cannot be blocked by a
     /// `set_state(Null)` that is itself waiting for the callback's thread.
     pub fn shutdown(&self) {
+        // A paused player repeats its last frame into the main pipeline;
+        // that repeat must let go before the flow is dropped.
+        self.still.release();
         let pipeline = match self.internal_pipeline.write() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
