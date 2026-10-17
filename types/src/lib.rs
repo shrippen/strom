@@ -27,7 +27,7 @@ pub mod mixer;
 pub mod network;
 pub mod ports;
 pub mod routing;
-pub mod show_sound;
+pub mod show_playback;
 pub mod state;
 pub mod stats;
 pub mod stinger;

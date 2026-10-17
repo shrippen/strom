@@ -1,5 +1,5 @@
-//! Types for the Show Sound block (`builtin.show_sound`): sound zones, and
-//! sound cues played into them at run time.
+//! Types for the Show Playback block (`builtin.show_playback`): sound zones
+//! and stages, and the sounds and pictures played into them at run time.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,18 @@ pub const GAIN_MAX_DB: f64 = 12.0;
 /// Longest fade (ms).
 pub const FADE_MAX_MS: u64 = 600_000;
 
+/// Most stages one block carries.
+pub const MAX_STAGES: usize = 8;
+
+/// Most pictures one block shows at once.
+pub const MAX_PICTURES: usize = 64;
+
+/// Largest stage side (px).
+pub const MAX_STAGE_PX: u32 = 7680;
+
+/// Highest picture layer; a higher layer is in front.
+pub const MAX_LAYER: u32 = 1000;
+
 /// One zone: a named group of output channels, one block output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
@@ -29,6 +41,15 @@ pub struct ShowZone {
     pub name: String,
     /// 1 to [`MAX_ZONE_CHANNELS`].
     pub channels: u32,
+}
+
+/// One stage: a picture surface of its own, one block output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct ShowStage {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One crosspoint: a channel of the sound's file into a channel of a zone.
@@ -46,7 +67,7 @@ pub struct SoundRoute {
     pub gain_db: f64,
 }
 
-/// When a sound added to the block starts.
+/// When a sound or picture added to the block starts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -120,7 +141,82 @@ pub struct ZoneLevelRequest {
     pub duration_ms: u64,
 }
 
-/// Where a sound is.
+/// How a picture fills its stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PictureFit {
+    /// Whole picture, aspect kept, bars where it does not fill.
+    #[default]
+    Fit,
+    /// The stage filled, aspect kept, the picture cut where it overhangs.
+    Fill,
+    /// The stage filled, aspect changed.
+    Stretch,
+}
+
+/// What a video does at its end.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PictureEnd {
+    /// Its last frame stays until it is stopped.
+    #[default]
+    Hold,
+    /// It leaves the stage.
+    Stop,
+}
+
+/// Show a picture (video or still image) on a stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct AddPictureRequest {
+    /// Name of the picture in this block; a picture of the same id is
+    /// replaced.
+    pub id: String,
+    /// `file://` URI (or a path in the media folder) of the file.
+    pub uri: String,
+    /// Stage, by its index in the block's `stages`.
+    #[serde(default)]
+    pub stage: usize,
+    /// 0 to [`MAX_LAYER`]; on the same layer the later picture is in front.
+    #[serde(default)]
+    pub layer: u32,
+    /// 0 (clear) to 1.
+    #[serde(default = "one")]
+    pub opacity: f64,
+    #[serde(default)]
+    pub fit: PictureFit,
+    #[serde(default)]
+    pub end: PictureEnd,
+    #[serde(default)]
+    pub start: SoundStart,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+/// Fade a picture's opacity (S-curve).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct PictureFadeRequest {
+    pub opacity: f64,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub end: FadeEnd,
+}
+
+/// Set a stage's brightness (dimmer, 0 = black), faded over `duration_ms`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct StageLevelRequest {
+    pub brightness: f64,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+/// Where a sound or picture is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -146,12 +242,17 @@ pub struct SoundInfo {
     pub error: Option<String>,
 }
 
-/// The block's sounds.
+/// The block's sounds and pictures.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
-pub struct ShowSoundState {
+pub struct ShowPlaybackState {
     pub zones: Vec<ShowZone>,
     pub sounds: Vec<SoundInfo>,
+    #[serde(default)]
+    pub stages: Vec<ShowStage>,
+    /// The pictures on the stages.
+    #[serde(default)]
+    pub pictures: Vec<SoundInfo>,
 }
 
 /// Linear gain of `db`; [`GAIN_MIN_DB`] and below is 0.

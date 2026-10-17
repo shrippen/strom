@@ -15,7 +15,7 @@ pub mod osc;
 pub mod ports;
 pub mod probes;
 pub mod sdp_transform;
-pub mod show_sound;
+pub mod show_playback;
 pub mod stinger;
 pub mod system_clock;
 pub mod version;
