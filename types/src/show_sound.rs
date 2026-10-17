@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Most zones one block carries.
-pub const MAX_ZONES: usize = 8;
+pub const MAX_ZONES: usize = 16;
 
 /// Most channels of one zone.
 pub const MAX_ZONE_CHANNELS: u32 = 8;
