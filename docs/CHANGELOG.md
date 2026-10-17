@@ -2,6 +2,325 @@
 
 All notable changes to the Strom GStreamer Flow Engine project.
 
+## [0.7.1] - 2026-10-12
+
+### Fixed
+- Stinger: decode a clip in software when its hardware decoder refuses it, and keep a failed analysis (#1054)
+- Local Input: multichannel audio is unpositioned, with explicit surround choices (ASIO 3+ channels) (#1059)
+- Headless: run the server on its own thread on Windows and Linux too (#1060)
+- Windows: run OpenGL on the discrete GPU on hybrid laptops (#1061)
+- WHIP Input: restore the default jitterbuffer latency to 200 ms (#1064)
+- Media Player: play HLS with muxed audio and video in passthrough (#1065)
+- Probe: a block without inputs gets no Probe button, and the API answers `400 Block '<id>' has no inputs to probe` instead of a 404 (#1065)
+
+### Changed
+- Media Player: `decode` now defaults to `true`, as on SRT, EFP and WHIP Input (#1065). **Saved flows:** a Media Player that never set `decode` now decodes. If it feeds an encoded-only output (SRT, RTMP, Recorder), that output refuses raw video and the flow fails to start. Set `decode=false` on the Media Player to keep passthrough.
+- WHIP, WHEP: split the block files into input and output modules (#1053)
+
+### CI
+- Tests: fix main-red tests on macOS and Windows (glupload format, partial file size, `filesrc` paths), and run the stinger tests one at a time (#1050, #1051)
+
+### Documentation
+- Catch up with 0.7.0 (#1052)
+- README: repoint the OSC badge to hosted Open Live (#1058)
+
+---
+
+## [0.7.0] - 2026-10-08
+
+### Added
+- Vision Mixer: stinger transitions — classic, track matte and mask only — with a clip library, cue and take (#1010)
+- Live Recorder: a new recorder block, `builtin.liverecorder`, where a quiet track holds nothing up (#1034)
+- Media: download a file from a URL into the media library, and stream uploads with progress (#1043)
+- Vision Mixer: change input labels while the flow runs (#1014)
+
+### Fixed
+- Vision Mixer: adapt GPU inputs to any pixel format, converting only while needed (#1033)
+- Vision Mixer: multiview tally follows a cut on the same frame (#1009)
+- Vision Mixer: the PGM compositor no longer waits on the multiview to allocate (CPU) (#1029)
+- Vision Mixer: key overlay registries by flow and block id (#1015)
+- Vision Mixer: a restarted border frame is due on the mixer's next output, and no border underlay restart holds a source while the flow stops (#1031, #1038)
+- WHIP Input: give a POST's session back on every error path (#987)
+- WHIP Input: flush a released slot's `appsrc` so a new session gets none of the old one's frames (#1028)
+- WHEP player: recover from a brief ICE drop and end the session on an early Disconnect (#1047)
+- Media Player: hold typefind until a start from READY has returned (#996)
+- Pipeline: drop sink QoS events with `Handled`, not `Drop` (#1011)
+- GStreamer: restore a streaming thread's priority when it leaves the flow (#1046)
+- Windows: give blocks a media path without the verbatim `\\?\` prefix, so the Recorder can write files (#1045)
+- Frontend: draw cables for links without a pad name (#1035)
+- Docker: install `gsettings-desktop-schemas` explicitly (#1048)
+
+### Performance
+- Vision Mixer: run idle FX slots in passthrough (#1007)
+- Vision Mixer: static border underlays, no frame for unconfigured borders (#1005)
+- Vision Mixer: stop re-uploading an unchanged overlay, cap meter redraws at 4 fps (#1004)
+- Vision Mixer: meter audio without a queue thread or a sink (#1006)
+- Mixer: stop bus mixers re-querying latency while a channel is unfed (#1003)
+
+### CI
+- Run every macOS/Windows test binary with `--no-fail-fast` (#1016)
+- Tests: stop waiting out fixed windows the tests do not need, and stabilise the mixer, vision mixer, recorder and Monitor queue tests (#995, #1000, #1008, #1012, #1018, #1026, #1027, #1039, #1041)
+
+### Documentation
+- Catch up with the code, and add `AGENTS.md` (#1019)
+
+---
+
+## [0.7.0-alpha2] - 2026-10-05
+
+### Fixed
+- WHIP Input: link a session pad only after its branch is PLAYING (#976)
+- WHIP Input: release only a slot the releasing session still holds (#972)
+- WHIP Input: judge a seat's audio and video separately (#983)
+- WHEP Output: re-adapt the video input when its caps change (#985)
+- Media Player: start the internal pipeline on the flow's clock (#984)
+- Media Player: stop a burst of jumps and pauses deadlocking the player (#986)
+- Mixer: stop group buses stacking the block latency on main (#971)
+- Audio Encoder: refuse an out-of-range bitrate instead of panicking (#982)
+- Thumbnail: adapt the thumbnail tap to CUDA memory on its tee (#973)
+- Docker: keep the CEF cache across a strom-full restart (#979)
+
+### Changed
+- Frontend: use the shared `strom-types` API types instead of local copies (#915)
+- Build: Rust 1.98.1 and cargo-zigbuild 0.23.4 (#941)
+
+### CI
+- Stop compiling the tree three times on macOS/Windows PRs; drop NVML on macOS (#990)
+- sccache: probe a write in the preflight, add a concurrency group (#989)
+- Pass gstcefsrc build inputs to the shell through env (#980)
+- Tests: run the GPU vision mixer GL tests on Linux CI, guard an empty EFP `data_stream_ids`, and stabilise the WHIP watchdog, mixer rewind, DSK and media player bridge tests (#975, #977, #978, #981, #988, #991)
+
+---
+
+## [0.7.0-alpha1] - 2026-10-02
+
+### Added
+- HTML Input: a block that renders a web page as a video (and audio) source, with remote control of the page over DevTools (#879)
+- Media Player: play live streams, extra tracks and URLs (#945)
+- Auth: sign the login cookie so logins survive a restart (#947)
+
+### Changed
+- Audio Mixer and Live Audio Router: resample every input to one configurable sample rate, 48 kHz by default (#946)
+- GStreamer: decide video input adapters in one place, and write down the block contract (#951)
+
+### Fixed
+- WHIP Input: consolidate the fixes from #759, #893, #787, #901 and #943 (#957)
+- WHIP Input: judge a session by the media it produces, not what arrives (#756)
+- WHIP Input: null a session bin `whipserversrc` removes mid-teardown (#763)
+- WHEP Output: unhide player audio controls; expose `Location` cross-origin (#811)
+- Vision Mixer: accept CUDA-memory inputs on the GPU backend (#948)
+- Vision Mixer: keep an Auto-format input on formats `videocrop` takes (#925)
+- Vision Mixer: keep a source's new shape when it changes size (#894)
+- GStreamer: keep NVDEC frames on the GPU into a GL input (#952)
+- Mixers: stop a late first input rewinding a live aggregator (#895)
+- Mixer: stop the monitor bus stacking the block latency (#920)
+- Mixer: clamp negative counts and live knee writes (#904)
+- Media Player: build file URIs that work on Windows (#959)
+- Media Player: drop a buffer with no PTS at the bridge (#961)
+- Auth: accept a percent-encoded `?auth_token=` (#908)
+- Frontend: fix two request-pad bugs in the graph (#911)
+
+### Performance
+- WHEP Output: convert a video input once, not once per viewer (#949)
+
+### Tests
+- Make backend unit tests guard real code, replace demonstration tests with guards on the real blocks, and consolidate the integration tests (#905, #907, #909, #910, #912)
+- GL: fail instead of skipping when the GPU mixer breaks (#917, #954)
+- Stabilise the AES67, live audio router and vision mixer tests, and run the two SRT integration tests on Windows again (#923, #929, #950, #958)
+
+### Documentation
+- Make the PR template ask for claims and their evidence (#853)
+- Use `--locked` when installing trunk (#940)
+
+---
+
+## [0.6.11] - 2026-09-29
+
+### Added
+- Ports: a port pool — reserve port numbers from a Strom-administered set (#852, #890)
+- Logging: optional structured event logging and a JSON stdout format (#789)
+- GStreamer: give pipeline threads a macOS QoS class so they run on P cores (#723)
+- Live Audio Router: output bus headroom and a ceiling (#795)
+- Stats: WHIP Input jitterbuffer stats per seat (#793)
+- Frontend: show RTP statistics for any block that reports them (#857)
+- Clocks: point to the chrony setup script when the clock is poorly disciplined (#888)
+- Live Audio Router: warn when an input's negotiated channels differ from its declaration (#889)
+
+### Changed
+- Outputs: fail the flow with the block's reason when it refuses an input (#869)
+- RTMP Output: refuse H.264 in a profile RTMP receivers reject (#871)
+- Video Encoder: default to the codec's 8-bit 4:2:0 profile (#850)
+
+### Fixed
+- MPEG-TS/SRT Input: relink an output when the demuxer replaces its pad (#877)
+- Pipeline: bound the `set_state(NULL)` join in stop and drop (#874)
+- Properties: read enum properties on elements and pads as their nick (#875)
+- Live Audio Router: show the bus its consumer's format before input (#881)
+- Vision Mixer: reject a PiP zone whose sources exceed its capacity (#808)
+- Frontend: show units and a generic heading in the block statistics panel (#882)
+- Video Encoder: close out the bitrate overflow panic and the unchecked preset/rate-control properties #821 left, and clamp derived values instead of refusing them (#769, #876)
+
+### Performance
+- Video Format: thread the scaling step, so a resize to or from 4K no longer runs on one core (#731)
+
+### CI
+- Windows: put GStreamer's DLLs ahead of Git's in the test PATH (#892)
+- Stop Static JS Tests re-running on every label event (#858)
+- Dependencies: security updates only from Dependabot, monthly otherwise; group cargo patch bumps, excluding GStreamer; drop the unused tower-http `fs` feature (#859, #860, #866, #891)
+- Tests: stabilise the mach port, `run_with_deadline` and live audio router tests (#870, #873, #878)
+
+### Documentation
+- The output block input convention (#867)
+- How quiet draft PRs are handled (#872)
+
+---
+
+## [0.6.10] - 2026-09-22
+
+### Added
+- Blocks: WHIP/WHEP — per-block ICE transport policy (#832)
+- Monitor: per-thread CPU sampling on macOS via mach `thread_info` (#722)
+- Tools: a probe for how a host bridges GPU video memory (#843)
+
+### Fixed
+- Device Source: let the capture front negotiate GL memory, so a GLMemory-only `avfvideosrc` no longer stalls macOS camera capture to ~1 fps (#837, #842)
+- GStreamer: download GL memory where a consumer cannot take it (#802)
+- Vision Mixer: keep per-pixel alpha on keyed pads when `output_format` cannot carry alpha (#748)
+- Video Encoder: reject out-of-range client properties instead of panicking (#769, #821)
+- Config: map every `STROM_*` environment variable explicitly (#831)
+- Docker: pin the patched decklink plugin by digest (#836)
+
+### CI
+- Windows: fail the job on a failing first command, and install every plugin (#838)
+
+### Documentation
+- Catch up with 0.6.9 — RTMP output, and the MCP server that is gone (#830)
+- Agent: make triage and review look for what is already open (#841)
+
+---
+
+## [0.6.9] - 2026-09-16
+
+### Added
+- Blocks: `builtin.rtmp_output` — publish a flow to an RTMP endpoint (#827)
+- Blocks: `builtin.audioenc`, an audio encoder block (#744)
+- Blocks: live audio router on synchronising buses, with per-sample crosspoint fades (#740)
+- EFP over SRT: reach EFP's embedded-data channel from a flow, and carry embedded data end to end with per-track stream routing (#700, #778)
+- WHIP/WHEP Input: make `drop-on-latency` configurable (#791)
+
+### Changed
+- MCP: drop the stdio MCP server and the dead demo script — the HTTP endpoint is the supported transport (#765)
+- Flow: warn when a block starts with partially wired inputs (#777)
+
+### Performance
+- macOS: let the platform choose its own convert mode, and thread the conversion (#726)
+
+### Fixed
+- WHIP: let a rejoining client take over a dead session's slot (#753)
+- WHIP: keep a slot's audio format stable across sessions (#758)
+- WHIP: detect a dropped ingest sooner and retry with backoff (#754)
+- WHIP: stop slots without a publisher holding the pipeline out of PLAYING (#749)
+- WHIP: evaluate the inactivity watchdog per poll tick, not per timeout (#752)
+- Recorder: end a track that stops so the rest of the recording continues (#757)
+- Recorder: lock the `ts_passthrough` multifilesink until its input carries data (#824)
+- Recorder: stop an input with no data holding the pipeline out of PLAYING (#750)
+- RTP: disable header extension aggregation on every depayloader (#721)
+- Vision Mixer: stop overlay timer threads on every teardown path (#784)
+- Vision Mixer: join overlay timer threads before the process exits (#746)
+- Compositor editor: undo the optimistic take swap when the request fails (#807)
+- Compositor: honour `force_live` on the CPU mixer path (#745)
+- Bus: remove exactly as many bus signal watches as were added (#788)
+- Pipeline: check property values against the spec instead of panicking (#724)
+- API: stop discarding links written with a bare element id (#725)
+- MCP: make the HTTP endpoint usable and correct, with tests (#766)
+- Version: report Kubernetes pods as containerised (#816)
+- macOS: keep the headless server out of App Nap (#735)
+- CEF: give it a per-instance cache directory on native runs (#671)
+- Build: accept git provenance as Docker build args (#800)
+
+### CI
+- Build macOS and Windows on main, and on labelled pull requests (#768)
+- Run the frontend's own tests (#826)
+- Stop the FX wipe test failing on a slow runner (#825)
+- Serialize `test_from_figment_cli_args_override` (#760)
+
+### Documentation
+- Vision Mixer: producer switching guide for the HTTP API (#798)
+- Hardware requirements and sizing doc (WIP) (#736)
+- Note publishing to YouTube Live and Twitch as an idea (#776)
+- WHIP: drop the stale `=true` from the `drop-on-latency` comment (#829)
+- Agent: move role, budget, priority order and review reasoning into the repo, and tighten the PR and onward-message rules (#751, #761, #773, #774, #775, #779, #780, #781, #801)
+
+### Dependencies
+- Bump cairo-rs, rust-embed, sysinfo, serial_test, mdns-sd, thiserror and libc (#696, #698, #732, #734, #818, #819, #820)
+
+---
+
+## [0.6.8] - 2026-09-01
+
+### Fixed
+- Env: a set-but-empty Strom variable means unset, not empty (#738)
+
+### Documentation
+- Agent: move the review-bot protocol into the repo, with two checks in code (#728)
+- Agent: scope `class=` to fix markers, so its absence stops being a finding (#730)
+
+---
+
+## [0.6.7] - 2026-08-27
+
+### Added
+- AES67 Output: expose the RTP payload type as a block property (#677)
+- WHIP/WHEP: expose `do-retransmission` as a block property (#663)
+- WHIP: add a `jitterbuffer_latency_ms` property to prevent stalls on session start (#665)
+
+### Fixed
+- State: one teardown path for every way a flow goes away (#715)
+- WHIP: stop a session's inactivity watchdog when the session ends (#720)
+- WHIP: ask the publisher for a keyframe when video does not start (#693)
+- WebRTC: refuse to build WHIP/WHEP blocks when ICE is unavailable (#689)
+- WHEP: download GL-memory video before it reaches `whepserversink` (#687)
+- WHEP: quieten and escape the unregistered-endpoint log lines (#713)
+- MPEG-TS over SRT: stop `srtsink` replaying a stale PAT/PMT to every caller (#712)
+- Pipeline: fail `start()` when the pipeline cannot reach PLAYING (#705)
+- Recorder: request `splitmuxsink` pads for connected tracks only (#676)
+- Recorder: add a queue per leg between parser and `splitmuxsink` (#675)
+- API: return a JSON 404 for unmatched `/api/*` paths (#692, #695)
+- API: honour the client-supplied flow id on `POST /api/flows` (#681)
+- macOS: run a Cocoa run loop in headless mode so CEF can initialise (#669)
+- macOS: install libnice-gstreamer so `webrtcbin` has ICE (#686)
+- Frontend: pin ambiguous float literals to f32 for the new rustc lint (#664)
+- Scripts: make the pre-commit hook match the checks CI actually runs (#718)
+
+### CI
+- Run the tests that were silently skipping, and make platform builds selectable (#678)
+- macOS: raise the job timeout from 30 to 45 minutes (#688)
+
+### Documentation
+- Correct the X11/Docker-only claim for HTML rendering on macOS (#670)
+
+### Dependencies
+- Bump gstreamer and gstreamer-video to 0.25.3 together, plus gst-plugin-rtp, eframe, gio, bcrypt, uuid, http-body-util and quinn-proto (#657, #658, #659, #660, #662, #697, #699, #704)
+
+---
+
+## [0.6.6] - 2026-06-26
+
+### Added
+- TAMS Output block with OSC PAT/SAT authentication (#647)
+
+### CI
+- Make the sccache cache non-blocking via a backend preflight (#654)
+- Point the sccache cache at the olivedev MinIO instance (#653)
+
+### Documentation
+- Document the 0.6.3–0.6.5 releases (#641)
+
+### Dependencies
+- Bump uuid, thread-priority, rustls, time, sysinfo, chrono, tower-http and egui_extras (#642, #643, #644, #645, #646, #648, #649, #650, #651, #652)
+
+---
+
 ## [0.6.5] - 2026-06-12
 
 ### Added
@@ -15,6 +334,9 @@ All notable changes to the Strom GStreamer Flow Engine project.
 ### Fixed
 - Vision Mixer: glitch, roll and punch transitions left driver-dependent residual artifacts after completion — transition envelopes now settle to an exact identity pass (#639)
 - Frontend: keep `wgpu` out of the WASM build after the eframe 0.34.2 default-feature regression (#639)
+
+### Documentation
+- README: link to the hosted Open Live platform (#638)
 
 ---
 
@@ -109,6 +431,10 @@ All notable changes to the Strom GStreamer Flow Engine project.
 - SRT: don't synthesize a phantom caller on an idle listener (#585)
 - Properties: coerce int/uint values for `gdouble`/`gfloat` properties (#586)
 - Build: isolate the WASM target dir to avoid a cargo lock deadlock (#591)
+- Tests: shrink the volume-ramp buffer size to stabilise mid-fade samples (#581)
+
+### CI
+- Raise the Check (Linux) timeout from 15 to 25 minutes (#584)
 
 ### Performance
 - Skip absent elements in block property read-back (#601)
@@ -117,7 +443,8 @@ All notable changes to the Strom GStreamer Flow Engine project.
 - Add an operator-facing Vision Mixer user guide (#593)
 
 ### Dependencies
-- Bump reqwest (#597), garde (#596), serde_json (#598), mdns-sd (#599), gstreamer-controller (#574), tower-http (#575), egui_extras (#576), gst-plugin-webrtc (#573), rand (#572)
+- Bump reqwest (#597), garde (#596), serde_json (#598), mdns-sd (#599), gstreamer-controller (#574), tower-http (#575), egui_extras (#576), gst-plugin-webrtc (#573), rand (#572), mdns-sd (#577)
+- `cargo update` patch bumps across the tree (#580)
 
 ---
 
@@ -139,6 +466,7 @@ All notable changes to the Strom GStreamer Flow Engine project.
 - Audio Mixer: smooth volume/mute via GstController (anti-zipper, anti-click) and honor `ramp_ms` on mute toggles with a cancel-guard (#539, #540)
 - Patched DeckLink plugin with synchronized capture group support (#554)
 - chrony NTP install script and runbook (#547)
+- DeckLink Input: expose `video-format` and `drop-no-signal-frames`; EFP over SRT: apply the Opus defaults and scale bitrate by channel count; DeckLink probe tooling (#541)
 
 ### Changed
 - Merge per-media DeckLink blocks into a single Input/Output block (#546)
@@ -154,6 +482,12 @@ All notable changes to the Strom GStreamer Flow Engine project.
 - Vision mixer: use GPU-aware videoconvert in the CPU pipeline (#534)
 - NVIDIA setup: apply cgroupfs + dev-char workarounds for the NVML cgroup-reload bug (#536)
 - Buffer age: show external pad label instead of internal "sink" (#535)
+
+### CI
+- Cache and verify the Zig tarball, switch to a mirror, install cargo-zigbuild from a prebuilt binary (#550)
+
+### Documentation
+- chrony NTP sync quality notes and a generic `[CLIENT]` log tag (#533)
 
 ### Dependencies
 - Bump sysinfo (#559), tower-http (#561), gst-plugin-inter (#560), gst-plugin-audiofx (#558), gstreamer-app (#557), utoipa (#542), egui (#545), tokio (#544), rustls (#543)
@@ -190,6 +524,10 @@ All notable changes to the Strom GStreamer Flow Engine project.
 
 ### Fixed
 - Unblock preroll on mpegtssrt output (`async=false`) (#504)
+- CEF: interim gstcefsrc downgrades to work around the MemoryInfra SIGILL, superseded by the shim in #508 (#505, #506, #507)
+
+### Dependencies
+- Bump rustls-webpki to 0.103.12 (#514)
 
 ---
 

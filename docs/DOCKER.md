@@ -1,5 +1,7 @@
 # Docker Deployment Guide
 
+> Code is the source of truth — this may have drifted; read the code for the current implementation.
+
 This is the generic Docker reference for Strom. For a guided, opinionated deployment
 (Docker run, GPU, ICE servers, authentication, verification) see
 [OPEN_LIVE_SETUP.md](OPEN_LIVE_SETUP.md) — it is the recommended starting point and ships a
@@ -14,7 +16,7 @@ docker pull eyevinntechnology/strom:latest        # base image
 docker pull eyevinntechnology/strom-full:latest   # + CEF/Chromium for HTML rendering
 ```
 
-Pin a specific version with a tag, e.g. `eyevinntechnology/strom:0.6.0`.
+Pin a specific version with a tag, e.g. `eyevinntechnology/strom:0.7.0` (tags `X.Y.Z`, `X.Y`, `X` and `latest` are published).
 
 ## Quick start
 
@@ -36,21 +38,31 @@ For GPU acceleration add `--gpus all` and `-e NVIDIA_DRIVER_CAPABILITIES=all` �
 
 ## Configuration
 
-Strom is configured via environment variables (see [DEVELOPMENT.md](DEVELOPMENT.md) for the
-full list and the CLI equivalents):
+Strom is configured via environment variables. `strom --help` lists the command-line
+options; every other setting, with its environment variable, is in `.strom.toml.example`.
+The common ones:
 
 | Variable | Purpose |
 |----------|---------|
 | `STROM_PORT` | HTTP server port (default `8080`) |
 | `STROM_DATA_DIR` | Data directory (default `/data` in the image) |
 | `STROM_DATABASE_URL` | PostgreSQL connection string (optional) — see [POSTGRESQL.md](POSTGRESQL.md) |
-| `STROM_ADMIN_USER` / `STROM_ADMIN_PASSWORD_HASH` / `STROM_API_KEY` | Authentication — see [AUTHENTICATION.md](AUTHENTICATION.md) |
+| `STROM_ADMIN_USER` / `STROM_ADMIN_PASSWORD_HASH` / `STROM_API_KEY` / `STROM_SESSION_SECRET` | Authentication — see [AUTHENTICATION.md](AUTHENTICATION.md) |
 | `STROM_SERVER_ICE_SERVERS` | STUN/TURN servers for WebRTC |
+| `STROM_SERVER_ICE_TRANSPORT_POLICY` | `all` (default) or `relay` to force WebRTC through TURN |
+| `STROM_PORTS` | Port numbers the pool hands out to callers (unset = pool off) — see [PORT_POOL.md](PORT_POOL.md) |
 | `STROM_TLS_CERT` / `STROM_TLS_KEY` | Built-in TLS (PEM) |
+| `STROM_MEDIA_PATH` | Media library directory (default `media/` under the data directory) |
+| `STROM_LOGGING_STDOUT_LOG_FORMAT` | `json` for container log collectors |
 | `RUST_LOG` | Logging level (default `info`) |
 
-Volumes: mount `./data:/data` for persistent storage. The `/data` volume is the only state
-Strom keeps by default.
+Volumes: mount `./data:/data` for persistent storage. The `/data` volume holds all of
+Strom's own state.
+
+In `strom-full`, the browser profiles of HTML sources (cookies, logins) live in the CEF cache
+at `/tmp/cef-cache`. It survives a container restart but not a replaced container. To keep
+logins across an image upgrade, mount a volume there (or point `GST_CEF_CACHE_LOCATION` at
+one), one per running container.
 
 ## Docker Compose
 
@@ -69,7 +81,7 @@ The [`Dockerfile`](../Dockerfile) uses a multi-stage build on Ubuntu 25.10 (Ques
 provides GStreamer 1.26 with the nvcodec fix:
 
 1. **Frontend builder** — builds the WASM frontend (platform-independent output).
-2. **Backend builder** — builds the backend and the MCP server, optionally cross-compiling
+2. **Backend builder** — builds the backend, optionally cross-compiling
    for ARM64 via Zig (targets an older glibc for broad compatibility — see
    [CROSS_COMPILE_ARM64.md](CROSS_COMPILE_ARM64.md)).
 3. **Runtime** — minimal Ubuntu with the GStreamer runtime plugins and the GL/EGL libraries
@@ -105,7 +117,8 @@ server {
 }
 ```
 
-Alternatively, terminate TLS in Strom itself with `STROM_TLS_CERT` / `STROM_TLS_KEY`.
+Alternatively, terminate TLS in Strom itself with `STROM_TLS_CERT` / `STROM_TLS_KEY`. Strom
+reloads the certificate when the files change.
 
 ### Logging and restart
 
@@ -120,7 +133,7 @@ logging:
 
 ### Backup
 
-The entire state lives under `/data`:
+Strom's state lives under `/data` (plus the CEF cache in `strom-full`, see Configuration):
 
 ```bash
 docker cp strom:/data ./backup/

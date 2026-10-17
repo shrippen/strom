@@ -14,6 +14,7 @@ use super::properties;
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
 use gstreamer as gst;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use strom_types::vision_mixer;
@@ -52,6 +53,16 @@ impl BlockBuilder for VisionMixerBuilder {
             })
             .collect();
 
+        if properties::parse_bool(props, strom_types::stinger::ENABLE_STINGER_PROPERTY, false) {
+            inputs.push(ExternalPad::with_label(
+                strom_types::stinger::STINGER_INPUT_PAD,
+                "Stinger",
+                MediaType::Video,
+                "queue_stinger",
+                "sink",
+            ));
+        }
+
         // DSK input pads
         for i in 0..num_dsk {
             inputs.push(ExternalPad::with_label(
@@ -71,7 +82,7 @@ impl BlockBuilder for VisionMixerBuilder {
                 format!("audio_in_{}", i),
                 format!("A{}", i),
                 MediaType::Audio,
-                format!("queue_audio_{}", i),
+                format!("audioconvert_audio_{}", i),
                 "sink",
             ));
         }
@@ -79,7 +90,7 @@ impl BlockBuilder for VisionMixerBuilder {
             "pgm_audio_in",
             "PGM Audio",
             MediaType::Audio,
-            "queue_audio_pgm",
+            "audioconvert_audio_pgm",
             "sink",
         ));
 
@@ -154,6 +165,8 @@ impl BlockBuilder for VisionMixerBuilder {
         let enable_fx = properties::parse_bool(props, "enable_fx", vision_mixer::DEFAULT_ENABLE_FX);
         let swap_pvw_pgm =
             properties::parse_bool(props, "swap_pvw_pgm", vision_mixer::DEFAULT_SWAP_PVW_PGM);
+        let enable_stinger =
+            properties::parse_bool(props, strom_types::stinger::ENABLE_STINGER_PROPERTY, false);
 
         let pref = props
             .get("compositor_preference")
@@ -200,6 +213,7 @@ impl BlockBuilder for VisionMixerBuilder {
             show_vu_meters,
             enable_fx,
             swap_pvw_pgm,
+            enable_stinger,
         };
 
         match backend {
@@ -244,6 +258,15 @@ pub(super) struct PipelineParams<'a> {
     pub(super) enable_fx: bool,
     /// Mirror the multiview layout (PGM left, PVW right).
     pub(super) swap_pvw_pgm: bool,
+    /// Build the stinger input: a graphic pad, and on the GPU a matte pad.
+    pub(super) enable_stinger: bool,
+}
+
+impl PipelineParams<'_> {
+    /// Sink index of the stinger graphic on the dist mixer (matte: + 1).
+    pub(super) fn stinger_pad_base(&self) -> usize {
+        vision_mixer::dist_stinger_pad_base(self.num_inputs, self.num_dsk_inputs, self.num_pips)
+    }
 }
 
 impl<'a> PipelineParams<'a> {
@@ -285,11 +308,6 @@ impl<'a> PipelineParams<'a> {
         }
     }
 
-    /// Raw video caps in the compositor's native memory.
-    fn raw_caps(&self) -> gst::caps::Builder<gst::caps::NoFeature> {
-        gst::Caps::builder("video/x-raw")
-    }
-
     /// Finish a caps builder, tagging it with the backend's memory feature.
     fn finish_caps(&self, builder: gst::caps::Builder<gst::caps::NoFeature>) -> gst::Caps {
         match self.memory_feature() {
@@ -300,41 +318,88 @@ impl<'a> PipelineParams<'a> {
 
     /// Caps pinning only the pixel format (input, DSK and overlay chains).
     pub(super) fn format_caps(&self, format: &str) -> gst::Caps {
-        self.finish_caps(self.raw_caps().field("format", format))
+        self.finish_caps(gst::Caps::builder("video/x-raw").field("format", format))
+    }
+
+    /// Raw video caps in the compositor's native memory, any format.
+    pub(super) fn memory_caps(&self) -> gst::Caps {
+        self.finish_caps(gst::Caps::builder("video/x-raw"))
+    }
+
+    /// Raw video caps with resolution, framerate and an optional pixel format.
+    fn raw_caps(&self, w: u32, h: u32, framerate: (i32, i32), format: Option<&str>) -> gst::Caps {
+        let mut builder = gst::Caps::builder("video/x-raw")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", gst::Fraction::new(framerate.0, framerate.1))
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
+        if let Some(fmt) = format {
+            builder = builder.field("format", fmt);
+        }
+        self.finish_caps(builder)
     }
 
     /// Build PGM output caps with resolution, framerate, and optional pixel format.
     pub(super) fn pgm_caps(&self) -> gst::Caps {
-        let mut builder = self
-            .raw_caps()
-            .field("width", self.pgm_w as i32)
-            .field("height", self.pgm_h as i32)
-            .field(
-                "framerate",
-                gst::Fraction::new(self.pgm_framerate.0, self.pgm_framerate.1),
-            )
-            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
-        if let Some(ref fmt) = self.output_format {
-            builder = builder.field("format", fmt.as_str());
-        }
-        self.finish_caps(builder)
+        self.raw_caps(
+            self.pgm_w,
+            self.pgm_h,
+            self.pgm_framerate,
+            self.output_format.as_deref(),
+        )
     }
 
     /// Build multiview output caps with resolution, framerate, and optional pixel format.
     pub(super) fn mv_caps(&self) -> gst::Caps {
-        let mut builder = self
-            .raw_caps()
-            .field("width", self.mv_w as i32)
-            .field("height", self.mv_h as i32)
-            .field(
-                "framerate",
-                gst::Fraction::new(self.mv_framerate.0, self.mv_framerate.1),
-            )
-            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
-        if let Some(ref fmt) = self.output_format {
-            builder = builder.field("format", fmt.as_str());
+        self.raw_caps(
+            self.mv_w,
+            self.mv_h,
+            self.mv_framerate,
+            self.output_format.as_deref(),
+        )
+    }
+
+    /// PGM caps with `format` instead of `output_format` — the software
+    /// compositor's blend space, see [`Self::alpha_blend_format`].
+    pub(super) fn pgm_blend_caps(&self, format: &str) -> gst::Caps {
+        self.raw_caps(self.pgm_w, self.pgm_h, self.pgm_framerate, Some(format))
+    }
+
+    /// Multiview caps with `format` instead of `output_format` — the software
+    /// compositor's blend space, see [`Self::alpha_blend_format`].
+    pub(super) fn mv_blend_caps(&self, format: &str) -> gst::Caps {
+        self.raw_caps(self.mv_w, self.mv_h, self.mv_framerate, Some(format))
+    }
+
+    /// The format the software compositor has to blend in so that keyed pads
+    /// keep their per-pixel alpha, or `None` when `output_format` needs no
+    /// substitute.
+    ///
+    /// `compositor` blends in its own output format and converts every sink
+    /// pad to it first, so an alpha-less `output_format` (I420, NV12, RGB, ...)
+    /// strips the alpha of DSK graphics, the multiview overlay and the border
+    /// underlays. Blending in the alpha-carrying counterpart and converting
+    /// once on the way out keeps the key and still hands `output_format`
+    /// downstream. Alpha-carrying and unknown formats are left alone.
+    pub(super) fn alpha_blend_format(&self) -> Option<&'static str> {
+        // `cudacompositor` gets CUDA memory, which no CPU convert takes.
+        if self.backend != CompositorBackend::Software {
+            return None;
         }
-        self.finish_caps(builder)
+        let fmt = self.output_format.as_deref()?;
+        let format = fmt.parse::<gst_video::VideoFormat>().ok()?;
+        let info = gst_video::VideoFormatInfo::from_format(format);
+        if info.has_alpha() {
+            return None;
+        }
+        // Match the chroma subsampling of the requested format so the extra
+        // hop costs nothing the output would not have cost anyway.
+        Some(match fmt {
+            "YUY2" | "UYVY" => "A422",
+            "v210" => "A422_10LE",
+            _ if info.is_rgb() || info.is_gray() => "RGBA",
+            _ => "A420",
+        })
     }
 
     /// Build PGM output caps for the GL-memory passthrough path.
@@ -424,10 +489,15 @@ pub(super) fn setup_overlay_renderer(
     overlay::register_overlay_renderer(p.flow_id, &block_id, Arc::clone(&renderer));
 
     let block_id_for_timer = block_id.clone();
+    let flow_id = p.flow_id;
     let renderer_for_timer = Arc::clone(&renderer);
     let mv_framerate = p.mv_framerate;
     ctx.register_element_setup(Box::new(move |_flow_id, _events| {
+        if let Ok(mut r) = renderer_for_timer.lock() {
+            r.track_mixer_pad();
+        }
         overlay::start_overlay_timer(
+            flow_id,
             block_id_for_timer.clone(),
             renderer_for_timer.clone(),
             mv_framerate,

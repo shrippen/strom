@@ -393,6 +393,57 @@ pub enum StromEvent {
         /// The effect as applied (after parameter clamping).
         effect: crate::effects::VideoEffect,
     },
+    /// A URL download into the media library started, progressed, or ended.
+    /// Progress is throttled per job; the final state (done, failed or
+    /// cancelled) is always sent.
+    MediaDownloadProgress(crate::media_download::MediaDownloadJob),
+    /// A stinger clip was cued on a vision mixer, or failed to load.
+    StingerCued {
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+        flow_id: FlowId,
+        block_id: String,
+        /// Playlist index on the stinger source.
+        index: usize,
+        /// Loaded and parked on its first frame.
+        ready: bool,
+        /// How long loading took.
+        cue_ms: u64,
+    },
+    /// A stinger take started: its first frame goes on air `take_to_air_ms`
+    /// after the request.
+    StingerStarted {
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+        flow_id: FlowId,
+        block_id: String,
+        /// As returned by the take request.
+        take_id: u64,
+        index: usize,
+        file: String,
+        variant: crate::stinger::StingerVariant,
+        downgraded_from: Option<crate::stinger::StingerVariant>,
+        from_input: usize,
+        to_input: usize,
+        take_to_air_ms: f64,
+        duration_ms: u64,
+    },
+    /// A stinger take finished, with what was measured.
+    StingerCompleted {
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+        flow_id: FlowId,
+        block_id: String,
+        report: crate::stinger::StingerTakeReport,
+    },
+    /// A stinger take could not play its clip.
+    StingerFailed {
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+        flow_id: FlowId,
+        block_id: String,
+        /// The failed take, when it got as far as being given an id.
+        take_id: Option<u64>,
+        reason: String,
+        /// The program still changed, without the clip.
+        program_changed: bool,
+    },
 }
 
 impl StromEvent {
@@ -861,6 +912,735 @@ impl StromEvent {
                     target
                 )
             }
+            StromEvent::MediaDownloadProgress(job) => match &job.error {
+                Some(error) => format!(
+                    "Media download {} of {} to {}: {:?} ({})",
+                    job.job_id, job.url, job.path, job.state, error
+                ),
+                None => format!(
+                    "Media download {} of {} to {}: {:?}, {} bytes",
+                    job.job_id, job.url, job.path, job.state, job.bytes
+                ),
+            },
+            StromEvent::StingerCued {
+                flow_id,
+                block_id,
+                index,
+                ready,
+                cue_ms,
+            } => format!(
+                "Vision mixer {} in flow {}: stinger clip {} {} in {} ms",
+                block_id,
+                flow_id,
+                index,
+                if *ready { "cued" } else { "failed to cue" },
+                cue_ms
+            ),
+            StromEvent::StingerStarted {
+                flow_id,
+                block_id,
+                file,
+                variant,
+                from_input,
+                to_input,
+                take_to_air_ms,
+                ..
+            } => format!(
+                "Vision mixer {} in flow {}: {:?} stinger '{}' from input {} to {}, on air in {:.0} ms",
+                block_id, flow_id, variant, file, from_input, to_input, take_to_air_ms
+            ),
+            StromEvent::StingerCompleted {
+                flow_id,
+                block_id,
+                report,
+            } => format!(
+                "Vision mixer {} in flow {}: stinger '{}' done, {}/{} clip frames, {} late{}",
+                block_id,
+                flow_id,
+                report.file,
+                report.frames_arrived,
+                report.frames_expected,
+                report.frames_late,
+                report
+                    .warning
+                    .as_ref()
+                    .map(|w| format!(": {}", w))
+                    .unwrap_or_default()
+            ),
+            StromEvent::StingerFailed {
+                flow_id,
+                block_id,
+                reason,
+                program_changed,
+                ..
+            } => format!(
+                "Vision mixer {} in flow {}: stinger failed ({}){}",
+                block_id,
+                flow_id,
+                reason,
+                if *program_changed {
+                    ", program changed without it"
+                } else {
+                    ""
+                }
+            ),
         }
+    }
+
+    // Three exhaustive (no-wildcard) accessors below: `event_type()`, `flow_id()`,
+    // `is_high_frequency()`. Adding a variant requires updating all three; the compiler
+    // enforces this.
+
+    /// The event's stable wire name (the serde `type` tag). Kept in sync with the wire
+    /// contract by the `event_type_matches_serde_wire_tag` test.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            StromEvent::FlowCreated { .. } => "FlowCreated",
+            StromEvent::FlowUpdated { .. } => "FlowUpdated",
+            StromEvent::FlowDeleted { .. } => "FlowDeleted",
+            StromEvent::FlowStarted { .. } => "FlowStarted",
+            StromEvent::FlowStopped { .. } => "FlowStopped",
+            StromEvent::FlowStateChanged { .. } => "FlowStateChanged",
+            StromEvent::PipelineError { .. } => "PipelineError",
+            StromEvent::PipelineWarning { .. } => "PipelineWarning",
+            StromEvent::PipelineInfo { .. } => "PipelineInfo",
+            StromEvent::PipelineEos { .. } => "PipelineEos",
+            StromEvent::PropertyChanged { .. } => "PropertyChanged",
+            StromEvent::PadPropertyChanged { .. } => "PadPropertyChanged",
+            StromEvent::Ping => "Ping",
+            StromEvent::MeterData { .. } => "MeterData",
+            StromEvent::SpectrumData { .. } => "SpectrumData",
+            StromEvent::LoudnessData { .. } => "LoudnessData",
+            StromEvent::LatencyData { .. } => "LatencyData",
+            StromEvent::SystemStats(_) => "SystemStats",
+            StromEvent::ThreadStats(_) => "ThreadStats",
+            StromEvent::PtpStats { .. } => "PtpStats",
+            StromEvent::SourceOutputAvailable { .. } => "SourceOutputAvailable",
+            StromEvent::SourceOutputUnavailable { .. } => "SourceOutputUnavailable",
+            StromEvent::SubscriptionStatusChanged { .. } => "SubscriptionStatusChanged",
+            StromEvent::QoSStats { .. } => "QoSStats",
+            StromEvent::StreamDiscovered { .. } => "StreamDiscovered",
+            StromEvent::StreamUpdated { .. } => "StreamUpdated",
+            StromEvent::StreamRemoved { .. } => "StreamRemoved",
+            StromEvent::MediaPlayerPosition { .. } => "MediaPlayerPosition",
+            StromEvent::MediaPlayerStateChanged { .. } => "MediaPlayerStateChanged",
+            StromEvent::TransitionTriggered { .. } => "TransitionTriggered",
+            StromEvent::AudioAnalyzerData { .. } => "AudioAnalyzerData",
+            StromEvent::RecorderFileChanged { .. } => "RecorderFileChanged",
+            StromEvent::RecorderAutoStop { .. } => "RecorderAutoStop",
+            StromEvent::TamsSegmentRegistered { .. } => "TamsSegmentRegistered",
+            StromEvent::TamsError { .. } => "TamsError",
+            StromEvent::BufferAgeWarning { .. } => "BufferAgeWarning",
+            StromEvent::BufferAgeProbe { .. } => "BufferAgeProbe",
+            StromEvent::BufferAgeProbeActivated { .. } => "BufferAgeProbeActivated",
+            StromEvent::BufferAgeProbeDeactivated { .. } => "BufferAgeProbeDeactivated",
+            StromEvent::VisionMixerStateChanged { .. } => "VisionMixerStateChanged",
+            StromEvent::VisionMixerDskChanged { .. } => "VisionMixerDskChanged",
+            StromEvent::VisionMixerOverlayAlphaChanged { .. } => "VisionMixerOverlayAlphaChanged",
+            StromEvent::VisionMixerFtbChanged { .. } => "VisionMixerFtbChanged",
+            StromEvent::VisionMixerEffectChanged { .. } => "VisionMixerEffectChanged",
+            StromEvent::MediaDownloadProgress(_) => "MediaDownloadProgress",
+            StromEvent::StingerCued { .. } => "StingerCued",
+            StromEvent::StingerStarted { .. } => "StingerStarted",
+            StromEvent::StingerCompleted { .. } => "StingerCompleted",
+            StromEvent::StingerFailed { .. } => "StingerFailed",
+        }
+    }
+
+    /// The flow this event pertains to, if any. Roughly a third of variants — system-wide
+    /// stats, AES67 stream discovery — are not scoped to a single flow and return `None`.
+    ///
+    /// Deliberately has no wildcard arm: adding a variant forces a decision here instead of
+    /// silently falling through to `None`.
+    pub fn flow_id(&self) -> Option<FlowId> {
+        match self {
+            StromEvent::FlowCreated { flow_id }
+            | StromEvent::FlowUpdated { flow_id }
+            | StromEvent::FlowDeleted { flow_id }
+            | StromEvent::FlowStarted { flow_id }
+            | StromEvent::FlowStopped { flow_id }
+            | StromEvent::FlowStateChanged { flow_id, .. }
+            | StromEvent::PipelineError { flow_id, .. }
+            | StromEvent::PipelineWarning { flow_id, .. }
+            | StromEvent::PipelineInfo { flow_id, .. }
+            | StromEvent::PipelineEos { flow_id }
+            | StromEvent::PropertyChanged { flow_id, .. }
+            | StromEvent::PadPropertyChanged { flow_id, .. }
+            | StromEvent::MeterData { flow_id, .. }
+            | StromEvent::SpectrumData { flow_id, .. }
+            | StromEvent::LoudnessData { flow_id, .. }
+            | StromEvent::LatencyData { flow_id, .. }
+            | StromEvent::PtpStats { flow_id, .. }
+            | StromEvent::QoSStats { flow_id, .. }
+            | StromEvent::MediaPlayerPosition { flow_id, .. }
+            | StromEvent::MediaPlayerStateChanged { flow_id, .. }
+            | StromEvent::TransitionTriggered { flow_id, .. }
+            | StromEvent::AudioAnalyzerData { flow_id, .. }
+            | StromEvent::RecorderFileChanged { flow_id, .. }
+            | StromEvent::RecorderAutoStop { flow_id, .. }
+            | StromEvent::TamsSegmentRegistered { flow_id, .. }
+            | StromEvent::TamsError { flow_id, .. }
+            | StromEvent::BufferAgeWarning { flow_id, .. }
+            | StromEvent::BufferAgeProbe { flow_id, .. }
+            | StromEvent::BufferAgeProbeActivated { flow_id, .. }
+            | StromEvent::BufferAgeProbeDeactivated { flow_id, .. }
+            | StromEvent::VisionMixerStateChanged { flow_id, .. }
+            | StromEvent::VisionMixerDskChanged { flow_id, .. }
+            | StromEvent::VisionMixerOverlayAlphaChanged { flow_id, .. }
+            | StromEvent::VisionMixerFtbChanged { flow_id, .. }
+            | StromEvent::VisionMixerEffectChanged { flow_id, .. }
+            | StromEvent::StingerCued { flow_id, .. }
+            | StromEvent::StingerStarted { flow_id, .. }
+            | StromEvent::StingerCompleted { flow_id, .. }
+            | StromEvent::StingerFailed { flow_id, .. } => Some(*flow_id),
+
+            // These only carry a source-side flow id (the flow publishing the output).
+            StromEvent::SourceOutputAvailable { source_flow_id, .. }
+            | StromEvent::SourceOutputUnavailable { source_flow_id, .. } => Some(*source_flow_id),
+
+            // Carries both a consumer and a source flow id; the consuming flow is the one
+            // this event is "about" from an operator's perspective (its subscription state
+            // changed), so it wins as the primary id.
+            StromEvent::SubscriptionStatusChanged {
+                consumer_flow_id, ..
+            } => Some(*consumer_flow_id),
+
+            StromEvent::Ping
+            | StromEvent::SystemStats(_)
+            | StromEvent::ThreadStats(_)
+            | StromEvent::StreamDiscovered { .. }
+            | StromEvent::StreamUpdated { .. }
+            | StromEvent::StreamRemoved { .. }
+            | StromEvent::MediaDownloadProgress(_) => None,
+        }
+    }
+
+    /// Whether this event is chatty enough that logging or forwarding it by default would
+    /// flood output — either because a single instance fires many times per second, or
+    /// because it fans out per connection, element, or flow even at a modest tick rate.
+    ///
+    /// Single source of truth for this classification — do not hand-maintain a second list
+    /// elsewhere. Deliberately has no wildcard arm: adding a variant forces a decision here.
+    pub fn is_high_frequency(&self) -> bool {
+        match self {
+            StromEvent::MeterData { .. }
+            | StromEvent::SpectrumData { .. }
+            | StromEvent::LoudnessData { .. }
+            | StromEvent::LatencyData { .. }
+            | StromEvent::SystemStats(_)
+            | StromEvent::ThreadStats(_)
+            | StromEvent::PtpStats { .. }
+            | StromEvent::QoSStats { .. }
+            | StromEvent::AudioAnalyzerData { .. }
+            | StromEvent::MediaPlayerPosition { .. }
+            | StromEvent::BufferAgeProbe { .. } => true,
+
+            // Progress ticks repeat several times a second per job; the final
+            // state of a download is a lifecycle event.
+            StromEvent::MediaDownloadProgress(job) => !job.state.is_finished(),
+
+            StromEvent::FlowCreated { .. }
+            | StromEvent::FlowUpdated { .. }
+            | StromEvent::FlowDeleted { .. }
+            | StromEvent::FlowStarted { .. }
+            | StromEvent::FlowStopped { .. }
+            | StromEvent::FlowStateChanged { .. }
+            | StromEvent::PipelineError { .. }
+            | StromEvent::PipelineWarning { .. }
+            | StromEvent::PipelineInfo { .. }
+            | StromEvent::PipelineEos { .. }
+            | StromEvent::PropertyChanged { .. }
+            | StromEvent::PadPropertyChanged { .. }
+            | StromEvent::Ping
+            | StromEvent::SourceOutputAvailable { .. }
+            | StromEvent::SourceOutputUnavailable { .. }
+            | StromEvent::SubscriptionStatusChanged { .. }
+            | StromEvent::StreamDiscovered { .. }
+            | StromEvent::StreamUpdated { .. }
+            | StromEvent::StreamRemoved { .. }
+            | StromEvent::MediaPlayerStateChanged { .. }
+            | StromEvent::TransitionTriggered { .. }
+            | StromEvent::RecorderFileChanged { .. }
+            | StromEvent::RecorderAutoStop { .. }
+            | StromEvent::TamsSegmentRegistered { .. }
+            | StromEvent::TamsError { .. }
+            | StromEvent::BufferAgeWarning { .. }
+            | StromEvent::BufferAgeProbeActivated { .. }
+            | StromEvent::BufferAgeProbeDeactivated { .. }
+            | StromEvent::VisionMixerStateChanged { .. }
+            | StromEvent::VisionMixerDskChanged { .. }
+            | StromEvent::VisionMixerOverlayAlphaChanged { .. }
+            | StromEvent::VisionMixerFtbChanged { .. }
+            | StromEvent::VisionMixerEffectChanged { .. }
+            | StromEvent::StingerCued { .. }
+            | StromEvent::StingerStarted { .. }
+            | StromEvent::StingerCompleted { .. }
+            | StromEvent::StingerFailed { .. } => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_accessor_tests {
+    use super::*;
+
+    fn flow_id() -> FlowId {
+        FlowId::nil()
+    }
+
+    #[test]
+    fn event_type_matches_serde_wire_tag() {
+        let event = StromEvent::FlowCreated { flow_id: flow_id() };
+        assert_eq!(event.event_type(), "FlowCreated");
+
+        let event = StromEvent::PipelineError {
+            flow_id: flow_id(),
+            error: "boom".to_string(),
+            source: None,
+        };
+        assert_eq!(event.event_type(), "PipelineError");
+
+        let event = StromEvent::Ping;
+        assert_eq!(event.event_type(), "Ping");
+    }
+
+    #[test]
+    fn flow_bearing_variants_return_their_flow_id() {
+        let id = flow_id();
+        assert_eq!(StromEvent::FlowCreated { flow_id: id }.flow_id(), Some(id));
+        assert_eq!(
+            StromEvent::PipelineError {
+                flow_id: id,
+                error: "boom".to_string(),
+                source: None,
+            }
+            .flow_id(),
+            Some(id)
+        );
+        assert_eq!(
+            StromEvent::RecorderAutoStop {
+                flow_id: id,
+                block_id: "rec0".to_string(),
+            }
+            .flow_id(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn dual_flow_id_variants_pick_the_documented_side() {
+        let source_id = FlowId::from(uuid::Uuid::from_u128(1));
+        let consumer_id = FlowId::from(uuid::Uuid::from_u128(2));
+
+        assert_eq!(
+            StromEvent::SourceOutputAvailable {
+                source_flow_id: source_id,
+                output_name: "out".to_string(),
+                channel_name: "ch".to_string(),
+            }
+            .flow_id(),
+            Some(source_id)
+        );
+
+        assert_eq!(
+            StromEvent::SubscriptionStatusChanged {
+                consumer_flow_id: consumer_id,
+                source_flow_id: source_id,
+                output_name: "out".to_string(),
+                connected: true,
+            }
+            .flow_id(),
+            Some(consumer_id)
+        );
+    }
+
+    #[test]
+    fn non_flow_variants_return_none() {
+        assert_eq!(StromEvent::Ping.flow_id(), None);
+        assert_eq!(
+            StromEvent::StreamDiscovered {
+                stream_id: "s1".to_string(),
+                name: "n".to_string(),
+                source: "sap".to_string(),
+            }
+            .flow_id(),
+            None
+        );
+    }
+
+    /// One instance of every `StromEvent` variant, so `event_type()` can be checked against
+    /// all of them at once instead of a hand-picked sample — this is the test the maintainer
+    /// asked for, kept exhaustive without hand-maintaining a match here: adding a variant
+    /// without adding it to this list just makes the list shorter than the enum, which the
+    /// count assertion below catches.
+    fn one_of_each_variant() -> Vec<StromEvent> {
+        use crate::effects::{EffectTarget, VideoEffect};
+        use crate::mediaplayer::PlayerState;
+        use crate::system_monitor::SystemStats;
+        use crate::thread_stats::ThreadStats;
+
+        let id = flow_id();
+        vec![
+            StromEvent::FlowCreated { flow_id: id },
+            StromEvent::FlowUpdated { flow_id: id },
+            StromEvent::FlowDeleted { flow_id: id },
+            StromEvent::FlowStarted { flow_id: id },
+            StromEvent::FlowStopped { flow_id: id },
+            StromEvent::FlowStateChanged {
+                flow_id: id,
+                state: "playing".to_string(),
+            },
+            StromEvent::PipelineError {
+                flow_id: id,
+                error: "boom".to_string(),
+                source: None,
+            },
+            StromEvent::PipelineWarning {
+                flow_id: id,
+                warning: "careful".to_string(),
+                source: None,
+            },
+            StromEvent::PipelineInfo {
+                flow_id: id,
+                message: "fyi".to_string(),
+                source: None,
+            },
+            StromEvent::PipelineEos { flow_id: id },
+            StromEvent::PropertyChanged {
+                flow_id: id,
+                element_id: "e0".to_string(),
+                property_name: "p".to_string(),
+                value: crate::element::PropertyValue::Bool(true),
+            },
+            StromEvent::PadPropertyChanged {
+                flow_id: id,
+                element_id: "e0".to_string(),
+                pad_name: "sink".to_string(),
+                property_name: "p".to_string(),
+                value: crate::element::PropertyValue::Bool(true),
+            },
+            StromEvent::Ping,
+            StromEvent::MeterData {
+                flow_id: id,
+                element_id: "level0".to_string(),
+                rms: vec![],
+                peak: vec![],
+                decay: vec![],
+            },
+            StromEvent::SpectrumData {
+                flow_id: id,
+                element_id: "spec0".to_string(),
+                magnitudes: vec![],
+            },
+            StromEvent::LoudnessData {
+                flow_id: id,
+                element_id: "loud0".to_string(),
+                momentary: -20.0,
+                shortterm: None,
+                integrated: None,
+                loudness_range: None,
+                true_peak: vec![],
+            },
+            StromEvent::LatencyData {
+                flow_id: id,
+                element_id: "lat0".to_string(),
+                last_latency_us: 0,
+                average_latency_us: 0,
+            },
+            StromEvent::SystemStats(SystemStats {
+                cpu_usage: 0.0,
+                num_cores: 1,
+                total_memory: 0,
+                used_memory: 0,
+                gpu_stats: vec![],
+                gl_renderer: None,
+                timestamp: 0,
+            }),
+            StromEvent::ThreadStats(ThreadStats {
+                threads: vec![],
+                timestamp: 0,
+            }),
+            StromEvent::PtpStats {
+                flow_id: id,
+                domain: 0,
+                synced: false,
+                mean_path_delay_ns: None,
+                clock_offset_ns: None,
+                r_squared: None,
+                clock_rate: None,
+                grandmaster_id: None,
+                master_id: None,
+            },
+            StromEvent::SourceOutputAvailable {
+                source_flow_id: id,
+                output_name: "out".to_string(),
+                channel_name: "ch".to_string(),
+            },
+            StromEvent::SourceOutputUnavailable {
+                source_flow_id: id,
+                output_name: "out".to_string(),
+            },
+            StromEvent::SubscriptionStatusChanged {
+                consumer_flow_id: id,
+                source_flow_id: id,
+                output_name: "out".to_string(),
+                connected: true,
+            },
+            StromEvent::QoSStats {
+                flow_id: id,
+                block_id: None,
+                element_id: "e0".to_string(),
+                element_name: "e0".to_string(),
+                internal_element_type: None,
+                event_count: 0,
+                avg_proportion: 1.0,
+                min_proportion: 1.0,
+                max_proportion: 1.0,
+                avg_jitter: 0,
+                total_processed: 0,
+                is_falling_behind: false,
+            },
+            StromEvent::StreamDiscovered {
+                stream_id: "s1".to_string(),
+                name: "n".to_string(),
+                source: "sap".to_string(),
+            },
+            StromEvent::StreamUpdated {
+                stream_id: "s1".to_string(),
+            },
+            StromEvent::StreamRemoved {
+                stream_id: "s1".to_string(),
+            },
+            StromEvent::MediaPlayerPosition {
+                flow_id: id,
+                block_id: "mp0".to_string(),
+                position_ns: 0,
+                duration_ns: 0,
+                current_file_index: 0,
+                total_files: 1,
+            },
+            StromEvent::MediaPlayerStateChanged {
+                flow_id: id,
+                block_id: "mp0".to_string(),
+                state: PlayerState::Playing,
+                current_file: None,
+            },
+            StromEvent::TransitionTriggered {
+                flow_id: id,
+                block_instance_id: "mix0".to_string(),
+                from_input: 0,
+                to_input: 1,
+                transition_type: "cut".to_string(),
+                duration_ms: 0,
+            },
+            StromEvent::AudioAnalyzerData {
+                flow_id: id,
+                element_id: "an0".to_string(),
+                waveform_l_min: String::new(),
+                waveform_l_max: String::new(),
+                waveform_r_min: String::new(),
+                waveform_r_max: String::new(),
+                vectorscope_l: String::new(),
+                vectorscope_r: String::new(),
+            },
+            StromEvent::RecorderFileChanged {
+                flow_id: id,
+                block_id: "rec0".to_string(),
+                filename: "out.mp4".to_string(),
+            },
+            StromEvent::RecorderAutoStop {
+                flow_id: id,
+                block_id: "rec0".to_string(),
+            },
+            StromEvent::TamsSegmentRegistered {
+                flow_id: id,
+                block_id: "tams0".to_string(),
+                tams_flow_id: "tf0".to_string(),
+                object_id: "bucket/key".to_string(),
+                timerange: "[0:0_1:0)".to_string(),
+            },
+            StromEvent::TamsError {
+                flow_id: id,
+                block_id: "tams0".to_string(),
+                error: "boom".to_string(),
+            },
+            StromEvent::BufferAgeWarning {
+                flow_id: id,
+                element_id: "e0".to_string(),
+                pad_name: "sink".to_string(),
+                age_ms: 0,
+                threshold_ms: 0,
+            },
+            StromEvent::BufferAgeProbe {
+                flow_id: id,
+                probe_id: "p0".to_string(),
+                element_id: "e0".to_string(),
+                pad_name: "sink".to_string(),
+                age_ms: 0,
+                sample_number: 0,
+            },
+            StromEvent::BufferAgeProbeActivated {
+                flow_id: id,
+                probe_id: "p0".to_string(),
+                element_id: "e0".to_string(),
+                pad_name: "sink".to_string(),
+            },
+            StromEvent::BufferAgeProbeDeactivated {
+                flow_id: id,
+                probe_id: "p0".to_string(),
+                reason: "manual".to_string(),
+            },
+            StromEvent::VisionMixerStateChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                preview_input: Some(0),
+                program_input: Some(1),
+                preview_pip: None,
+                program_pip: None,
+            },
+            StromEvent::VisionMixerDskChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                dsk: 1,
+                enabled: true,
+            },
+            StromEvent::VisionMixerOverlayAlphaChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                alpha: 0.5,
+            },
+            StromEvent::VisionMixerFtbChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                active: false,
+            },
+            StromEvent::VisionMixerEffectChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                target: EffectTarget::Master,
+                effect: VideoEffect::None,
+            },
+            StromEvent::StingerCued {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                index: 0,
+                ready: true,
+                cue_ms: 12,
+            },
+            StromEvent::StingerStarted {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                take_id: 1,
+                index: 0,
+                file: "sting.mkv".to_string(),
+                variant: crate::stinger::StingerVariant::TrackMatte,
+                downgraded_from: None,
+                from_input: 0,
+                to_input: 1,
+                take_to_air_ms: 120.0,
+                duration_ms: 1500,
+            },
+            StromEvent::StingerCompleted {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                report: crate::stinger::StingerTakeReport {
+                    take_id: 1,
+                    index: 0,
+                    file: "sting.mkv".to_string(),
+                    variant: crate::stinger::StingerVariant::Classic,
+                    downgraded_from: Some(crate::stinger::StingerVariant::TrackMatte),
+                    from_input: 0,
+                    to_input: 1,
+                    take_to_air_ms: 120.0,
+                    cue_ms: None,
+                    duration_ms: 1500,
+                    cut_point_ms: Some(700),
+                    frames_expected: 45,
+                    frames_arrived: 45,
+                    frames_late: 0,
+                    worst_margin_ms: Some(40.0),
+                    warning: None,
+                },
+            },
+            StromEvent::StingerFailed {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                take_id: Some(2),
+                reason: "clip missing".to_string(),
+                program_changed: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn every_variant_event_type_matches_its_serde_wire_tag() {
+        let events = one_of_each_variant();
+
+        let variant_count = 48;
+        assert_eq!(
+            events.len(),
+            variant_count,
+            "one_of_each_variant() is out of sync with StromEvent — update it alongside new variants"
+        );
+
+        for event in &events {
+            let wire_tag = serde_json::to_value(event)
+                .unwrap()
+                .get("type")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert_eq!(
+                event.event_type(),
+                wire_tag,
+                "event_type() disagrees with the serde wire tag for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_frequency_classification_matches_known_variants() {
+        assert!(StromEvent::MeterData {
+            flow_id: flow_id(),
+            element_id: "level0".to_string(),
+            rms: vec![],
+            peak: vec![],
+            decay: vec![],
+        }
+        .is_high_frequency());
+
+        assert!(!StromEvent::FlowCreated { flow_id: flow_id() }.is_high_frequency());
+        assert!(!StromEvent::Ping.is_high_frequency());
+    }
+
+    fn media_download_event(state: crate::media_download::MediaDownloadState) -> StromEvent {
+        StromEvent::MediaDownloadProgress(crate::media_download::MediaDownloadJob {
+            job_id: "job".to_string(),
+            url: "https://example.com/clip.mp4".to_string(),
+            directory: String::new(),
+            filename: "clip.mp4".to_string(),
+            path: "clip.mp4".to_string(),
+            bytes: 10,
+            total: Some(20),
+            state,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn media_download_progress_is_tagged_and_classified() {
+        use crate::media_download::MediaDownloadState;
+
+        let progress = media_download_event(MediaDownloadState::Downloading);
+        let wire = serde_json::to_value(&progress).unwrap();
+        assert_eq!(wire["type"], "MediaDownloadProgress");
+        assert_eq!(wire["data"]["state"], "downloading");
+        assert_eq!(progress.event_type(), "MediaDownloadProgress");
+        assert_eq!(progress.flow_id(), None);
+        // Ticks are chatty; the final state is a lifecycle event.
+        assert!(progress.is_high_frequency());
+        assert!(!media_download_event(MediaDownloadState::Done).is_high_frequency());
+        assert!(!media_download_event(MediaDownloadState::Failed).is_high_frequency());
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::paths::{DataPaths, PathConfig};
 use figment::{
-    providers::{Env, Format, Serialized, Toml},
+    providers::{Format, Serialized, Toml},
     Figment,
 };
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,52 @@ struct ConfigFile {
     logging: LoggingConfig,
     #[serde(default)]
     discovery: DiscoveryConfig,
+    #[serde(default)]
+    ports: PortsConfig,
+    #[serde(default)]
+    cef: CefConfig,
+    #[serde(default)]
+    media: MediaConfig,
+}
+
+/// `[media]` section: downloading files from URLs into the media library.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct MediaConfig {
+    /// Let URL downloads connect to loopback, private (RFC 1918, ULA),
+    /// link-local and carrier-grade NAT addresses. For local and lab use: on
+    /// a shared Strom it lets anyone who can call the API make the server
+    /// fetch from its own network. Cloud metadata and unroutable addresses
+    /// stay refused either way.
+    #[serde(default)]
+    download_allow_private_addresses: bool,
+    /// Largest file a URL download may write, in bytes. Default 2 GiB.
+    download_max_bytes: Option<u64>,
+    /// Time allowed for one whole URL download, in seconds. Default 7200.
+    download_timeout_seconds: Option<u64>,
+}
+
+/// `[ports]` section: the port numbers Strom administers and hands out.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PortsConfig {
+    /// Each entry is a range (`"47100-47199"`) or a single port (`47250`), in
+    /// either case expanded into the pool. Empty switches the pool off: a
+    /// Strom nobody shares has no ports to administer, and a pool picked for
+    /// it by default would only narrow which ports its own flows may bind.
+    #[serde(default)]
+    ports: Vec<PortConfigEntry>,
+    /// Lifetime a reservation gets when the caller does not say.
+    lease_ttl_seconds: Option<u64>,
+    /// Whether to bind-probe a candidate port before handing it out.
+    probe_before_handout: Option<bool>,
+}
+
+/// One entry in the configured port pool. TOML keeps quoted ranges as strings
+/// and bare single ports as integers, so both forms must deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum PortConfigEntry {
+    Port(u16),
+    Spec(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +143,34 @@ struct StorageConfig {
     cef_cache_path: Option<PathBuf>,
 }
 
+/// CEF/Chromium settings for the `cefsrc` browsers.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CefConfig {
+    /// Chromium remote debugging port. Unset means Strom picks a free one.
+    ///
+    /// Strom opens the port with or without authentication: it guards
+    /// every page through it. Remote control links go through it too, but are
+    /// only handed out when authentication is configured. Nothing outside
+    /// Strom connects to it, so this only pins the number.
+    ///
+    /// The port carries the Chrome DevTools Protocol, which is full control of
+    /// the browser process: arbitrary JavaScript, arbitrary navigation
+    /// including `file://`, and every cookie. Chromium binds it to loopback;
+    /// keep it there and reach it through the authenticated API instead.
+    #[serde(default)]
+    debug_port: Option<u16>,
+    /// Serve the Chromium DevTools application instead of the remote control
+    /// page, and stop filtering the protocol.
+    ///
+    /// The remote control page needs a picture, clicks and keystrokes, and the
+    /// proxy allows nothing else. DevTools needs the whole protocol, which is
+    /// arbitrary JavaScript, arbitrary navigation including `file://`, and
+    /// every cookie in the profile - so turning this on makes a link full
+    /// control of the browser and of what it can read on this host.
+    #[serde(default)]
+    full_devtools: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct LoggingConfig {
     /// Path to log file (if set, logs will be written to file in addition to stdout)
@@ -104,6 +178,26 @@ struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     /// If not set, uses RUST_LOG environment variable or defaults to "info"
     log_level: Option<String>,
+    /// Stdout log format ("compact" or "json"). Raw string so blank values fall back to the
+    /// default instead of a deserialize error (same pattern as `log_file` / `log_level`).
+    stdout_log_format: Option<String>,
+    /// Emit selected StromEvent lifecycle/error events as structured tracing logs.
+    #[serde(default)]
+    structured_events: bool,
+    /// Include high-frequency events (meters, stats, ...) in structured event logs.
+    #[serde(default)]
+    include_high_frequency_events: bool,
+}
+
+/// Stdout log output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable, single-line-per-event output (current default behavior).
+    #[default]
+    Compact,
+    /// Structured JSON output, one object per line, suitable for log collectors.
+    Json,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +223,51 @@ fn default_sap_multicast_addresses() -> Vec<String> {
     ]
 }
 
+/// Environment variables that map to a scalar config key.
+///
+/// These have to be listed explicitly. A generic `Env::prefixed("STROM_")`
+/// provider splits the variable name on every underscore, which only produces
+/// the right key for single-word fields: `STROM_SERVER_ICE_TRANSPORT_POLICY`
+/// becomes `server.ice.transport.policy`, which no field matches, so the
+/// variable is silently ignored.
+const SCALAR_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "STROM_SERVER_ICE_TRANSPORT_POLICY",
+        "server.ice_transport_policy",
+    ),
+    ("STROM_TLS_CERT", "server.tls_cert"),
+    ("STROM_TLS_KEY", "server.tls_key"),
+    ("STROM_STORAGE_DATABASE_URL", "storage.database_url"),
+    ("STROM_STORAGE_DATA_DIR", "storage.data_dir"),
+    ("STROM_STORAGE_FLOWS_PATH", "storage.flows_path"),
+    ("STROM_STORAGE_BLOCKS_PATH", "storage.blocks_path"),
+    ("STROM_STORAGE_MEDIA_PATH", "storage.media_path"),
+    ("STROM_STORAGE_CEF_CACHE_PATH", "storage.cef_cache_path"),
+    ("STROM_LOGGING_LOG_FILE", "logging.log_file"),
+    ("STROM_LOGGING_LOG_LEVEL", "logging.log_level"),
+];
+
+/// Environment variables that map to a list config key, comma-separated.
+const LIST_ENV_VARS: &[(&str, &str)] = &[
+    ("STROM_SERVER_ICE_SERVERS", "server.ice_servers"),
+    (
+        "STROM_SERVER_CORS_ALLOWED_ORIGINS",
+        "server.cors_allowed_origins",
+    ),
+    (
+        "STROM_DISCOVERY_SAP_MULTICAST_ADDRESSES",
+        "discovery.sap_multicast_addresses",
+    ),
+];
+
+/// Splits a comma-separated environment variable into non-empty entries.
+fn split_list_env(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn default_port() -> u16 {
     strom_types::DEFAULT_PORT
 }
@@ -146,6 +285,8 @@ pub struct Config {
     pub host: std::net::IpAddr,
     /// Port to listen on
     pub port: u16,
+    /// Data directory the storage paths default to
+    pub data_dir: PathBuf,
     /// Path to flows storage file (used if database_url is None)
     pub flows_path: PathBuf,
     /// Path to blocks storage file
@@ -154,6 +295,11 @@ pub struct Config {
     pub media_path: PathBuf,
     /// Directory holding the CEF/Chromium profile used by `cefsrc`
     pub cef_cache_path: PathBuf,
+    /// Chromium remote debugging port for `cefsrc`, or `None` when disabled
+    pub cef_debug_port: Option<u16>,
+    /// Hand out the Chromium DevTools application rather than the restricted
+    /// remote control page. See `CefConfig::full_devtools`.
+    pub cef_full_devtools: bool,
     /// PostgreSQL database URL (if set, PostgreSQL is used instead of JSON files)
     /// Format: postgresql://user:password@host/database_name
     pub database_url: Option<String>,
@@ -161,6 +307,12 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     /// Log level (if set, overrides RUST_LOG environment variable)
     pub log_level: Option<String>,
+    /// Stdout log format: compact (human-readable) or JSON (structured)
+    pub stdout_log_format: LogFormat,
+    /// Emit selected StromEvent lifecycle/error events as structured tracing logs
+    pub structured_events: bool,
+    /// Include high-frequency events (meters, stats, ...) in structured event logs
+    pub include_high_frequency_events: bool,
     /// ICE servers for WebRTC NAT traversal (STUN/TURN)
     /// Format: stun:host:port or turn:user:pass@host:port
     pub ice_servers: Vec<String>,
@@ -177,6 +329,61 @@ pub struct Config {
     pub tls_cert: Option<PathBuf>,
     /// Path to TLS private key file (PEM format). Enables HTTPS when paired with tls_cert.
     pub tls_key: Option<PathBuf>,
+    /// Port numbers the pool may hand out. Empty switches the pool off.
+    pub pool_ports: std::collections::BTreeSet<u16>,
+    /// Lifetime a reservation gets when the caller does not say.
+    pub port_lease_ttl_seconds: u64,
+    /// Whether to bind-probe a candidate port before handing it out.
+    pub probe_before_handout: bool,
+    /// Let URL downloads into the media library reach private and local addresses.
+    pub media_download_allow_private_addresses: bool,
+    /// Largest file a URL download may write, in bytes.
+    pub media_download_max_bytes: u64,
+    /// Time allowed for one whole URL download, in seconds.
+    pub media_download_timeout_seconds: u64,
+}
+
+/// Expand the `[ports] ports` entries into the pool.
+///
+/// A range is notation: `"47100-47199"` and `47250` both land in the same set,
+/// which is what lets an operator punch a hole in a range by listing the
+/// pieces around it. An empty list means no pool at all — never a silent
+/// default range.
+fn pool_ports(entries: &[PortConfigEntry]) -> anyhow::Result<std::collections::BTreeSet<u16>> {
+    let mut ports = std::collections::BTreeSet::new();
+    for entry in entries {
+        let spec = match entry {
+            PortConfigEntry::Port(port) => port.to_string(),
+            PortConfigEntry::Spec(spec) => spec.trim().to_string(),
+        };
+        if spec.is_empty() {
+            continue;
+        }
+        let expanded = strom_types::ports::parse_port_spec(&spec)
+            .map_err(|e| anyhow::anyhow!("invalid ports.ports entry '{spec}': {e}"))?;
+        ports.extend(expanded);
+    }
+    Ok(ports)
+}
+
+/// A configured value that must be above zero, or the default when unset.
+fn positive(key: &str, configured: Option<u64>, default: u64) -> anyhow::Result<u64> {
+    match configured {
+        Some(0) => anyhow::bail!("{key} must be greater than 0"),
+        Some(value) => Ok(value),
+        None => Ok(default),
+    }
+}
+
+fn port_lease_ttl(configured: Option<u64>) -> anyhow::Result<u64> {
+    let ttl = configured.unwrap_or(strom_types::ports::DEFAULT_PORT_LEASE_TTL_SECS);
+    if ttl == 0 || ttl > strom_types::ports::MAX_PORT_LEASE_TTL_SECS {
+        anyhow::bail!(
+            "ports.lease_ttl_seconds / STROM_PORT_LEASE_TTL must be between 1 and {}, got {ttl}",
+            strom_types::ports::MAX_PORT_LEASE_TTL_SECS
+        );
+    }
+    Ok(ttl)
 }
 
 /// A blank path is not a path. Blank environment variables are gone before
@@ -184,6 +391,25 @@ pub struct Config {
 /// `tls_cert = ""` just as easily.
 fn non_blank_path(path: Option<PathBuf>) -> Option<PathBuf> {
     path.filter(|p| !p.to_string_lossy().trim().is_empty())
+}
+
+/// Parse the raw `logging.stdout_log_format` config value. A blank or absent value falls back to
+/// the default (`compact`) rather than a deserialize error — matching the blank-value
+/// handling already applied to `log_file` and `log_level`. Anything other than `"compact"`
+/// or `"json"` (case-insensitive) is rejected with a clear error instead of silently
+/// defaulting, so a typo doesn't go unnoticed.
+fn parse_stdout_log_format(value: Option<String>) -> anyhow::Result<LogFormat> {
+    let normalized = strom_types::env::non_blank(value).map(|s| s.to_lowercase());
+    match normalized.as_deref() {
+        None => Ok(LogFormat::default()),
+        Some("compact") => Ok(LogFormat::Compact),
+        Some("json") => Ok(LogFormat::Json),
+        Some(other) => {
+            anyhow::bail!(
+                "invalid logging.stdout_log_format '{other}': expected \"compact\" or \"json\""
+            )
+        }
+    }
 }
 
 impl Config {
@@ -228,6 +454,9 @@ impl Config {
             storage: StorageConfig::default(),
             logging: LoggingConfig::default(),
             discovery: DiscoveryConfig::default(),
+            ports: PortsConfig::default(),
+            cef: CefConfig::default(),
+            media: MediaConfig::default(),
         }));
 
         // 2. Merge user config file if it exists
@@ -244,37 +473,120 @@ impl Config {
             }
         }
 
-        // 4. Merge environment variables (STROM_* prefix)
-        // Note: Single underscore splits nested keys (e.g., STROM_SERVER_PORT -> server.port)
-        // This means field names with underscores can't be set via env vars using this method
-        figment = figment.merge(
-            Env::prefixed("STROM_")
-                .map(|key| key.as_str().replace("__", ".").into())
-                .split("_"),
-        );
-
-        // 4b. Handle STROM_SERVER_ICE_SERVERS specially (comma-separated array)
-        // This needs special handling because:
-        // - The split("_") above would turn ICE_SERVERS into ice.servers (wrong)
-        // - Figment doesn't parse comma-separated values into arrays
-        if let Some(ice_servers_str) = strom_types::env::var_opt("STROM_SERVER_ICE_SERVERS") {
-            let ice_servers: Vec<String> = ice_servers_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !ice_servers.is_empty() {
-                figment = figment.merge(Serialized::default("server.ice_servers", ice_servers));
+        // 4. Merge environment variables (STROM_* prefix).
+        //
+        // Every key is mapped explicitly. A generic provider that splits the
+        // variable name on underscores cannot express a field name that itself
+        // contains one, and figment does not parse comma-separated lists.
+        if let Some(port) = strom_types::env::var_opt("STROM_SERVER_PORT") {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| anyhow::anyhow!("STROM_SERVER_PORT is not a valid port: {}", port))?;
+            figment = figment.merge(Serialized::default("server.port", port));
+        }
+        if let Some(port) = strom_types::env::var_opt("STROM_CEF_DEBUG_PORT") {
+            let port: u16 = port.parse().map_err(|_| {
+                anyhow::anyhow!("STROM_CEF_DEBUG_PORT is not a valid port: {}", port)
+            })?;
+            figment = figment.merge(Serialized::default("cef.debug_port", port));
+        }
+        if let Some(value) = strom_types::env::var_opt("STROM_CEF_FULL_DEVTOOLS") {
+            let on = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+            figment = figment.merge(Serialized::default("cef.full_devtools", on));
+        }
+        for (var, key) in SCALAR_ENV_VARS {
+            if let Some(value) = strom_types::env::var_opt(var) {
+                figment = figment.merge(Serialized::default(key, value));
+            }
+        }
+        for (var, key) in LIST_ENV_VARS {
+            if let Some(raw) = strom_types::env::var_opt(var) {
+                let values = split_list_env(&raw);
+                if !values.is_empty() {
+                    figment = figment.merge(Serialized::default(key, values));
+                }
             }
         }
 
-        // 4c. Handle STROM_TLS_CERT / STROM_TLS_KEY specially
-        // (underscore in field name breaks the split("_") env mapping)
-        if let Some(cert) = strom_types::env::var_opt("STROM_TLS_CERT") {
-            figment = figment.merge(Serialized::default("server.tls_cert", PathBuf::from(cert)));
+        // 4d. Handle STROM_LOGGING_STDOUT_LOG_FORMAT / STROM_LOGGING_STRUCTURED_EVENTS /
+        // STROM_LOGGING_INCLUDE_HIGH_FREQUENCY_EVENTS specially, for the same
+        // reason as 4c: underscores in the field names break the split("_")
+        // env mapping above.
+        if let Some(format) = strom_types::env::var_opt("STROM_LOGGING_STDOUT_LOG_FORMAT") {
+            figment = figment.merge(Serialized::default(
+                "logging.stdout_log_format",
+                format.to_lowercase(),
+            ));
         }
-        if let Some(key) = strom_types::env::var_opt("STROM_TLS_KEY") {
-            figment = figment.merge(Serialized::default("server.tls_key", PathBuf::from(key)));
+        if let Some(val) = strom_types::env::var_opt("STROM_LOGGING_STRUCTURED_EVENTS") {
+            if let Ok(enabled) = val.parse::<bool>() {
+                figment = figment.merge(Serialized::default("logging.structured_events", enabled));
+            }
+        }
+        if let Some(val) = strom_types::env::var_opt("STROM_LOGGING_INCLUDE_HIGH_FREQUENCY_EVENTS")
+        {
+            if let Ok(enabled) = val.parse::<bool>() {
+                figment = figment.merge(Serialized::default(
+                    "logging.include_high_frequency_events",
+                    enabled,
+                ));
+            }
+        }
+
+        // 4e. Port pool settings, each named explicitly for the same reason.
+        if let Some(raw) = strom_types::env::var_opt("STROM_PORTS") {
+            let entries = split_list_env(&raw);
+            if !entries.is_empty() {
+                figment = figment.merge(Serialized::default("ports.ports", entries));
+            }
+        }
+        if let Some(ttl) = strom_types::env::var_opt("STROM_PORT_LEASE_TTL") {
+            let ttl: u64 = ttl
+                .parse()
+                .map_err(|_| anyhow::anyhow!("STROM_PORT_LEASE_TTL is not a number: {ttl}"))?;
+            figment = figment.merge(Serialized::default("ports.lease_ttl_seconds", ttl));
+        }
+        if let Some(probe) = strom_types::env::var_opt("STROM_PORT_PROBE_BEFORE_HANDOUT") {
+            let probe = match probe.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => anyhow::bail!(
+                    "STROM_PORT_PROBE_BEFORE_HANDOUT must be true or false, got {probe}"
+                ),
+            };
+            figment = figment.merge(Serialized::default("ports.probe_before_handout", probe));
+        }
+
+        // 4f. URL download settings, each named explicitly for the same reason.
+        if let Some(value) =
+            strom_types::env::var_opt("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES")
+        {
+            let allow = match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => anyhow::bail!(
+                    "STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES must be true or false, got {value}"
+                ),
+            };
+            figment = figment.merge(Serialized::default(
+                "media.download_allow_private_addresses",
+                allow,
+            ));
+        }
+        if let Some(value) = strom_types::env::var_opt("STROM_MEDIA_DOWNLOAD_MAX_BYTES") {
+            let max: u64 = value.trim().parse().map_err(|_| {
+                anyhow::anyhow!("STROM_MEDIA_DOWNLOAD_MAX_BYTES is not a number: {value}")
+            })?;
+            figment = figment.merge(Serialized::default("media.download_max_bytes", max));
+        }
+        if let Some(value) = strom_types::env::var_opt("STROM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS") {
+            let secs: u64 = value.trim().parse().map_err(|_| {
+                anyhow::anyhow!("STROM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS is not a number: {value}")
+            })?;
+            figment = figment.merge(Serialized::default("media.download_timeout_seconds", secs));
         }
 
         // 5. Merge CLI arguments (highest priority)
@@ -325,20 +637,52 @@ impl Config {
         Ok(Self {
             host: config_file.server.host,
             port: config_file.server.port,
+            data_dir: data_paths.data_dir,
             flows_path: data_paths.flows_path,
             blocks_path: data_paths.blocks_path,
             media_path: data_paths.media_path,
             cef_cache_path: data_paths.cef_cache_path,
+            cef_debug_port: config_file.cef.debug_port,
+            cef_full_devtools: config_file.cef.full_devtools,
             database_url: strom_types::env::non_blank(config_file.storage.database_url),
             log_file: non_blank_path(config_file.logging.log_file),
             log_level: strom_types::env::non_blank(config_file.logging.log_level),
+            stdout_log_format: parse_stdout_log_format(config_file.logging.stdout_log_format)?,
+            structured_events: config_file.logging.structured_events,
+            include_high_frequency_events: config_file.logging.include_high_frequency_events,
             ice_servers: normalize_ice_servers(config_file.server.ice_servers),
             ice_transport_policy: config_file.server.ice_transport_policy,
             sap_multicast_addresses: config_file.discovery.sap_multicast_addresses,
             cors_allowed_origins: config_file.server.cors_allowed_origins,
             tls_cert: non_blank_path(config_file.server.tls_cert),
             tls_key: non_blank_path(config_file.server.tls_key),
+            pool_ports: pool_ports(&config_file.ports.ports)?,
+            port_lease_ttl_seconds: port_lease_ttl(config_file.ports.lease_ttl_seconds)?,
+            probe_before_handout: config_file.ports.probe_before_handout.unwrap_or(true),
+            media_download_allow_private_addresses: config_file
+                .media
+                .download_allow_private_addresses,
+            media_download_max_bytes: positive(
+                "media.download_max_bytes",
+                config_file.media.download_max_bytes,
+                strom_types::media_download::DEFAULT_MEDIA_DOWNLOAD_MAX_BYTES,
+            )?,
+            media_download_timeout_seconds: positive(
+                "media.download_timeout_seconds",
+                config_file.media.download_timeout_seconds,
+                crate::media_download::DEFAULT_TOTAL_TIMEOUT_SECS,
+            )?,
         })
+    }
+
+    /// The URL download settings this configuration asks for.
+    pub fn media_download_settings(&self) -> crate::media_download::MediaDownloadSettings {
+        crate::media_download::MediaDownloadSettings {
+            allow_private_addresses: self.media_download_allow_private_addresses,
+            max_bytes: self.media_download_max_bytes,
+            total_timeout: std::time::Duration::from_secs(self.media_download_timeout_seconds),
+            ..Default::default()
+        }
     }
 
     /// Returns TLS config paths if both cert and key are provided.
@@ -376,19 +720,31 @@ impl Config {
         Ok(Self {
             host: default_host(),
             port,
+            data_dir: data_paths.data_dir,
             flows_path: data_paths.flows_path,
             blocks_path: data_paths.blocks_path,
             media_path: data_paths.media_path,
             cef_cache_path: data_paths.cef_cache_path,
+            cef_debug_port: None,
+            cef_full_devtools: false,
             database_url,
             log_file: None,
             log_level: None,
+            stdout_log_format: LogFormat::default(),
+            structured_events: false,
+            include_high_frequency_events: false,
             ice_servers: default_ice_servers(),
             ice_transport_policy: default_ice_transport_policy(),
             sap_multicast_addresses: default_sap_multicast_addresses(),
             cors_allowed_origins: Vec::new(),
             tls_cert: None,
             tls_key: None,
+            pool_ports: std::collections::BTreeSet::new(),
+            port_lease_ttl_seconds: strom_types::ports::DEFAULT_PORT_LEASE_TTL_SECS,
+            probe_before_handout: true,
+            media_download_allow_private_addresses: false,
+            media_download_max_bytes: strom_types::media_download::DEFAULT_MEDIA_DOWNLOAD_MAX_BYTES,
+            media_download_timeout_seconds: crate::media_download::DEFAULT_TOTAL_TIMEOUT_SECS,
         })
     }
 
@@ -426,19 +782,32 @@ impl Default for Config {
             Self {
                 host: default_host(),
                 port: strom_types::DEFAULT_PORT,
+                data_dir: PathBuf::from("."),
                 flows_path: PathBuf::from("flows.json"),
                 blocks_path: PathBuf::from("blocks.json"),
                 media_path: PathBuf::from("media"),
                 cef_cache_path: PathBuf::from("cef-cache"),
+                cef_debug_port: None,
+                cef_full_devtools: false,
                 database_url: None,
                 log_file: None,
                 log_level: None,
+                stdout_log_format: LogFormat::default(),
+                structured_events: false,
+                include_high_frequency_events: false,
                 ice_servers: default_ice_servers(),
                 ice_transport_policy: default_ice_transport_policy(),
                 sap_multicast_addresses: default_sap_multicast_addresses(),
                 cors_allowed_origins: Vec::new(),
                 tls_cert: None,
                 tls_key: None,
+                pool_ports: std::collections::BTreeSet::new(),
+                port_lease_ttl_seconds: strom_types::ports::DEFAULT_PORT_LEASE_TTL_SECS,
+                probe_before_handout: true,
+                media_download_allow_private_addresses: false,
+                media_download_max_bytes:
+                    strom_types::media_download::DEFAULT_MEDIA_DOWNLOAD_MAX_BYTES,
+                media_download_timeout_seconds: crate::media_download::DEFAULT_TOTAL_TIMEOUT_SECS,
             }
         })
     }
@@ -474,6 +843,95 @@ mod tests {
 
         assert_eq!(config.port, strom_types::DEFAULT_PORT);
         assert!(config.database_url.is_none());
+        assert_eq!(config.stdout_log_format, LogFormat::Compact);
+        assert!(!config.structured_events);
+        assert!(!config.include_high_frequency_events);
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_figment_parses_json_stdout_log_format() {
+        std::env::remove_var("STROM_LOGGING_STDOUT_LOG_FORMAT");
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join(".strom.toml");
+        fs::write(&config_file, "[logging]\nstdout_log_format = \"json\"\n").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
+
+        let _ = std::env::set_current_dir(original_dir);
+
+        assert_eq!(config.stdout_log_format, LogFormat::Json);
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_figment_stdout_log_format_env_var() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        std::env::set_var("STROM_LOGGING_STDOUT_LOG_FORMAT", "json");
+
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
+
+        let _ = std::env::set_current_dir(&original_dir);
+        std::env::remove_var("STROM_LOGGING_STDOUT_LOG_FORMAT");
+
+        assert_eq!(config.stdout_log_format, LogFormat::Json);
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_figment_rejects_invalid_stdout_log_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join(".strom.toml");
+        fs::write(&config_file, "[logging]\nstdout_log_format = \"yaml\"\n").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
+
+        let _ = std::env::set_current_dir(&original_dir);
+
+        assert!(
+            result.is_err(),
+            "an unrecognized stdout_log_format must be a clear error, not a silent fallback"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_figment_parses_structured_events() {
+        std::env::remove_var("STROM_LOGGING_STRUCTURED_EVENTS");
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join(".strom.toml");
+        fs::write(&config_file, "[logging]\nstructured_events = true\n").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
+
+        let _ = std::env::set_current_dir(original_dir);
+
+        assert!(config.structured_events);
+        assert!(
+            !config.include_high_frequency_events,
+            "include_high_frequency_events must default to false independently"
+        );
     }
 
     // Serialized with its neighbours: from_figment reads `.strom.toml` from the
@@ -570,6 +1028,7 @@ data_dir = ""
 [logging]
 log_file = ""
 log_level = "   "
+stdout_log_format = ""
 "#;
         fs::write(&config_file, config_content).unwrap();
 
@@ -597,6 +1056,11 @@ log_level = "   "
             "a blank log level would build an EnvFilter with no directives, silencing the process"
         );
         assert_eq!(config.log_file, None);
+        assert_eq!(
+            config.stdout_log_format,
+            LogFormat::Compact,
+            "a blank stdout_log_format must fall back to the default instead of failing to parse"
+        );
         assert!(
             config.flows_path.is_absolute(),
             "a blank data dir must fall back to the default location, got {:?}",
@@ -793,6 +1257,254 @@ data_dir = "{}"
         );
     }
 
+    /// Restores an environment variable on drop so a failing assertion cannot
+    /// leak it into the next test.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Loads a config from a temp directory, so a `.strom.toml` in the working
+    /// directory cannot influence the result.
+    fn config_from_env() -> Config {
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
+        let _ = std::env::set_current_dir(original_dir);
+        config.unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn test_ice_transport_policy_env_var() {
+        let _guard = EnvGuard::set("STROM_SERVER_ICE_TRANSPORT_POLICY", "relay");
+
+        assert_eq!(config_from_env().ice_transport_policy, "relay");
+    }
+
+    #[test]
+    #[serial]
+    fn test_cors_allowed_origins_env_var() {
+        let _guard = EnvGuard::set(
+            "STROM_SERVER_CORS_ALLOWED_ORIGINS",
+            "https://a.example.com, https://b.example.com",
+        );
+
+        assert_eq!(
+            config_from_env().cors_allowed_origins,
+            vec![
+                "https://a.example.com".to_string(),
+                "https://b.example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_sap_multicast_addresses_env_var() {
+        let _guard = EnvGuard::set(
+            "STROM_DISCOVERY_SAP_MULTICAST_ADDRESSES",
+            "239.0.0.1,239.0.0.2",
+        );
+
+        assert_eq!(
+            config_from_env().sap_multicast_addresses,
+            vec!["239.0.0.1".to_string(), "239.0.0.2".to_string()]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_logging_env_vars() {
+        let _level = EnvGuard::set("STROM_LOGGING_LOG_LEVEL", "debug");
+        let _file = EnvGuard::set("STROM_LOGGING_LOG_FILE", "/tmp/strom-env-test.log");
+
+        let config = config_from_env();
+
+        assert_eq!(config.log_level.as_deref(), Some("debug"));
+        assert_eq!(
+            config.log_file,
+            Some(PathBuf::from("/tmp/strom-env-test.log"))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_storage_env_vars() {
+        let temp_dir = TempDir::new().unwrap();
+        let flows = temp_dir.path().join("custom-flows.json");
+        let _db = EnvGuard::set(
+            "STROM_STORAGE_DATABASE_URL",
+            "postgresql://user:pass@db.example.com/strom",
+        );
+        let _flows = EnvGuard::set("STROM_STORAGE_FLOWS_PATH", flows.to_str().unwrap());
+
+        let config = config_from_env();
+
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgresql://user:pass@db.example.com/strom")
+        );
+        assert_eq!(config.flows_path, flows);
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_env_vars() {
+        let _cert = EnvGuard::set("STROM_TLS_CERT", "/etc/strom/cert.pem");
+        let _key = EnvGuard::set("STROM_TLS_KEY", "/etc/strom/key.pem");
+
+        let config = config_from_env();
+
+        assert_eq!(config.tls_cert, Some(PathBuf::from("/etc/strom/cert.pem")));
+        assert_eq!(config.tls_key, Some(PathBuf::from("/etc/strom/key.pem")));
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_port_env_var_is_an_error() {
+        let _guard = EnvGuard::set("STROM_SERVER_PORT", "not-a-port");
+
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
+        let _ = std::env::set_current_dir(original_dir);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn documented_mixed_port_pool_config_loads() {
+        let _ports = EnvGuard::remove("STROM_PORTS");
+        let _ttl = EnvGuard::remove("STROM_PORT_LEASE_TTL");
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(".strom.toml"),
+            r#"
+[ports]
+ports = ["47100-47199", 47250, "47300-47399"]
+lease_ttl_seconds = 600
+"#,
+        )
+        .unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
+
+        let _ = std::env::set_current_dir(original_dir);
+        let config = result.unwrap();
+        assert_eq!(config.pool_ports.len(), 201);
+        assert!(config.pool_ports.contains(&47100));
+        assert!(config.pool_ports.contains(&47250));
+        assert!(config.pool_ports.contains(&47399));
+    }
+
+    #[test]
+    #[serial]
+    fn an_unrecognised_probe_setting_fails_config_loading() {
+        let _ports = EnvGuard::remove("STROM_PORTS");
+        let _ttl = EnvGuard::remove("STROM_PORT_LEASE_TTL");
+        let _probe = EnvGuard::set("STROM_PORT_PROBE_BEFORE_HANDOUT", "maybe");
+        let err = Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("STROM_PORT_PROBE_BEFORE_HANDOUT"));
+
+        let _probe = EnvGuard::set("STROM_PORT_PROBE_BEFORE_HANDOUT", "off");
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
+        assert!(!config.probe_before_handout);
+    }
+
+    #[test]
+    #[serial]
+    fn media_download_settings_default_to_safe_values() {
+        let _allow = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES");
+        let _max = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_MAX_BYTES");
+        let _timeout = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS");
+        let settings = config_from_env().media_download_settings();
+        assert!(!settings.allow_private_addresses);
+        assert_eq!(
+            settings.max_bytes,
+            strom_types::media_download::DEFAULT_MEDIA_DOWNLOAD_MAX_BYTES
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn media_download_settings_from_env_and_file() {
+        let _allow = EnvGuard::set("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES", "true");
+        let _max = EnvGuard::set("STROM_MEDIA_DOWNLOAD_MAX_BYTES", "1000");
+        let _timeout = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS");
+        let settings = config_from_env().media_download_settings();
+        assert!(settings.allow_private_addresses);
+        assert_eq!(settings.max_bytes, 1000);
+
+        let _allow = EnvGuard::set("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES", "perhaps");
+        let err = Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES"));
+
+        let _allow = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES");
+        let _max = EnvGuard::remove("STROM_MEDIA_DOWNLOAD_MAX_BYTES");
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(
+            temp_dir.path().join(".strom.toml"),
+            "[media]\ndownload_allow_private_addresses = true\ndownload_timeout_seconds = 60\n",
+        )
+        .unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
+        let _ = std::env::set_current_dir(original_dir);
+        let settings = result.unwrap().media_download_settings();
+        assert!(settings.allow_private_addresses);
+        assert_eq!(settings.total_timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn port_lease_ttl_is_validated_during_config_loading() {
+        assert_eq!(
+            port_lease_ttl(None).unwrap(),
+            strom_types::ports::DEFAULT_PORT_LEASE_TTL_SECS
+        );
+        assert!(port_lease_ttl(Some(0)).is_err());
+        assert!(port_lease_ttl(Some(strom_types::ports::MAX_PORT_LEASE_TTL_SECS + 1)).is_err());
+    }
+
     #[test]
     fn test_ice_servers_normalization() {
         // Test that URLs with :// are normalized to RFC format (without //)
@@ -817,26 +1529,5 @@ data_dir = "{}"
             normalize_ice_server_url("turn:user:pass@turn.example.com:3478"),
             "turn:user:pass@turn.example.com:3478"
         );
-    }
-
-    #[test]
-    fn test_legacy_config_new() {
-        let temp_dir = TempDir::new().unwrap();
-        let flows = temp_dir.path().join("flows.json");
-        let blocks = temp_dir.path().join("blocks.json");
-
-        let config = Config::new(
-            8080,
-            None,
-            Some(flows.clone()),
-            Some(blocks.clone()),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.flows_path, flows);
-        assert_eq!(config.blocks_path, blocks);
     }
 }

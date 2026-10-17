@@ -1,4 +1,6 @@
-use serde::Serialize;
+use strom_types::mediaplayer::{
+    GotoRequest, PlayerAction, PlayerControlRequest, SeekRequest, SetPlaylistRequest,
+};
 use strom_types::FlowId;
 
 use super::*;
@@ -23,14 +25,12 @@ impl ApiClient {
             files.len()
         );
 
-        #[derive(Serialize)]
-        struct SetPlaylistRequest {
-            files: Vec<String>,
-        }
-
         let response = self
             .with_auth(self.client.post(&url))
-            .json(&SetPlaylistRequest { files })
+            .json(&SetPlaylistRequest {
+                files,
+                loop_playlist: None,
+            })
             .send()
             .await
             .map_err(|e| {
@@ -49,12 +49,12 @@ impl ApiClient {
         Ok(())
     }
 
-    /// Control a media player block (play, pause, next, prev).
+    /// Control a media player block.
     pub async fn control_player(
         &self,
         flow_id: FlowId,
         block_id: &str,
-        action: &str,
+        action: PlayerAction,
     ) -> ApiResult<()> {
         use tracing::info;
 
@@ -62,17 +62,12 @@ impl ApiClient {
             "{}/flows/{}/blocks/{}/player/control",
             self.base_url, flow_id, block_id
         );
-        info!("Controlling player {}: {}", block_id, action);
-
-        #[derive(Serialize)]
-        struct ControlRequest {
-            action: String,
-        }
+        info!("Controlling player {}: {:?}", block_id, action);
 
         let response = self
             .with_auth(self.client.post(&url))
-            .json(&ControlRequest {
-                action: action.to_string(),
+            .json(&PlayerControlRequest {
+                action: action.clone(),
             })
             .send()
             .await
@@ -88,7 +83,38 @@ impl ApiClient {
             return Err(ApiError::Http(status, text));
         }
 
-        info!("Successfully sent {} to player {}", action, block_id);
+        info!("Successfully sent {:?} to player {}", action, block_id);
+        Ok(())
+    }
+
+    /// Jump a media player to playlist entry `index` and play it.
+    pub async fn goto_player(
+        &self,
+        flow_id: FlowId,
+        block_id: &str,
+        index: usize,
+    ) -> ApiResult<()> {
+        let url = format!(
+            "{}/flows/{}/blocks/{}/player/goto",
+            self.base_url, flow_id, block_id
+        );
+
+        let response = self
+            .with_auth(self.client.post(&url))
+            .json(&GotoRequest { index })
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!("Network error jumping to playlist entry: {}", e);
+                ApiError::Network(e.to_string())
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            tracing::error!("HTTP error {}: {}", status, text);
+            return Err(ApiError::Http(status, text));
+        }
         Ok(())
     }
 
@@ -106,11 +132,6 @@ impl ApiClient {
             self.base_url, flow_id, block_id
         );
         info!("Seeking player {} to {} ns", block_id, position_ns);
-
-        #[derive(Serialize)]
-        struct SeekRequest {
-            position_ns: u64,
-        }
 
         let response = self
             .with_auth(self.client.post(&url))

@@ -20,14 +20,30 @@
 //!   element, so a crosspoint is a level, not a checkbox.
 //!
 //! ```text
-//! audio_in_I → identity_in_I → deinterleave_in_I → tee_iIcC
+//! audio_in_I → identity_in_I → resample_in_I → rate_in_I → deinterleave_in_I → tee_iIcC
 //!
 //!   tee_iIcC → xp_iIcC_oOcD (volume)      one branch per crosspoint,
 //!            → mixer_O sink pad           the pad placing the mono
 //!                                         on output channel D
 //!
-//!   mixer_O → caps_out_O → capssetter_out_O → queue_out_O → audio_out_O
+//!   mixer_O → caps_out_O → capssetter_out_O → fader_out_O (volume)
+//!           → [soft_clip_out_O (rglimiter)] → queue_out_O → audio_out_O
 //! ```
+//!
+//! An output bus sums every crosspoint routed to it, so a mix-minus return
+//! carries N-1 talkers at unity and goes over full scale long before any one
+//! of them does. `fader_out_O` and `soft_clip_out_O` are what it has to catch
+//! that: the fader brings the bus down so the sum fits, and the soft clipper
+//! after it puts a ceiling on what is left. The clipper comes second because
+//! it is only transparent on a signal that is already mostly below its knee.
+//!
+//! Both are off by default, and while they are off the bus is left alone down
+//! to its negotiation: `caps_out_O` pins `F32LE` only once one of them is
+//! engaged. That pin is the load-bearing part. An `audiomixer` saturates at
+//! the sum in a fixed-point format, so with the format left open whether a
+//! fan-in overload clipped inside the router or reached the output intact
+//! depended on what the next block negotiated — and neither stage can undo a
+//! sum that has already been saturated upstream of it.
 //!
 //! There is no queue on a crosspoint branch. A tee branch normally needs one
 //! so it cannot block its siblings, but every branch here ends on a
@@ -35,6 +51,16 @@
 //! for the mix, and the bus never waits indefinitely on a pad. A queue per
 //! crosspoint would be a thread per crosspoint for decoupling that is already
 //! there; `queue_out_O` is where downstream is decoupled.
+//!
+//! Every output bus runs at the block's `sample_rate`: `caps_out_O` pins the
+//! rate, and `resample_in_I` converts each input to it. `rate_in_I` tells the
+//! resampler which rate to produce: `deinterleave` creates its source pads
+//! only once it has caps, so it cannot pass the buses' rate back upstream. An `audiomixer`
+//! cannot take inputs at different rates (once one sink pad has caps, the
+//! others are held to its rate), so without the resampler a second source at
+//! another rate is refused: `not-negotiated` when both are there at start,
+//! `not-linked` when it joins a running bus. The resampler passes through
+//! untouched when the rates already match.
 //!
 //! Fan-out is one `tee` feeding several crosspoints; fan-in is several
 //! crosspoints landing on the same mixer. An unrouted output channel simply
@@ -49,7 +75,7 @@ use gstreamer::prelude::*;
 use std::collections::HashMap;
 use strom_types::routing::{self, Crosspoint, RoutingGains};
 use strom_types::{block::*, element::ElementPadRef, PropertyValue, *};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum number of input/output streams.
 const MAX_STREAMS: usize = 8;
@@ -110,6 +136,29 @@ const CROSSPOINT_PREFIX: &str = ":xp_";
 /// The `GstAudioConverter` option that maps a mixer sink pad's channels onto
 /// the mixer's output channels.
 const MIX_MATRIX_KEY: &str = "GstAudioConverter.mix-matrix";
+
+/// Name of the output fader property, in dB.
+pub const OUTPUT_FADER_PROPERTY: &str = "output_fader_db";
+
+/// Name of the property setting the rate every output bus runs at.
+pub const SAMPLE_RATE_PROPERTY: &str = "sample_rate";
+
+/// Name of the output soft clipper property.
+pub const OUTPUT_SOFT_CLIP_PROPERTY: &str = "output_soft_clip_enabled";
+
+/// The element every output bus is soft-clipped by. GStreamer calls
+/// `rglimiter` a limiter, but it has no attack or release: it is a fixed
+/// transfer curve applied per sample — unity below -6 dBFS, a `tanh` knee
+/// above it, and an asymptote at full scale — which is a soft clipper. Nothing
+/// it emits can reach 0 dBFS whatever goes in.
+///
+/// Not `lsp-rs-limiter`, the true limiter `builtin.mixer` uses through
+/// `make_limiter_element`. That one rides gain on an envelope, and on speech
+/// its attack loses the transient it was pointed at: measured on a four-seat
+/// return 5 dB over, it still let 0.05% of samples past full scale at a -3 dB
+/// threshold and 0.0007% at -10 dB, where it also costs 7.5 dB of level. A
+/// ceiling that is usually held is not a ceiling on a headphone feed.
+const SOFT_CLIPPER_FACTORY: &str = "rglimiter";
 
 /// Element naming for a crosspoint. The wire format itself lives in
 /// `strom_types::routing`, shared with the graph editor.
@@ -290,6 +339,19 @@ impl BlockBuilder for LiveAudioRouterBuilder {
             DEFAULT_OUTPUT_BUFFER_MS,
         )
         .max(1);
+        let sample_rate = parse_sample_rate(properties);
+        let fader_db = output_fader_db(properties);
+        let soft_clip_enabled = parse_bool(
+            properties,
+            OUTPUT_SOFT_CLIP_PROPERTY,
+            routing::DEFAULT_OUTPUT_SOFT_CLIP_ENABLED,
+        );
+        // A bus with its fader down or its soft clipper on has to sum in
+        // float, and a bus with neither must negotiate as it did before:
+        // neither stage is any use after an `audiomixer` has already saturated
+        // the sum in a fixed-point format, and pinning a format nobody asked
+        // for would change what every existing flow negotiates.
+        let sum_in_float = soft_clip_enabled || fader_db != 0.0;
 
         // A matrix that has never been set gets the straight-through default,
         // so a router that has just been dropped in passes audio. An empty
@@ -327,6 +389,7 @@ impl BlockBuilder for LiveAudioRouterBuilder {
                 force_live,
                 latency_ms,
                 min_upstream_latency_ms,
+                crate::blocks::builtin::start_time::StartTime::Zero,
             )?;
             mixer.set_property(
                 "output-buffer-duration",
@@ -337,17 +400,19 @@ impl BlockBuilder for LiveAudioRouterBuilder {
 
             // The mixer's own output must be unpositioned: a sink pad's
             // mix-matrix is only applied when the converter is not asked to do
-            // positional mapping as well.
+            // positional mapping as well. The rate is pinned so every bus
+            // runs at `sample_rate` whatever its consumer would pick.
             let caps_id = format!("{instance_id}:caps_out_{out_idx}");
+            let mut bus_caps = gst::Caps::builder("audio/x-raw")
+                .field("rate", sample_rate as i32)
+                .field("channels", channels as i32)
+                .field("channel-mask", gst::Bitmask::new(0));
+            if sum_in_float {
+                bus_caps = bus_caps.field("format", "F32LE");
+            }
             let caps = gst::ElementFactory::make("capsfilter")
                 .name(&caps_id)
-                .property(
-                    "caps",
-                    gst::Caps::builder("audio/x-raw")
-                        .field("channels", channels as i32)
-                        .field("channel-mask", gst::Bitmask::new(0))
-                        .build(),
-                )
+                .property("caps", bus_caps.build())
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("caps_out: {e}")))?;
             elements.push((caps_id.clone(), caps));
@@ -357,6 +422,27 @@ impl BlockBuilder for LiveAudioRouterBuilder {
             let setter_id = format!("{instance_id}:capssetter_out_{out_idx}");
             let setter = make_capssetter(&setter_id, channels)?;
             elements.push((setter_id.clone(), setter));
+
+            // Headroom: bring the bus down so the sum fits, then cap what is
+            // left. The fader is a `volume`, which leaves samples untouched at
+            // unity, so it is always built. It takes no unsigned formats, but
+            // neither does any crosspoint `volume` in front of the mixer, so
+            // at unity it changes nothing about what the bus can negotiate.
+            let fader_id = format!("{instance_id}:fader_out_{out_idx}");
+            let fader = gst::ElementFactory::make("volume")
+                .name(&fader_id)
+                .property("volume", db_to_linear(fader_db))
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("fader_out: {e}")))?;
+            elements.push((fader_id.clone(), fader));
+
+            // The soft clipper is not. `rglimiter` accepts `F32LE` and nothing
+            // else, so leaving a disabled one in the chain would pin the whole
+            // output to float for a flow that never asked for it.
+            let clipper_id = format!("{instance_id}:soft_clip_out_{out_idx}");
+            if soft_clip_enabled {
+                elements.push((clipper_id.clone(), make_output_soft_clipper(&clipper_id)?));
+            }
 
             let queue_id = format!("{instance_id}:queue_out_{out_idx}");
             let queue = gst::ElementFactory::make("queue")
@@ -375,8 +461,23 @@ impl BlockBuilder for LiveAudioRouterBuilder {
             ));
             internal_links.push((
                 ElementPadRef::pad(&setter_id, "src"),
-                ElementPadRef::pad(&queue_id, "sink"),
+                ElementPadRef::pad(&fader_id, "sink"),
             ));
+            if soft_clip_enabled {
+                internal_links.push((
+                    ElementPadRef::pad(&fader_id, "src"),
+                    ElementPadRef::pad(&clipper_id, "sink"),
+                ));
+                internal_links.push((
+                    ElementPadRef::pad(&clipper_id, "src"),
+                    ElementPadRef::pad(&queue_id, "sink"),
+                ));
+            } else {
+                internal_links.push((
+                    ElementPadRef::pad(&fader_id, "src"),
+                    ElementPadRef::pad(&queue_id, "sink"),
+                ));
+            }
         }
 
         // ------------------------------------------------------------------
@@ -390,7 +491,36 @@ impl BlockBuilder for LiveAudioRouterBuilder {
                 .property("silent", true)
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("identity: {e}")))?;
+            watch_input_channels(&identity, in_idx, channels);
             elements.push((identity_id.clone(), identity));
+
+            // The buses run at `sample_rate`, so an input at another rate is
+            // converted here rather than refused. It takes the same sample
+            // formats as the crosspoint `volume` elements, so it narrows
+            // nothing an input could negotiate before.
+            let resample_id = format!("{instance_id}:resample_in_{in_idx}");
+            let resample = gst::ElementFactory::make("audioresample")
+                .name(&resample_id)
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("audioresample: {e}")))?;
+            elements.push((resample_id.clone(), resample));
+
+            // `deinterleave` answers a caps query before it has source pads,
+            // so the buses' rate never reaches the resampler through it: pin
+            // the rate here, or the resampler passes the input's rate through
+            // and the bus refuses it.
+            let rate_id = format!("{instance_id}:rate_in_{in_idx}");
+            let rate = gst::ElementFactory::make("capsfilter")
+                .name(&rate_id)
+                .property(
+                    "caps",
+                    gst::Caps::builder("audio/x-raw")
+                        .field("rate", sample_rate as i32)
+                        .build(),
+                )
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("rate_in: {e}")))?;
+            elements.push((rate_id.clone(), rate));
 
             let deint_id = format!("{instance_id}:deinterleave_in_{in_idx}");
             let deint = gst::ElementFactory::make("deinterleave")
@@ -401,6 +531,14 @@ impl BlockBuilder for LiveAudioRouterBuilder {
 
             internal_links.push((
                 ElementPadRef::pad(&identity_id, "src"),
+                ElementPadRef::pad(&resample_id, "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(&resample_id, "src"),
+                ElementPadRef::pad(&rate_id, "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(&rate_id, "src"),
                 ElementPadRef::pad(&deint_id, "sink"),
             ));
 
@@ -532,10 +670,14 @@ impl BlockBuilder for LiveAudioRouterBuilder {
         }
 
         info!(
-            "LiveAudioRouter '{}' built: {} crosspoints, {} open at build time",
+            "LiveAudioRouter '{}' built: {} crosspoints, {} open at build time, \
+             {} Hz, output fader {:.1} dB, soft clipper {}",
             instance_id,
             crosspoints,
-            gains.values().filter(|g| **g > 0.0).count()
+            gains.values().filter(|g| **g > 0.0).count(),
+            sample_rate,
+            fader_db,
+            if soft_clip_enabled { "on" } else { "off" }
         );
 
         Ok(BlockBuildResult {
@@ -561,6 +703,104 @@ fn set_pad_placement(pad: &gst::Pad, out_channel: usize, out_channels: usize) {
     pad.set_property("converter-config", &config);
 }
 
+/// The output soft clipper for one bus, built only where one was asked for.
+fn make_output_soft_clipper(id: &str) -> Result<gst::Element, BlockBuildError> {
+    gst::ElementFactory::make(SOFT_CLIPPER_FACTORY)
+        .name(id)
+        .property("enabled", true)
+        .build()
+        .map_err(|e| {
+            // gst-plugins-good is a hard dependency everywhere this runs, so a
+            // missing `rglimiter` is a broken install. Substituting a
+            // passthrough would leave the operator believing the return is
+            // protected when it is not.
+            error!("Live Audio Router: {SOFT_CLIPPER_FACTORY} is unavailable for {id}: {e}");
+            BlockBuildError::ElementCreation(format!(
+                "Live Audio Router: the output soft clipper needs the {SOFT_CLIPPER_FACTORY} element from \
+                 gst-plugins-good, which is not installed"
+            ))
+        })
+}
+
+/// dB to a linear `volume` coefficient.
+fn db_to_linear(db: f64) -> f64 {
+    10f64.powf(db / 20.0)
+}
+
+/// Read the output fader, clamped to the range the block advertises. A fader
+/// that boosts would add to the overload it exists to remove, so it stops at
+/// unity.
+fn output_fader_db(properties: &HashMap<String, PropertyValue>) -> f64 {
+    properties
+        .get(OUTPUT_FADER_PROPERTY)
+        .and_then(|v| match v {
+            PropertyValue::Float(f) => Some(*f),
+            PropertyValue::Int(i) => Some(*i as f64),
+            PropertyValue::UInt(u) => Some(*u as f64),
+            _ => None,
+        })
+        .unwrap_or(routing::DEFAULT_OUTPUT_FADER_DB)
+        .clamp(routing::MIN_OUTPUT_FADER_DB, routing::MAX_OUTPUT_FADER_DB)
+}
+
+/// Warn when an input's negotiated channel count differs from its declared
+/// `input_<i>_channels`.
+///
+/// The router does not follow the stream: the declared count is what the saved
+/// routing matrix is indexed by, so resizing underneath it would silently
+/// change what a saved flow means. The operator is told which property to set
+/// instead. The warning goes on the bus from the input's `identity`, which the
+/// pipeline's bus watch forwards to clients as a pipeline warning.
+///
+/// An event probe that acts on CAPS only, so it fires once per negotiation and
+/// never per buffer. It captures no GStreamer object.
+fn watch_input_channels(identity: &gst::Element, in_idx: usize, declared: usize) {
+    let Some(sink) = identity.static_pad("sink") else {
+        return;
+    };
+    sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(caps) = event.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let negotiated = caps
+            .caps()
+            .structure(0)
+            .and_then(|s| s.get::<i32>("channels").ok())
+            .map(|n| n.max(0) as usize);
+        let Some(message) = negotiated.and_then(|n| channel_mismatch(in_idx, declared, n)) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        if let Some(element) = pad.parent_element() {
+            gst::element_warning!(element, gst::StreamError::Format, ("{}", message));
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// The operator-facing message for an input whose stream carries `negotiated`
+/// channels against a declaration of `declared`, or `None` when they agree.
+fn channel_mismatch(in_idx: usize, declared: usize, negotiated: usize) -> Option<String> {
+    if negotiated == declared {
+        return None;
+    }
+    let consequence = if negotiated < declared {
+        format!(
+            "{} of its declared channels carry nothing",
+            declared - negotiated
+        )
+    } else {
+        format!("{} of its channels are not routed", negotiated - declared)
+    };
+    Some(format!(
+        "Live Audio Router input {in_idx} carries {negotiated} channel(s) but \
+         input_{in_idx}_channels is {declared}: {consequence}. Set input_{in_idx}_channels \
+         to {negotiated} and restart the flow."
+    ))
+}
+
 /// capssetter fixing the channel-mask the way `builtin.audiorouter` does:
 /// 1ch = 0x1, 2ch = 0x3, 3+ch = 0x0 (unpositioned).
 fn make_capssetter(id: &str, channels: usize) -> Result<gst::Element, BlockBuildError> {
@@ -572,12 +812,86 @@ fn make_capssetter(id: &str, channels: usize) -> Result<gst::Element, BlockBuild
     let caps = gst::Caps::builder("audio/x-raw")
         .field("channel-mask", gst::Bitmask::new(channel_mask))
         .build();
-    gst::ElementFactory::make("capssetter")
+    let setter = gst::ElementFactory::make("capssetter")
         .name(id)
         .property("caps", &caps)
         .property("join", true)
         .build()
-        .map_err(|e| BlockBuildError::ElementCreation(format!("capssetter: {e}")))
+        .map_err(|e| BlockBuildError::ElementCreation(format!("capssetter: {e}")))?;
+    answer_caps_queries_from_downstream(&setter);
+    Ok(setter)
+}
+
+/// Make a caps query through `setter` report what its downstream accepts.
+///
+/// `capssetter` answers an upstream caps query with the query's own filter,
+/// or ANY, never with anything from downstream. The bus mixer reads its
+/// output format from that query whenever it negotiates before any input has
+/// caps: always when an input joins after the flow started, and whenever the
+/// mixer's first timeout beats the first input. It then picks a format blind
+/// (S32LE), and a consumer that takes one format and does not convert refuses
+/// it with `not-negotiated`. Reporting downstream here keeps that pick to a
+/// format the consumer accepts. The rate is not picked here: `caps_out_O`,
+/// upstream of the setter, pins it to the block's `sample_rate`.
+///
+/// The mixer fixes its output from the first entry of the answer, and also
+/// passes the answer on to its own inputs. So downstream's rates come first,
+/// for a consumer that cannot resample, followed by the same caps with any
+/// rate: a rate that a downstream mixer has locked must not refuse a later
+/// input at another rate, which the mixer resamples. Within each, float comes
+/// first when downstream accepts it, because a consumer that converts lists
+/// its own output format first, and that would sum the bus in fixed point.
+fn answer_caps_queries_from_downstream(setter: &gst::Element) {
+    let Some(sink) = setter.static_pad("sink") else {
+        return;
+    };
+    // Fires per query, never per buffer. The setter is looked up through the
+    // pad rather than captured, so the probe holds no reference to it.
+    sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |pad, info| {
+        let Some(gst::PadProbeData::Query(query)) = info.data.as_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::QueryViewMut::Caps(q) = query.view_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(setter) = pad.parent_element() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(src) = setter.static_pad("src") else {
+            return gst::PadProbeReturn::Ok;
+        };
+
+        // What downstream takes once the setter has stamped its fields, with
+        // those fields opened again: the setter overwrites them, so upstream
+        // may carry any value.
+        let stamped = setter.property::<gst::Caps>("caps");
+        let mut accepted = src
+            .peer_query_caps(None)
+            .intersect_with_mode(&stamped, gst::CapsIntersectMode::First);
+        for s in accepted.make_mut().iter_mut() {
+            for field in stamped.iter().flat_map(|st| st.fields()) {
+                s.remove_field(field);
+            }
+        }
+        let mut any_rate = accepted.clone();
+        for s in any_rate.make_mut().iter_mut() {
+            s.remove_field("rate");
+        }
+        let float = gst::Caps::builder("audio/x-raw")
+            .field("format", gst::List::new(["F32LE", "F64LE"]))
+            .build();
+        let mut result = gst::Caps::new_empty();
+        for caps in [accepted, any_rate] {
+            let caps = match q.filter() {
+                Some(filter) => filter.intersect_with_mode(&caps, gst::CapsIntersectMode::First),
+                None => caps,
+            };
+            result.merge(caps.intersect_with_mode(&float, gst::CapsIntersectMode::First));
+            result.merge(caps);
+        }
+        q.set_result(&result);
+        gst::PadProbeReturn::Handled
+    });
 }
 
 // ============================================================================
@@ -621,6 +935,21 @@ fn parse_millis(properties: &HashMap<String, PropertyValue>, key: &str, default:
             _ => None,
         })
         .unwrap_or(default)
+}
+
+/// Read the rate every output bus runs at. Unset gives
+/// `DEFAULT_AUDIO_SAMPLE_RATE`; a value outside the common rates is logged and
+/// falls back to the default too.
+fn parse_sample_rate(properties: &HashMap<String, PropertyValue>) -> u32 {
+    match properties.get(SAMPLE_RATE_PROPERTY) {
+        None => DEFAULT_AUDIO_SAMPLE_RATE,
+        Some(v) => parse_common_audio_sample_rate(v).unwrap_or_else(|| {
+            warn!(
+                "Live Audio Router: unsupported sample_rate {v:?}, using {DEFAULT_AUDIO_SAMPLE_RATE}"
+            );
+            DEFAULT_AUDIO_SAMPLE_RATE
+        }),
+    }
 }
 
 fn parse_bool(properties: &HashMap<String, PropertyValue>, key: &str, default: bool) -> bool {
@@ -763,6 +1092,71 @@ fn liveaudiorouter_definition() -> BlockDefinition {
         mapping: PropertyMapping {
             element_id: "_block".to_string(),
             property_name: "output_buffer_duration".to_string(),
+            transform: None,
+        },
+        live: false,
+        persist: None,
+    });
+
+    exposed_properties.push(ExposedProperty {
+        name: SAMPLE_RATE_PROPERTY.to_string(),
+        label: "Sample Rate".to_string(),
+        description: "Sample rate the router runs at. Every input is resampled to this rate, and every output runs at it. Construction-time only.".to_string(),
+        property_type: PropertyType::Enum {
+            values: common_audio_sample_rate_enum_values(false),
+        },
+        default_value: Some(PropertyValue::String(DEFAULT_AUDIO_SAMPLE_RATE.to_string())),
+        mapping: PropertyMapping {
+            element_id: "_block".to_string(),
+            property_name: SAMPLE_RATE_PROPERTY.to_string(),
+            transform: None,
+        },
+        live: false,
+        persist: None,
+    });
+
+    exposed_properties.push(ExposedProperty {
+        name: OUTPUT_FADER_PROPERTY.to_string(),
+        label: "Output Fader (dB)".to_string(),
+        description: format!(
+            "Master level of every output bus, in dB ({} to {}). An output sums every \
+             crosspoint routed to it, so two seats talking over each other in a mix-minus \
+             return can go over full scale when neither alone does. {:.0} dB with the soft \
+             clipper on is the starting point for a conversation, whatever the seat count: \
+             overlaps are short and almost always two voices. Construction-time only.",
+            routing::MIN_OUTPUT_FADER_DB,
+            routing::MAX_OUTPUT_FADER_DB,
+            routing::SUGGESTED_OUTPUT_FADER_DB,
+        ),
+        property_type: PropertyType::Float,
+        default_value: Some(PropertyValue::Float(routing::DEFAULT_OUTPUT_FADER_DB)),
+        mapping: PropertyMapping {
+            element_id: "_block".to_string(),
+            property_name: OUTPUT_FADER_PROPERTY.to_string(),
+            transform: None,
+        },
+        live: false,
+        persist: None,
+    });
+    exposed_properties.push(ExposedProperty {
+        name: OUTPUT_SOFT_CLIP_PROPERTY.to_string(),
+        label: "Output Soft Clipper".to_string(),
+        description: "Put a ceiling on every output bus so a fan-in overload cannot reach full \
+                      scale. Transparent below -6 dBFS and progressively rounds off peaks above \
+                      it, and it adds no latency. Unlike a limiter it does not turn the bus \
+                      down, so a bus driven hard into it distorts. The ceiling is full scale \
+                      itself, which leaves nothing for a lossy return leg to overshoot into, so \
+                      it catches the rare collision the output fader leaves rather than \
+                      replacing the fader. \
+                      Construction-time only."
+            .to_string(),
+        property_type: PropertyType::Bool,
+        default_value: Some(PropertyValue::Bool(
+            routing::DEFAULT_OUTPUT_SOFT_CLIP_ENABLED,
+        )),
+        mapping: PropertyMapping {
+            element_id: "_block".to_string(),
+            property_name: OUTPUT_SOFT_CLIP_PROPERTY.to_string(),
             transform: None,
         },
         live: false,

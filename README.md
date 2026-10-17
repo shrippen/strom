@@ -4,16 +4,16 @@
 
 **Strom** is a GStreamer media pipeline engine with a visual, web-based GUI. At its core it builds, runs, and manages real-time media pipelines; the node-based editor lets you design and control complex media flows without writing code.
 
-> **Used by [Open Live](https://github.com/Eyevinn/open-live):** Strom is a standalone GStreamer flow engine, but [Open Live](https://github.com/Eyevinn/open-live) — an open-source live production platform with [Open Live Studio](https://github.com/Eyevinn/open-live-studio) as its web-based production interface — uses Strom as a media backend, driving it over its REST and WebSocket APIs. Try the hosted platform at [openlive.apps.osaas.io](https://openlive.apps.osaas.io/), or see [docs/OPEN_LIVE_SETUP.md](docs/OPEN_LIVE_SETUP.md) for running your own Strom instance for Open Live.
+> **Used by [Open Live](https://github.com/Eyevinn/open-live):** Strom is a standalone GStreamer flow engine, but [Open Live](https://github.com/Eyevinn/open-live) — an open-source live production platform with [Open Live Studio](https://github.com/Eyevinn/open-live-studio) as its web-based production interface — uses Strom as a media backend, driving it over its REST and WebSocket APIs. Try the hosted platform at [openlive.apps.osaas.io](https://openlive.apps.osaas.io/?utm_source=github&utm_medium=readme&utm_campaign=strom), or see [docs/OPEN_LIVE_SETUP.md](docs/OPEN_LIVE_SETUP.md) for running your own Strom instance for Open Live.
 
 ---
 <div align="center">
 
 ## Quick Demo: Open Source Cloud
 
-Run this service in the cloud with a single click.
+Strom is the media engine behind Open Live. Try it in the hosted Open Live platform on Open Source Cloud.
 
-[![Badge OSC](https://img.shields.io/badge/Try%20it%20out!-1E3A8A?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://app.osaas.io/browse/eyevinn-strom)
+[![Badge OSC](https://img.shields.io/badge/Try%20it%20out!-1E3A8A?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTIiIGZpbGw9InVybCgjcGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyKSIvPgo8Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSI3IiBzdHJva2U9ImJsYWNrIiBzdHJva2Utd2lkdGg9IjIiLz4KPGRlZnM+CjxsaW5lYXJHcmFkaWVudCBpZD0icGFpbnQwX2xpbmVhcl8yODIxXzMxNjcyIiB4MT0iMTIiIHkxPSIwIiB4Mj0iMTIiIHkyPSIyNCIgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiPgo8c3RvcCBzdG9wLWNvbG9yPSIjQzE4M0ZGIi8+CjxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzREQzlGRiIvPgo8L2xpbmVhckdyYWRpZW50Pgo8L2RlZnM+Cjwvc3ZnPgo=)](https://openlive.apps.osaas.io/?utm_source=github&utm_medium=readme&utm_campaign=strom)
 
 </div>
 
@@ -27,15 +27,15 @@ Run this service in the cloud with a single click.
 - **Visual Pipeline Editor** - Node-based graph editor in your browser
 - **Real-time Control** - Start, stop, and monitor pipelines via REST API or WebSocket
 - **Element Discovery** - Browse and configure any installed GStreamer element
-- **Reusable Blocks** - Pre-built inputs, outputs, and processing blocks (mixers, encoders, WebRTC, AES67, SRT, NDI, DeckLink, …)
-- **Vision Mixer** - Broadcast-style PVW/PGM video switcher with web control UI and a GPU shader FX engine (GLSL looks, wipes, and master FX takes)
+- **Reusable Blocks** - Pre-built inputs, outputs, and processing blocks (mixers, encoders, media player, recorders, WebRTC, RTMP, AES67, SRT, NDI, DeckLink, TAMS, …)
+- **Vision Mixer** - Broadcast-style PVW/PGM video switcher with web control UI and a GPU shader FX engine (GLSL looks, wipes, and master FX takes) and stinger transitions
 - **Audio Mixer** - Digital mixing console with channel processing, aux sends, groups, and metering
-- **WebRTC / AES67 / SRT / NDI / DeckLink** - Wide protocol and hardware I/O coverage
-- **HTML Rendering** - Render web pages as video sources using CEF (via `strom-full` Docker image)
+- **WebRTC / RTMP / AES67 / SRT / NDI / DeckLink** - Wide protocol and hardware I/O coverage
+- **HTML Rendering** - Render web pages as video and audio sources with the HTML Input block, and drive the page remotely, using CEF (via `strom-full` Docker image)
 - **gst-launch Import/Export** - Import existing `gst-launch-1.0` commands or export flows
 - **System Monitoring** - Real-time CPU, memory, and GPU usage graphs
 - **Authentication** - Optional session login or API keys
-- **MCP Integration** - Control pipelines with AI assistants (Claude, etc.)
+- **MCP Integration** - Control pipelines with AI assistants (Claude, etc.) over the backend's own `/api/mcp` endpoint — no separate binary to install
 - **Native or Web** - Run as a desktop app or a web service
 
 Browse the full set of built-in blocks and their properties in the app's element palette and inspector.
@@ -63,7 +63,7 @@ Use `eyevinntechnology/strom-full:latest` for the image with HTML rendering (CEF
 - **Pre-built binaries** (Linux, macOS, Windows MSI) — see [GitHub Releases](https://github.com/Eyevinn/strom/releases).
 - **Docker / Docker Compose** (production, GPU, reverse proxy) — see [docs/DOCKER.md](docs/DOCKER.md) and [docs/DOCKER_GPU_SETUP.md](docs/DOCKER_GPU_SETUP.md).
 - **Build from source** — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
-- **Deploy for Open Live** — try the hosted platform at [openlive.apps.osaas.io](https://openlive.apps.osaas.io/), or see [docs/OPEN_LIVE_SETUP.md](docs/OPEN_LIVE_SETUP.md).
+- **Deploy for Open Live** — try the hosted platform at [openlive.apps.osaas.io](https://openlive.apps.osaas.io/?utm_source=github&utm_medium=readme&utm_campaign=strom), or see [docs/OPEN_LIVE_SETUP.md](docs/OPEN_LIVE_SETUP.md).
 
 ### First steps
 
@@ -89,7 +89,7 @@ Quick links: [Open Live setup](docs/OPEN_LIVE_SETUP.md) · [Docker](docs/DOCKER.
 │  - Element palette              │
 │  - Property inspector           │
 └────────────┬────────────────────┘
-             │ REST + WebSocket/SSE
+             │ REST + WebSocket    
 ┌────────────▼────────────────────┐
 │  Backend (Rust + Axum)          │
 │  - Flow manager                 │
@@ -106,7 +106,7 @@ Quick links: [Open Live setup](docs/OPEN_LIVE_SETUP.md) · [Docker](docs/DOCKER.
 
 ## Configuration
 
-Configure via config file, CLI arguments, or environment variables (in priority order):
+Configure via CLI arguments, environment variables, or a config file (highest priority first):
 
 ```bash
 --port 8080                      # or STROM_PORT=8080
@@ -114,12 +114,12 @@ Configure via config file, CLI arguments, or environment variables (in priority 
 --database-url postgresql://...   # or STROM_DATABASE_URL=... (production)
 ```
 
-Copy `.strom.toml.example` to `.strom.toml` for all options. Key topics have dedicated guides: [storage](docs/POSTGRESQL.md), [authentication](docs/AUTHENTICATION.md), and HTTPS/TLS (built-in `--tls-cert`/`--tls-key` with hot-reload, or a reverse proxy). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for the full option list.
+Copy `.strom.toml.example` to `.strom.toml` for all options. Key topics have dedicated guides: [storage](docs/POSTGRESQL.md), [authentication](docs/AUTHENTICATION.md), [media library](docs/MEDIA_LIBRARY.md), and HTTPS/TLS (built-in `--tls-cert`/`--tls-key` with hot-reload, or a reverse proxy). `strom --help` lists every CLI option; [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) covers the common ones.
 
 ## API & MCP
 
-- REST + WebSocket/SSE API, with interactive OpenAPI docs at `/swagger-ui`.
-- `WS /api/ws` and `GET /api/events` for real-time state and pipeline events.
+- REST + WebSocket API, with interactive OpenAPI docs at `/swagger-ui`.
+- `WS /api/ws` for real-time state and pipeline events.
 - gst-launch import/export via `POST /api/gst-launch/parse` and `/export`.
 - Model Context Protocol over HTTP at `/api/mcp` — see [docs/MCP.md](docs/MCP.md).
 
@@ -139,4 +139,4 @@ MIT OR Apache-2.0
 
 ---
 
-> The name **Strom** comes from "Ström" — Swedish for "stream".
+> The name Strom (rhymes with "from") comes from "Ström" — Swedish for "stream".

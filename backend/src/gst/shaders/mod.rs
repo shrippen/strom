@@ -39,6 +39,9 @@ use gstreamer_gl as gst_gl;
 use strom_types::effects::{parse_hex_rgb, VideoEffect};
 use tracing::{debug, error};
 
+mod passthrough;
+pub use passthrough::{request_passthrough, PassthroughTicket};
+
 /// Common header: GStreamer's default GL filter vertex shader provides
 /// `v_texcoord`; `glshader` itself sets `tex`, `time`, `width`, `height`.
 const PRELUDE: &str = r#"
@@ -169,6 +172,31 @@ const MASTER_SPIN: &str = include_str!("glsl/master_spin.glsl");
 const MASTER_ROLL: &str = include_str!("glsl/master_roll.glsl");
 const MASTER_NEGATIVE: &str = include_str!("glsl/master_negative.glsl");
 const MASTER_RIPPLE: &str = include_str!("glsl/master_ripple.glsl");
+
+const STINGER_MATTE: &str = include_str!("glsl/stinger_matte.glsl");
+
+/// The stinger matte fragment: the clip's matte region as alpha.
+pub fn stinger_matte_fragment() -> String {
+    format!("{}{}", PRELUDE, STINGER_MATTE)
+}
+
+/// Uniforms for [`stinger_matte_fragment`]: where the matte sits in the clip
+/// and whether to invert it.
+pub fn stinger_matte_uniforms(
+    layout: strom_types::stinger::StingerLayout,
+    invert: bool,
+) -> gst::Structure {
+    use strom_types::stinger::StingerLayout;
+    let region = match layout {
+        StingerLayout::SideBySide => 1.0,
+        StingerLayout::Stacked => 2.0,
+        _ => 0.0,
+    };
+    uniforms(&[
+        ("u_layout", region),
+        ("u_invert", if invert { 1.0 } else { 0.0 }),
+    ])
+}
 
 /// Default soft-edge width for wipes, in normalized ordering units.
 const DEFAULT_WIPE_SOFTNESS: f32 = 0.05;
@@ -692,7 +720,10 @@ impl MasterFxKind {
 /// real GL pipeline. Keep exhaustive: a fragment missing here can reach
 /// production uncompiled and kill the pipeline at runtime.
 pub fn all_fragments() -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = vec![("identity".to_string(), identity_fragment())];
+    let mut v: Vec<(String, String)> = vec![
+        ("identity".to_string(), identity_fragment()),
+        ("stinger_matte".to_string(), stinger_matte_fragment()),
+    ];
     let looks = [
         VideoEffect::ChromaKey {
             key_color: "#00B140".into(),
@@ -792,12 +823,5 @@ mod tests {
         assert_eq!(s.get::<f32>("u_start").unwrap(), 12.5);
         assert_eq!(s.get::<f32>("u_duration").unwrap(), 0.8);
         assert_eq!(s.get::<f32>("u_dx").unwrap(), -1.0);
-    }
-
-    #[test]
-    fn master_bases() {
-        assert_eq!(MasterFxKind::Glitch.base(), MasterBase::DelayedCut);
-        assert_eq!(MasterFxKind::Flash.base(), MasterBase::Fade);
-        assert_eq!(MasterFxKind::WhipLeft.base(), MasterBase::Push(-1, 0));
     }
 }

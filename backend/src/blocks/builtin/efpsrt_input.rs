@@ -1129,15 +1129,15 @@ mod tests {
     use super::*;
     use gstreamer as gst;
 
+    /// Initialise GStreamer and register the EFP plugin. efpdemux is a Rust
+    /// plugin linked into Strom, not installed system-wide; main.rs registers
+    /// it at startup, so the lib test binary has to do the same.
     fn init_gst() {
-        let _ = gst::init();
-    }
-
-    fn efpdemux_available() -> bool {
-        let registry = gst::Registry::get();
-        registry
-            .find_feature("efpdemux", gst::ElementFactory::static_type())
-            .is_some()
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            gst::init().expect("GStreamer init");
+            gst_plugin_efp::plugin_register_static().expect("register the EFP plugin");
+        });
     }
 
     fn build_with_normalize_segment(value: &str) -> Result<BlockBuildResult, BlockBuildError> {
@@ -1159,43 +1159,83 @@ mod tests {
             .expect("block result must contain an efpdemux element")
     }
 
+    /// The demuxer's `normalize-segment` value as its enum nick. The property
+    /// is a GEnum, so `get::<i32>()` fails on it; read the nick instead.
+    fn demux_mode_nick(demux: &gst::Element) -> String {
+        let value = demux.property_value("normalize-segment");
+        let (_, enum_value) = gst::glib::EnumValue::from_value(&value)
+            .expect("normalize-segment must be an enum property");
+        enum_value.nick().to_string()
+    }
+
+    /// An empty or blank `data_stream_ids` means "fill the tracks in arrival
+    /// order", not a list with one unparsable entry. The build-level guard is
+    /// `input_block_builds_with_an_empty_data_stream_ids_list` in the EFP/SRT
+    /// round-trip test.
     #[test]
-    fn normalize_segment_never_is_applied_to_demux() {
-        init_gst();
-        if !efpdemux_available() {
-            eprintln!("efpdemux plugin not available — skipping");
-            return;
+    fn data_stream_ids_empty_or_blank_leaves_every_track_unpinned() {
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                parse_data_stream_ids(value, 2).expect("an empty list must parse"),
+                vec![None, None],
+                "data_stream_ids={:?}",
+                value
+            );
         }
-        let result = build_with_normalize_segment("never").expect("build should succeed");
-        let demux = find_demux(&result);
-        let mode: i32 = demux
-            .property_value("normalize-segment")
-            .get()
-            .unwrap_or(-1);
-        // Matches the enum ordering in gst-plugin-efp: Auto=0, Always=1, Never=2.
         assert_eq!(
-            mode, 2,
-            "normalize_segment=never must set demux property to Never"
+            parse_data_stream_ids(Some(""), 0).expect("an empty list must parse"),
+            Vec::<Option<u8>>::new()
         );
+    }
+
+    #[test]
+    fn data_stream_ids_pins_one_stream_per_track() {
+        assert_eq!(
+            parse_data_stream_ids(Some("3"), 1).expect("one stream for one track"),
+            vec![Some(3)]
+        );
+        assert_eq!(
+            parse_data_stream_ids(Some(" 5 , 7 "), 2).expect("whitespace around entries"),
+            vec![Some(5), Some(7)]
+        );
+    }
+
+    /// An empty entry inside a list is an error, not skipped. Two tracks, so
+    /// skipping it would leave a list of the right length and build.
+    #[test]
+    fn data_stream_ids_rejects_an_empty_entry() {
+        assert!(matches!(
+            parse_data_stream_ids(Some("1,,2"), 2),
+            Err(BlockBuildError::InvalidProperty(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_segment_is_applied_to_demux() {
+        init_gst();
+        for mode in ["never", "always", "auto"] {
+            let result = build_with_normalize_segment(mode).expect("build should succeed");
+            assert_eq!(
+                demux_mode_nick(&find_demux(&result)),
+                mode,
+                "normalize_segment={} must reach the demuxer",
+                mode
+            );
+        }
     }
 
     #[test]
     fn normalize_segment_auto_is_default() {
         init_gst();
-        if !efpdemux_available() {
-            eprintln!("efpdemux plugin not available — skipping");
-            return;
-        }
         let ctx = BlockBuildContext::new(vec![], "all".to_string());
         let result = EfpSrtInputBuilder
             .build("test_instance", &HashMap::new(), &ctx)
             .expect("build should succeed with no properties");
-        let demux = find_demux(&result);
-        let mode: i32 = demux
-            .property_value("normalize-segment")
-            .get()
-            .unwrap_or(-1);
-        assert_eq!(mode, 0, "default normalize_segment must be Auto");
+        assert_eq!(
+            demux_mode_nick(&find_demux(&result)),
+            "auto",
+            "default normalize_segment must be Auto"
+        );
     }
 
     #[test]

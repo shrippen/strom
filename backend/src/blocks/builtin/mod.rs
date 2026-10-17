@@ -2,6 +2,7 @@
 
 pub mod aes67;
 pub mod audioanalyzer;
+pub mod audioenc;
 pub mod audioformat;
 pub mod audiogain;
 pub mod audiorouter;
@@ -13,8 +14,10 @@ pub mod devicesrc;
 pub mod efpsrt;
 #[cfg(feature = "efp")]
 pub mod efpsrt_input;
+pub mod html_input;
 pub mod inter;
 pub mod latency;
+pub mod live_recorder;
 pub mod liveaudiorouter;
 pub mod loudness;
 pub mod mediaplayer;
@@ -34,6 +37,7 @@ pub mod time_offset;
 pub mod videoenc;
 pub mod videoformat;
 pub mod vision_mixer;
+pub(crate) mod webrtc_props;
 pub mod whep;
 pub mod whip;
 
@@ -80,6 +84,9 @@ pub fn get_all_builtin_blocks() -> Vec<BlockDefinition> {
     #[cfg(feature = "efp")]
     blocks.extend(efpsrt_input::get_blocks());
 
+    // Add HTML Input blocks
+    blocks.extend(html_input::get_blocks());
+
     // Add Inter-pipeline blocks
     blocks.extend(inter::get_blocks());
 
@@ -109,6 +116,7 @@ pub fn get_all_builtin_blocks() -> Vec<BlockDefinition> {
 
     // Add Recorder blocks
     blocks.extend(recorder::get_blocks());
+    blocks.extend(live_recorder::get_blocks());
 
     // Add Spectrum blocks
     blocks.extend(spectrum::get_blocks());
@@ -121,6 +129,9 @@ pub fn get_all_builtin_blocks() -> Vec<BlockDefinition> {
 
     // Add Time Offset block (generic timestamp shifter)
     blocks.extend(time_offset::get_blocks());
+
+    // Add AudioEncoder blocks
+    blocks.extend(audioenc::get_blocks());
 
     // Add VideoEncoder blocks
     blocks.extend(videoenc::get_blocks());
@@ -152,6 +163,7 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.aes67_input" => Some(Arc::new(aes67::AES67InputBuilder)),
         "builtin.aes67_output" => Some(Arc::new(aes67::AES67OutputBuilder)),
         "builtin.audioanalyzer" => Some(Arc::new(audioanalyzer::AudioAnalyzerBuilder)),
+        "builtin.audioenc" => Some(Arc::new(audioenc::AudioEncBuilder)),
         "builtin.audioformat" => Some(Arc::new(audioformat::AudioFormatBuilder)),
         "builtin.audiogain" => Some(Arc::new(audiogain::AudioGainBuilder)),
         "builtin.audiorouter" => Some(Arc::new(audiorouter::AudioRouterBuilder)),
@@ -160,6 +172,7 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.decklink_input" => Some(Arc::new(decklink::DeckLinkInputBuilder)),
         "builtin.decklink_output" => Some(Arc::new(decklink::DeckLinkOutputBuilder)),
         "builtin.local_input" => Some(Arc::new(devicesrc::LocalInputBuilder)),
+        "builtin.html_input" => Some(Arc::new(html_input::HtmlInputBuilder)),
         "builtin.inter_output" => Some(Arc::new(inter::InterOutputBuilder)),
         "builtin.inter_input" => Some(Arc::new(inter::InterInputBuilder)),
         "builtin.latency" => Some(Arc::new(latency::LatencyBuilder)),
@@ -176,6 +189,7 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.ndi_input" => Some(Arc::new(ndi::NDIInputBuilder)),
         "builtin.ndi_output" => Some(Arc::new(ndi::NDIOutputBuilder)),
         "builtin.recorder" => Some(Arc::new(recorder::RecorderBuilder)),
+        "builtin.liverecorder" => Some(Arc::new(live_recorder::LiveRecorderBuilder)),
         "builtin.rtmp_output" => Some(Arc::new(rtmp::RtmpOutputBuilder)),
         "builtin.spectrum" => Some(Arc::new(spectrum::SpectrumBuilder)),
         "builtin.tams_output" => Some(Arc::new(tams_output::TamsOutputBuilder)),
@@ -190,5 +204,69 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.whep_output" => Some(Arc::new(whep::WHEPOutputBuilder)),
         // Future: Add more builders here
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gstreamer as gst;
+    use strom_types::block::PropertyType;
+    use strom_types::PropertyValue;
+
+    /// Every WebRTC block must let an operator force TURN relay on its own,
+    /// without changing the server-wide policy. A block that misses the
+    /// property silently ignores the setting in the UI.
+    #[test]
+    fn webrtc_blocks_expose_the_ice_transport_policy_override() {
+        // Some block definitions query the GStreamer registry while building.
+        gst::init().expect("gst init");
+
+        let blocks = get_all_builtin_blocks();
+
+        for id in [
+            "builtin.whip_input",
+            "builtin.whip_output",
+            "builtin.whep_input",
+            "builtin.whep_output",
+        ] {
+            let block = blocks
+                .iter()
+                .find(|b| b.id == id)
+                .unwrap_or_else(|| panic!("{} missing from the built-in blocks", id));
+
+            let prop = block
+                .exposed_properties
+                .iter()
+                .find(|p| p.name == "ice_transport_policy")
+                .unwrap_or_else(|| panic!("{} does not expose ice_transport_policy", id));
+
+            match &prop.property_type {
+                PropertyType::Enum { values } => {
+                    let values: Vec<&str> = values.iter().map(|v| v.value.as_str()).collect();
+                    assert_eq!(
+                        values,
+                        vec!["", "all", "relay"],
+                        "{} exposes unexpected ice_transport_policy values",
+                        id
+                    );
+                }
+                other => panic!(
+                    "{} ice_transport_policy is {:?}, expected an enum",
+                    id, other
+                ),
+            }
+
+            // The default must inherit the server setting: adding this property
+            // may not change how any existing flow negotiates.
+            match &prop.default_value {
+                Some(PropertyValue::String(s)) if s.is_empty() => {}
+                other => panic!(
+                    "{} ice_transport_policy defaults to {:?}, expected the empty \
+                     value that inherits the server setting",
+                    id, other
+                ),
+            }
+        }
     }
 }

@@ -57,6 +57,13 @@ pub(super) fn build_gpu_pipeline(
     // With gl_download=false: mixer → queue_post_dist → tee_pgm → capsfilter(GLMemory) → queue_dist_out
     // The capsfilter on the false path enforces pgm_framerate/resolution while
     // keeping memory in GL — without it, the framerate property is silently ignored.
+    //
+    // These capsfilters carry output_format (see pgm_caps/mv_caps), and keyed
+    // pads still keep their alpha: glvideomixer is a bin whose own converter
+    // absorbs the pin, so the blend stays RGBA in GL memory. Keep a converting
+    // element between the mixer and any format pin — a mixer converts every
+    // sink pad to its own src format, so an alpha-less pin on mixer:src strips
+    // the alpha of every DSK graphic and border underlay feeding it.
     let q_post_dist_id = p.id("queue_post_dist");
     let queue_post_dist = elements::make_queue(&q_post_dist_id)?;
     let tee_pgm_id = p.id("tee_pgm");
@@ -161,7 +168,7 @@ pub(super) fn build_gpu_pipeline(
         let queue = elements::make_queue(&q_id)?;
         let glupload = elements::make_element("glupload", &up_id)?;
         let glcolorconvert = elements::make_element("glcolorconvert", &cc_id)?;
-        install_upload_bridge(&queue, &q_id);
+        install_input_front(&queue, &glupload, &p.id(&format!("dsk_in_{}", i)));
 
         elems.push((q_id.clone(), queue));
         elems.push((up_id.clone(), glupload));
@@ -176,6 +183,80 @@ pub(super) fn build_gpu_pipeline(
             ElementPadRef::pad(&cc_id, "sink"),
         ));
         // NOTE: link to mixer is added later, after video input links, to ensure correct pad order
+    }
+
+    // --- Stinger input ---
+    // queue → glupload → glcolorconvert → tee, feeding two dist mixer pads:
+    // the graphic, and the matte through a shader that turns it into alpha.
+    // The matte pad subtracts that alpha from what is already drawn, and the
+    // incoming source of a track-matte take blends by it (see
+    // `effects::stinger`). Links to the mixer come after the underlays.
+    if p.enable_stinger {
+        let q_id = p.id("queue_stinger");
+        let vc_id = p.id("videoconvert_stinger");
+        let up_id = p.id("glupload_stinger");
+        let cc_id = p.id("glcolorconvert_stinger");
+        let tee_id = p.id("tee_stinger");
+        let q_fill_id = p.id("queue_stinger_fill");
+        let q_matte_id = p.id("queue_stinger_matte");
+        let matte_id = p.id("stinger_matte");
+
+        // No GL input front here: the stinger source decodes in software to
+        // system memory, and the videoconvert below adapts its pixel format.
+        let queue = elements::make_queue(&q_id)?;
+        let glupload = elements::make_element("glupload", &up_id)?;
+        let matte = elements::make_glshader(&matte_id)?;
+        matte.set_property("fragment", crate::gst::shaders::stinger_matte_fragment());
+        matte.set_property(
+            "uniforms",
+            crate::gst::shaders::stinger_matte_uniforms(
+                strom_types::stinger::StingerLayout::MaskOnly,
+                false,
+            ),
+        );
+        elements::keep_input_size(&matte);
+        // Not an FX slot: the matte always renders. In passthrough the clip
+        // reaches the mixer as it is, and its own alpha becomes the matte.
+        crate::gst::shaders::request_passthrough(&matte, false);
+
+        elems.push((q_id.clone(), queue));
+        // Passes through what glupload takes and converts the rest: clips
+        // decode to whatever their codec gives (10-bit 4:4:4 with alpha for
+        // ProRes 4444), and each clip may differ from the last.
+        elems.push((
+            vc_id.clone(),
+            elements::make_element("videoconvert", &vc_id)?,
+        ));
+        elems.push((up_id.clone(), glupload));
+        elems.push((
+            cc_id.clone(),
+            elements::make_element("glcolorconvert", &cc_id)?,
+        ));
+        elems.push((tee_id.clone(), elements::make_tee(&tee_id)?));
+        elems.push((q_fill_id.clone(), elements::make_queue(&q_fill_id)?));
+        elems.push((q_matte_id.clone(), elements::make_queue(&q_matte_id)?));
+        elems.push((matte_id.clone(), matte));
+
+        for (from, to) in [
+            (&q_id, &vc_id),
+            (&vc_id, &up_id),
+            (&up_id, &cc_id),
+            (&cc_id, &tee_id),
+            (&q_matte_id, &matte_id),
+        ] {
+            links.push((
+                ElementPadRef::pad(from, "src"),
+                ElementPadRef::pad(to, "sink"),
+            ));
+        }
+        links.push((
+            ElementPadRef::pad(&tee_id, "src_0"),
+            ElementPadRef::pad(&q_fill_id, "sink"),
+        ));
+        links.push((
+            ElementPadRef::pad(&tee_id, "src_1"),
+            ElementPadRef::pad(&q_matte_id, "sink"),
+        ));
     }
 
     // --- Multiview output chain ---
@@ -261,7 +342,9 @@ pub(super) fn build_gpu_pipeline(
         .format(gst::Format::Time)
         .is_live(false)
         .automatic_eos(false)
-        .do_timestamp(true)
+        // The renderer stamps every buffer itself, for the mixer's next
+        // output frame (see `OverlayRenderer::next_output_time`).
+        .do_timestamp(false)
         .max_buffers(2)
         .leaky_type(gst_app::AppLeakyType::Upstream)
         .build();
@@ -291,10 +374,11 @@ pub(super) fn build_gpu_pipeline(
     // --- Border underlay sources ---
     // Zone borders render as solid-color compositor pads directly beneath
     // their content pads (see `gst::underlay`). One tiny videotestsrc per
-    // (region, input); the border color is set at runtime via
-    // `foreground-color`. Non-live → contributes no latency. Only built when
-    // PiPs are configured — zones (and thus borders) cannot exist without
-    // them.
+    // (region, input) pushes one frame, which the mixer pad holds while the
+    // border is configured or visible. The border color is set at runtime
+    // via `foreground-color` and a restart (`set_underlay_color`). Non-live,
+    // so it adds no latency. Only built when PiPs are configured: zones (and
+    // thus borders) cannot exist without them.
     if p.num_pips > 0 {
         let underlay_chains: Vec<String> = (0..p.num_inputs)
             .map(|i| format!("underlay_dist_{}", i))
@@ -305,8 +389,8 @@ pub(super) fn build_gpu_pipeline(
                     .collect::<Vec<_>>()
             }))
             .collect();
-        // Low framerate: the color only changes on border edits and the
-        // mixer keeps compositing the latest buffer between pushes.
+        // Each source pushes a single frame; the mixer pad repeats it
+        // (`repeat-after-eos`) while the border is configured or visible.
         let (underlay_live, underlay_caps_str) = p.underlay_source();
         let underlay_caps: gst::Caps = underlay_caps_str
             .parse()
@@ -315,12 +399,8 @@ pub(super) fn build_gpu_pipeline(
             let src_id = p.id(&format!("{}_src", name));
             let cf_id = p.id(&format!("{}_caps", name));
             let up_id = p.id(&format!("{}_upload", name));
-            let src = gst::ElementFactory::make("videotestsrc")
-                .name(&src_id)
-                .property("is-live", underlay_live)
-                .build()
+            let src = crate::gst::underlay::make_underlay_src(&src_id, underlay_live)
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", src_id, e)))?;
-            src.set_property_from_str("pattern", "solid-color");
             let cf = gst::ElementFactory::make("capsfilter")
                 .name(&cf_id)
                 .property("caps", &underlay_caps)
@@ -357,7 +437,7 @@ pub(super) fn build_gpu_pipeline(
         let glupload = elements::make_element("glupload", &up_id)?;
         let glcolorconvert = elements::make_element("glcolorconvert", &cc_id)?;
         let tee = elements::make_tee(&tee_id)?;
-        install_upload_bridge(&queue, &q_id);
+        install_input_front(&queue, &glupload, &p.id(&format!("video_in_{}", i)));
 
         elems.push((q_id.clone(), queue));
         elems.push((up_id.clone(), glupload));
@@ -394,7 +474,9 @@ pub(super) fn build_gpu_pipeline(
             // pixelate, ...). Sits before the tee so the look follows the
             // source everywhere: PGM, PVW, thumbnails and PiPs.
             let fx_look_id = p.id(&format!("fx_look_{}", i));
-            elems.push((fx_look_id.clone(), elements::make_glshader(&fx_look_id)?));
+            let fx_look = elements::make_glshader(&fx_look_id)?;
+            elements::keep_input_size(&fx_look);
+            elems.push((fx_look_id.clone(), fx_look));
             links.push((
                 ElementPadRef::pad(&cc_id, "src"),
                 ElementPadRef::pad(&fx_look_id, "sink"),
@@ -425,7 +507,9 @@ pub(super) fn build_gpu_pipeline(
             // shader transitions. Dist branch only — multiview thumbnails
             // and PVW stay clean during a wipe.
             let fx_take_id = p.id(&format!("fx_take_{}", i));
-            elems.push((fx_take_id.clone(), elements::make_glshader(&fx_take_id)?));
+            let fx_take = elements::make_glshader(&fx_take_id)?;
+            elements::keep_input_size(&fx_take);
+            elems.push((fx_take_id.clone(), fx_take));
             links.push((
                 ElementPadRef::pad(&q_dist_id, "src"),
                 ElementPadRef::pad(&fx_take_id, "sink"),
@@ -464,6 +548,20 @@ pub(super) fn build_gpu_pipeline(
                 ),
             ));
         }
+    }
+
+    // Stinger pads — after the underlays: graphic at the base index, matte
+    // at the next.
+    if p.enable_stinger {
+        let base = p.stinger_pad_base();
+        links.push((
+            ElementPadRef::pad(p.id("queue_stinger_fill"), "src"),
+            ElementPadRef::pad(&mixer_id, format!("sink_{}", base)),
+        ));
+        links.push((
+            ElementPadRef::pad(p.id("stinger_matte"), "src"),
+            ElementPadRef::pad(&mixer_id, format!("sink_{}", base + 1)),
+        ));
     }
 
     // Multiview compositor thumbnails: tee_i.src_1 → queue → mv_comp
@@ -570,15 +668,22 @@ pub(super) fn build_gpu_pipeline(
     // setup time (after linking, when the request pads exist).
     {
         let block_id = p.instance_id.to_string();
+        let flow_id = p.flow_id;
         let num_inputs = p.num_inputs;
         let num_pips = p.num_pips;
+        let underlay_state = std::sync::Arc::clone(&overlay_state);
         ctx.register_element_setup(Box::new(move |_flow_id, _events| {
             let (Some(mixer), Some(mv_comp)) = (dist_weak.upgrade(), mv_weak.upgrade()) else {
                 return;
             };
             super::super::geometry::install_caps_probes(
-                &block_id, &mixer, &mv_comp, num_inputs, num_pips,
+                flow_id, &block_id, &mixer, &mv_comp, num_inputs, num_pips,
             );
+            // Border underlays hold a frame only while their border is
+            // configured or still visible.
+            if num_pips > 0 {
+                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp);
+            }
         }));
     }
 
@@ -601,19 +706,22 @@ pub(super) fn build_gpu_pipeline(
     })
 }
 
-/// Hardware decoders deliver CUDA or VA frames, which `glupload` cannot
-/// take; bridge them on the input queue (see `gst::gl_bridge`).
+/// Adapt an external video input's front to what its producer offers: the
+/// input's `queue` is where upstream's caps queries land, `glupload` is what
+/// they are answered by. `label` names the input in logs and errors, after its
+/// external pad. See [`crate::gst::gl_input_front`].
 ///
 /// Where `glupload`'s udmabuf path is broken (see
 /// `gpu::udmabuf_upload_broken`), the queue also stops upstream from
 /// seeing its allocation proposal, so sources keep their own memory and
 /// `glupload` does a plain texture upload.
-fn install_upload_bridge(queue: &gst::Element, queue_id: &str) {
-    let Some(src) = queue.static_pad("src") else {
-        return;
-    };
-    crate::gst::gl_bridge::install_gl_upload_bridge(&src, queue_id);
-    keep_own_memory(&src);
+fn install_input_front(queue: &gst::Element, glupload: &gst::Element, label: &str) {
+    if let Some(src) = queue.static_pad("src") {
+        keep_own_memory(&src);
+    }
+    if let Some(sink) = queue.static_pad("sink") {
+        crate::gst::gl_input_front::install(&sink, glupload, label);
+    }
 }
 
 /// Where `glupload`'s udmabuf path is broken (see

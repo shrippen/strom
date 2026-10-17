@@ -10,7 +10,7 @@
     "license": {
       "name": "MIT OR Apache-2.0"
     },
-    "version": "0.6.8"
+    "version": "0.7.1"
   },
   "paths": {
     "/api/auth/status": {
@@ -301,6 +301,158 @@
         "responses": {
           "204": {
             "description": "Log entries accepted"
+          }
+        }
+      }
+    },
+    "/api/devtools/links": {
+      "get": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "List the links that are alive right now.",
+        "description": "Without this an operator who has lost track of a link can only wait out its\nTTL or restart the instance, and one link is control of every browser in it.\nThe key is never in the answer — it is the credential, and the point of the\nlisting is to revoke a link, not to recover one.",
+        "operationId": "list_links",
+        "responses": {
+          "200": {
+            "description": "The live remote control links",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevToolsLinks"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Revoke every link at once, and end every session open on one.",
+        "description": "The panic button: one call after which nobody is driving any browser in\nthis instance, whether or not anyone still knows which links exist.",
+        "operationId": "revoke_all_links",
+        "responses": {
+          "200": {
+            "description": "How many links were revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevToolsRevokedLinks"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          }
+        }
+      }
+    },
+    "/api/devtools/links/{id}": {
+      "delete": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Revoke a link before it expires, and end any session already open on it.",
+        "description": "Takes the link's non-secret id, not its key: an operator revoking a link\nthey handed out should not have to keep a copy of the credential to do it,\nand the id is the only part of a link that is safe to write down.",
+        "operationId": "revoke_link",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The link's non-secret id, as returned when it was minted",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The link is gone, and so is any session on it"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "404": {
+            "description": "No such link"
+          }
+        }
+      }
+    },
+    "/api/devtools/targets": {
+      "get": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "List the pages that `cefsrc` elements are currently rendering.",
+        "operationId": "list_targets",
+        "responses": {
+          "200": {
+            "description": "Pages available for remote control",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevToolsTargets"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "502": {
+            "description": "The DevTools endpoint did not answer"
+          }
+        }
+      }
+    },
+    "/api/devtools/targets/{target_id}/link": {
+      "post": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Mint a remote control link for one page.",
+        "description": "The caller authenticates as they would for any other endpoint; what comes\nback is a path anyone can open, so it is handed to a person, not published.\n\nNaming Chromium's target directly does not get around the block's Remote\nControl switch: the target has to be the page of an HTML source with the\nswitch on, the same page [`create_block_link`] would hand out for it. The\ntwo endpoints are different ways of naming the same page, so they cannot be\nallowed to disagree about whether it may be opened.",
+        "operationId": "create_link",
+        "parameters": [
+          {
+            "name": "target_id",
+            "in": "path",
+            "description": "Chromium target id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A remote control link for this HTML source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevToolsLink"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed target id"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "No HTML source with remote control on is rendering this page"
+          },
+          "404": {
+            "description": "Remote control is disabled, or no such page"
           }
         }
       }
@@ -834,6 +986,57 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/devtools/link": {
+      "post": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Mint a remote control link for one HTML source.",
+        "description": "The block is the name an operator has for a page, so this is the endpoint a\nclient uses. The link is for the block: a session opens on the page the\nblock renders at that moment, whatever URL it is on and however many other\nblocks share its URL, and a restarted flow's new page is reached through\nthe same link.",
+        "operationId": "create_block_link",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block instance id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A remote control link for this HTML source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevToolsLink"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The block has remote control switched off"
+          },
+          "404": {
+            "description": "No such block, or it is not rendering a page yet"
           }
         }
       }
@@ -1383,6 +1586,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The player is playing a stinger take",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1447,6 +1660,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The player is playing a stinger take",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1494,6 +1717,16 @@
           },
           "404": {
             "description": "Flow or block not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The player is playing a stinger take",
             "content": {
               "application/json": {
                 "schema": {
@@ -1558,6 +1791,16 @@
           },
           "404": {
             "description": "Player not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The player is playing a stinger take",
             "content": {
               "application/json": {
                 "schema": {
@@ -1956,6 +2199,533 @@
           },
           "404": {
             "description": "Block has no live state (pipeline not running)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Stinger state of a vision mixer: its source, clips (with analysis and how\neach plays here), the cued clip, and the last take's measurements.",
+        "operationId": "get_stinger_state",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stinger state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/clips": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add a clip to the stinger library (the stinger source's playlist). Adding\na file already in the library returns it unchanged. Upload the file first\nwith the media API when it is not on the server yet.",
+        "operationId": "add_stinger_clip",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StingerAddClipRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The clip, as it plays here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerClip"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or no such file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/clips/{index}": {
+      "put": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Store a stinger clip's settings (layout, cut point, mix, premultiplied\nalpha, matte inversion) on the stinger source block.",
+        "operationId": "set_stinger_clip_settings",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "Playlist index on the stinger source",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "file",
+            "in": "query",
+            "description": "The file expected at `index`; 409 when the library has changed",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StingerClipSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Settings stored; the clip as it now plays",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerClip"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The library changed: `file` is no longer at `index`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a clip from the stinger library, with its settings. The file stays\nin the media directory. Refused while a stinger is on air.",
+        "operationId": "remove_stinger_clip",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "Playlist index on the stinger source",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "file",
+            "in": "query",
+            "description": "The file expected at `index`; 409 when the library has changed",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The library changed: `file` is no longer at `index`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/cue": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Cue a stinger clip: load it and park it on its first frame, so a take\nstarts it without delay.",
+        "operationId": "cue_stinger",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StingerCueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Clip cued; the stinger state after the cue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The clip could not be cued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The library changed: `file` is no longer at `index`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/examples": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Render Strom's example stingers (classic, track matte, mask only) into the\nmedia directory and add them to the stinger source's playlist.",
+        "operationId": "write_stinger_examples",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Examples written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerExamplesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/reload": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Reload the stinger library from disk: analyse clips whose files changed,\nload and park the cued clip again when its file changed since it was\nloaded, and report clips whose files are gone (`missing`). Analyses run in\nthe background; poll the stinger state for them. Refused while a stinger\nis on air.",
+        "operationId": "reload_stinger",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Library reloaded; the stinger state after the reload",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A stinger is on air",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/stinger/take": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Take a stinger from PGM to PVW.",
+        "operationId": "take_stinger",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StingerTakeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Take started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StingerTakeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The take could not start",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The library changed: `file` is not the clip that would play",
             "content": {
               "application/json": {
                 "schema": {
@@ -2932,10 +3702,10 @@
             }
           },
           "400": {
-            "description": "Invalid request"
+            "description": "Invalid request, or a block with no inputs to probe"
           },
           "404": {
-            "description": "Flow not found or not running"
+            "description": "Flow not found or not running, or no such element or block (or block definition)"
           }
         }
       }
@@ -3554,9 +4324,6 @@
                 }
               }
             }
-          },
-          "500": {
-            "description": "Internal server error"
           }
         }
       }
@@ -3578,9 +4345,6 @@
                 }
               }
             }
-          },
-          "500": {
-            "description": "Internal server error"
           }
         }
       }
@@ -3833,6 +4597,191 @@
         }
       }
     },
+    "/api/media/download": {
+      "post": {
+        "tags": [
+          "Media"
+        ],
+        "summary": "Download a file from a URL into a media directory.",
+        "description": "Checks the URL and waits for the remote server's response headers, then\nanswers 202 with the job while the body downloads in the background.\nProgress and the outcome arrive as `MediaDownloadProgress` WebSocket events.",
+        "operationId": "download_url",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MediaDownloadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Download started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaDownloadJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid URL, path or file name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The URL leads to an address downloads may not connect to",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target directory not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The file exists and overwrite is not set, or another download is writing it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The file is larger than the configured limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The request failed validation (URL or file name too long)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The remote server failed or answered with an error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The remote server did not answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/media/downloads": {
+      "get": {
+        "tags": [
+          "Media"
+        ],
+        "summary": "List active and recently finished URL downloads.",
+        "operationId": "list_downloads",
+        "responses": {
+          "200": {
+            "description": "Downloads, oldest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaDownloadListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/media/downloads/{job_id}": {
+      "delete": {
+        "tags": [
+          "Media"
+        ],
+        "summary": "Cancel a running URL download. Nothing is left behind.",
+        "operationId": "cancel_download",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "description": "Download job ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancellation requested",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaOperationResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The download has already ended, or is complete and being saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/media/file/{path}": {
       "get": {
         "tags": [
@@ -4018,6 +4967,16 @@
               }
             }
           },
+          "413": {
+            "description": "Upload larger than the server accepts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "500": {
             "description": "Upload failed",
             "content": {
@@ -4151,6 +5110,496 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/OscAuthStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports": {
+      "get": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Report the port pool.",
+        "description": "The configured ports as runs, how many are free, and every port that is not free with the reservation and flow holding it. Only ports that are reserved, assigned or blocked are listed, so the response is proportional to what is interesting rather than to pool size. Unlike the reservation routes this answers on a server with no pool configured, reporting `enabled: false`.",
+        "operationId": "get_pool",
+        "responses": {
+          "200": {
+            "description": "The pool, configured or not",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortPoolStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports/reservations": {
+      "get": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "List live reservations.",
+        "operationId": "list_reservations",
+        "responses": {
+          "200": {
+            "description": "Every reservation that has not lapsed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PortReservation"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Reserve ports.",
+        "description": "Reserves ports for `owner_id` until `ttl_secs` after the last request or renewal. The call is idempotent per owner: an owner that already holds a reservation gets it back, renewed, with a 200 instead of a 201, and its existing ports are never moved. A `count` larger than it holds adds ports, preferring ones that continue the block it already has; equal or smaller changes nothing but the expiry, since ports are given back by deleting the reservation rather than by shrinking it. `ports` is an explicit list and callers must not assume it is contiguous.",
+        "operationId": "create_reservation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateReservationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The owner's existing reservation, renewed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortReservation"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "A new reservation was granted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortReservation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid owner_id, count or ttl_secs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not enough free ports",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reservation could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports/reservations/{id}": {
+      "get": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Get one reservation.",
+        "operationId": "get_reservation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Reservation id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortReservation"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live reservation with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Release a reservation.",
+        "description": "Gives the ports back. Ports the owner has declared in use by a flow that still exists stay held until that flow is gone — a port returns to the pool only when no live reservation and no existing flow holds it.",
+        "operationId": "delete_reservation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Reservation id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Reservation released"
+          },
+          "404": {
+            "description": "No live reservation with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reservation could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports/reservations/{id}/assign": {
+      "post": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Declare which ports a flow uses.",
+        "description": "Records that these ports of this reservation are used by that flow. The pool will not return them while the flow exists, so a reservation that lapses under a running pipeline releases only its idle ports. Replaces whatever was recorded for the same flow, so a caller can correct itself by assigning again. Nothing verifies that the flow actually binds them.",
+        "operationId": "assign_ports",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Reservation id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignPortsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortReservation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A port does not belong to this reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live reservation with that id, or no flow with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A port is already assigned to another flow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reservation could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports/reservations/{id}/assign/{flow_id}": {
+      "delete": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Drop a flow's declaration.",
+        "description": "The ports go back to the reservation, never to the pool: an owner keeps its ports across any amount of flow churn.",
+        "operationId": "unassign_ports",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Reservation id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Declaration dropped"
+          },
+          "404": {
+            "description": "No such reservation, or no ports declared for that flow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reservation could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/ports/reservations/{id}/renew": {
+      "post": {
+        "tags": [
+          "ports"
+        ],
+        "summary": "Extend a reservation.",
+        "description": "Moves the reservation's expiry to now plus `ttl_secs`. A reservation that has already lapsed is gone: request it again with the same `owner_id` through `POST /api/ports/reservations` instead.",
+        "operationId": "renew_reservation",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Reservation id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Optional new lifetime",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenewReservationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The renewed reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortReservation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid ttl_secs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No live reservation with that id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Reservation could not be persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No port pool is configured on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -4753,6 +6202,30 @@
           }
         }
       },
+      "AssignPortsRequest": {
+        "type": "object",
+        "description": "Tell the pool which of a reservation's ports a flow uses.\n\nReplaces whatever was recorded for that flow, so a caller can correct\nitself by assigning again.",
+        "required": [
+          "flow_id",
+          "ports"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The flow using them."
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Ports, all of which must belong to this reservation."
+          }
+        }
+      },
       "AuthStatusResponse": {
         "type": "object",
         "description": "Authentication status response.",
@@ -5313,6 +6786,186 @@
           "path": {
             "type": "string",
             "description": "Path for new directory (relative to media root)"
+          }
+        }
+      },
+      "CreateReservationRequest": {
+        "type": "object",
+        "description": "Ask for ports.",
+        "required": [
+          "owner_id",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many ports the owner wants to hold in total. Larger than it holds\nnow adds ports; equal or smaller leaves them alone.",
+            "minimum": 0
+          },
+          "owner_id": {
+            "type": "string",
+            "description": "Stable name of the owner, such as a production or instance id. A repeat\nrequest under the same name renews and returns the existing\nreservation rather than allocating a second one."
+          },
+          "ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Lifetime in seconds. Defaults to the server's configured TTL.",
+            "minimum": 0
+          }
+        }
+      },
+      "DevToolsLink": {
+        "type": "object",
+        "description": "A minted remote control link.\n\nThe path is the whole credential: it names no target, carries no API token\nand spells out no address or port, so handing it over hands over exactly\nwhat it says and nothing more. It dies on its own if it goes unused.",
+        "required": [
+          "id",
+          "path",
+          "expires_in_seconds",
+          "warning"
+        ],
+        "properties": {
+          "expires_in_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long the link survives without being used. Each use starts it over.",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "A name for this link that is not the credential.\n\nSafe to show, store and log. It is what `DELETE /api/devtools/links/{id}`\ntakes, so a link can be revoked without anyone having to keep the key."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path to open in a browser, relative to this Strom instance.\n\nThis one *is* the credential — everything under it is reachable by\nwhoever holds it, so it is handed to a person, never logged or stored."
+          },
+          "warning": {
+            "type": "string",
+            "description": "What the holder of this link can actually reach, in Strom's words: one\nof [`SCREENCAST_CONTROL_WARNING`] (with [`SHARED_CONTEXT_WARNING`]\nappended when sources share a browser context) or\n[`REMOTE_CONTROL_WARNING`]. A client shows it to the operator before\nhanding the link on."
+          }
+        }
+      },
+      "DevToolsLinkSummary": {
+        "type": "object",
+        "description": "One live link, as an operator sees it when reviewing what is outstanding.\n\nDeliberately without the key: the point of a listing is to let someone who\nhas lost track of a link kill it, not to hand the credential back out.",
+        "required": [
+          "id",
+          "flow_id",
+          "flow_name",
+          "block_id",
+          "block_name",
+          "expires_in_seconds"
+        ],
+        "properties": {
+          "block_id": {
+            "type": "string",
+            "description": "The HTML Input block this link controls."
+          },
+          "block_name": {
+            "type": "string",
+            "description": "The block's name, or its id when it has none."
+          },
+          "expires_in_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds left before it expires on its own. Every use starts it over.",
+            "minimum": 0
+          },
+          "flow_id": {
+            "type": "string",
+            "description": "The flow of the HTML source this link controls."
+          },
+          "flow_name": {
+            "type": "string",
+            "description": "That flow's name, so the operator can tell which link they are about\nto cut off."
+          },
+          "id": {
+            "type": "string",
+            "description": "The non-secret id, for revoking this link."
+          }
+        }
+      },
+      "DevToolsLinks": {
+        "type": "object",
+        "description": "Every remote control link that is currently alive.",
+        "required": [
+          "links"
+        ],
+        "properties": {
+          "links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DevToolsLinkSummary"
+            },
+            "description": "The live links, soonest to expire first."
+          }
+        }
+      },
+      "DevToolsRevokedLinks": {
+        "type": "object",
+        "description": "How many links a bulk revoke ended.",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "description": "Links that were live and are now gone, together with any session that\nwas open on them.",
+            "minimum": 0
+          }
+        }
+      },
+      "DevToolsTarget": {
+        "type": "object",
+        "description": "One browser page rendered by a `cefsrc` element.\n\nA CEF process hosts every `cefsrc` in the instance, so the targets of all\nHTML sources arrive in one list. The `id` is Chromium's, and it changes\nwhenever the page is recreated — it identifies a live page, not a block.",
+        "required": [
+          "id",
+          "title",
+          "url"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Chromium's target id for this page."
+          },
+          "title": {
+            "type": "string",
+            "description": "The page's current title, as the document reports it."
+          },
+          "url": {
+            "type": "string",
+            "description": "The URL the page is currently showing."
+          }
+        }
+      },
+      "DevToolsTargets": {
+        "type": "object",
+        "description": "Every page currently rendered by a `cefsrc` element.",
+        "required": [
+          "enabled",
+          "targets"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether the instance has a Chromium remote debugging port configured.\nWhen false the list is empty and no target can be opened."
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DevToolsTarget"
+            },
+            "description": "The pages available for remote control."
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What a client must tell the operator before handing them a link, in\nStrom's words rather than each client's own. Present whenever remote\ncontrol is enabled. See [`REMOTE_CONTROL_WARNING`]."
           }
         }
       },
@@ -6853,6 +8506,121 @@
           }
         }
       },
+      "MediaDownloadJob": {
+        "type": "object",
+        "description": "One URL download into the media library.\n\nCarried by `POST /api/media/download`, `GET /api/media/downloads` and the\n`MediaDownloadProgress` WebSocket event.",
+        "required": [
+          "job_id",
+          "url",
+          "directory",
+          "filename",
+          "path",
+          "bytes",
+          "state"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes received so far.",
+            "minimum": 0
+          },
+          "directory": {
+            "type": "string",
+            "description": "Directory the file is saved into, relative to the media root."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the download failed, when it did."
+          },
+          "filename": {
+            "type": "string",
+            "description": "File name the download is saved as."
+          },
+          "job_id": {
+            "type": "string",
+            "description": "Job identifier, used to cancel the download."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path of the finished file, relative to the media root."
+          },
+          "state": {
+            "$ref": "#/components/schemas/MediaDownloadState",
+            "description": "Current state."
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Total size, when the server announced one.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "The requested URL without user info, query or fragment, for display."
+          }
+        }
+      },
+      "MediaDownloadListResponse": {
+        "type": "object",
+        "description": "Response listing active and recently finished URL downloads.",
+        "required": [
+          "downloads"
+        ],
+        "properties": {
+          "downloads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MediaDownloadJob"
+            },
+            "description": "Downloads, oldest first."
+          }
+        }
+      },
+      "MediaDownloadRequest": {
+        "type": "object",
+        "description": "Request to download a file from a URL into the media library.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "filename": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "File name to save as. When absent, the name comes from the response's\n`Content-Disposition` header, then from the URL's last path segment.\nAt most 200 bytes."
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Replace an existing file of the same name. Without it, an existing file\nmakes the request fail with 409 Conflict."
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory to save into, relative to the media root. Empty means the root."
+          },
+          "url": {
+            "type": "string",
+            "description": "The http or https URL to fetch."
+          }
+        }
+      },
+      "MediaDownloadState": {
+        "type": "string",
+        "description": "Where a URL download is in its life.",
+        "enum": [
+          "downloading",
+          "done",
+          "failed",
+          "cancelled"
+        ]
+      },
       "MediaFileEntry": {
         "type": "object",
         "description": "A file or directory entry in a media directory listing.",
@@ -7414,6 +9182,190 @@
           }
         }
       },
+      "PortEntry": {
+        "type": "object",
+        "description": "A port that is not free, and who holds it.",
+        "required": [
+          "port",
+          "state"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The flow declared against it, when the state is `assigned`."
+          },
+          "owner_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The owner holding it, when a reservation does."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port.",
+            "minimum": 0
+          },
+          "reservation_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The reservation holding it."
+          },
+          "state": {
+            "$ref": "#/components/schemas/PortState",
+            "description": "What it is doing."
+          }
+        }
+      },
+      "PortInUse": {
+        "type": "object",
+        "description": "One of a reservation's ports, and the flow using it.",
+        "required": [
+          "port",
+          "flow_id"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The flow the owner says uses it."
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The port.",
+            "minimum": 0
+          }
+        }
+      },
+      "PortPoolStatus": {
+        "type": "object",
+        "description": "The pool, and everything in it that is not free.\n\n`entries` lists only ports that are reserved, assigned or blocked, so the\nresponse is proportional to what is interesting rather than to pool size —\na pool of nine hundred idle ports answers with an empty list.",
+        "required": [
+          "enabled",
+          "ports",
+          "total",
+          "free",
+          "entries"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether any ports are configured. Every reservation route answers 503\nwhile this is `false`."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortEntry"
+            },
+            "description": "Every port that is not free."
+          },
+          "free": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many no reservation holds and no probe has blocked.",
+            "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortSpan"
+            },
+            "description": "The configured ports, as runs, ascending."
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many ports the pool holds.",
+            "minimum": 0
+          }
+        }
+      },
+      "PortReservation": {
+        "type": "object",
+        "description": "Ports held by one owner.\n\n`ports` is an explicit list, ascending. Allocation prefers a contiguous run\nand growth prefers extending the existing one, but neither is guaranteed —\na port the operator left out of the pool, one another owner holds, or one\nfound blocked can put a hole anywhere. Callers must not assume contiguity.",
+        "required": [
+          "id",
+          "owner_id",
+          "ports",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "When the reservation was first granted (RFC 3339, UTC)."
+          },
+          "expires_at": {
+            "type": "string",
+            "description": "When it lapses unless renewed (RFC 3339, UTC)."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Reservation identifier, used to renew, release and assign."
+          },
+          "in_use": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortInUse"
+            },
+            "description": "Which of `ports` the owner has told the pool are used by a flow."
+          },
+          "owner_id": {
+            "type": "string",
+            "description": "The owner's stable name. One reservation per owner; asking again\nreturns it."
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The ports held, ascending."
+          }
+        }
+      },
+      "PortSpan": {
+        "type": "object",
+        "description": "A run of consecutive ports, for reading a pool back compactly.\n\nA display shape only: the pool is a set, and nothing in the model depends\non ports being contiguous.",
+        "required": [
+          "first",
+          "last"
+        ],
+        "properties": {
+          "first": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Lowest port in the run.",
+            "minimum": 0
+          },
+          "last": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Highest port in the run, inclusive.",
+            "minimum": 0
+          }
+        }
+      },
+      "PortState": {
+        "type": "string",
+        "description": "What a port is doing.",
+        "enum": [
+          "reserved",
+          "assigned",
+          "blocked"
+        ]
+      },
       "Position": {
         "type": "object",
         "description": "Position in the visual editor",
@@ -7790,6 +9742,21 @@
           "old_path": {
             "type": "string",
             "description": "Current path (relative to media root)"
+          }
+        }
+      },
+      "RenewReservationRequest": {
+        "type": "object",
+        "description": "Extend a reservation's lifetime.",
+        "properties": {
+          "ttl_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "New lifetime in seconds, counted from now. Defaults to the server's\nconfigured TTL.",
+            "minimum": 0
           }
         }
       },
@@ -8696,6 +10663,582 @@
             "description": "Current value"
           }
         }
+      },
+      "StingerAddClipRequest": {
+        "type": "object",
+        "description": "Add a clip to the stinger library.",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Path relative to the media directory (as the media API names files),\nan absolute path, or a URI."
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerClipSettings",
+                "description": "Settings to store with it. Defaults detect everything."
+              }
+            ]
+          }
+        }
+      },
+      "StingerBeneath": {
+        "type": "string",
+        "description": "What a classic stinger does to the program at its cut point.",
+        "enum": [
+          "cut",
+          "mix"
+        ]
+      },
+      "StingerClip": {
+        "type": "object",
+        "description": "One playlist entry of the stinger source, as the mixer sees it.",
+        "required": [
+          "index",
+          "file",
+          "settings"
+        ],
+        "properties": {
+          "analysis_error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the clip's analysis failed, when it did. It is not retried until\nthe file changes or the library is reloaded."
+          },
+          "cut_point_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Effective cut point for a classic take.",
+            "minimum": 0
+          },
+          "downgraded_from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerVariant",
+                "description": "Set when the variant the clip asks for cannot run here."
+              }
+            ]
+          },
+          "file": {
+            "type": "string",
+            "description": "Playlist entry (path or URI)."
+          },
+          "index": {
+            "type": "integer",
+            "description": "Playlist index on the stinger source.",
+            "minimum": 0
+          },
+          "info": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerClipInfo",
+                "description": "Analysis, once it has run."
+              }
+            ]
+          },
+          "missing": {
+            "type": "boolean",
+            "description": "The clip's file is not on disk (deleted or renamed since it was\nadded). Only a local file can be missing."
+          },
+          "settings": {
+            "$ref": "#/components/schemas/StingerClipSettings",
+            "description": "Settings as stored."
+          },
+          "variant": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerVariant",
+                "description": "How this clip plays on this mixer, after detection and any downgrade."
+              }
+            ]
+          }
+        }
+      },
+      "StingerClipInfo": {
+        "type": "object",
+        "description": "What analysing a clip found.",
+        "required": [
+          "width",
+          "height",
+          "framerate_num",
+          "framerate_den",
+          "frames",
+          "duration_ms",
+          "has_alpha",
+          "detected_layout",
+          "cover_peak",
+          "analysis_ms"
+        ],
+        "properties": {
+          "analysis_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long the analysis took.",
+            "minimum": 0
+          },
+          "cover_peak": {
+            "type": "number",
+            "format": "float"
+          },
+          "cover_peak_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Where the graphic covers the largest part of the frame, and how much\n(0..1). Taken from the graphic's alpha.",
+            "minimum": 0
+          },
+          "detected_layout": {
+            "$ref": "#/components/schemas/StingerLayout",
+            "description": "Layout read from the clip's shape and alpha. Never `auto`."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Length of the clip.",
+            "minimum": 0
+          },
+          "framerate_den": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "framerate_num": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Frame rate as a fraction."
+          },
+          "frames": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of decoded frames.",
+            "minimum": 0
+          },
+          "has_alpha": {
+            "type": "boolean",
+            "description": "Whether the decoded frames carry an alpha channel."
+          },
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "matte_end_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "matte_midpoint_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Where the matte first shows more of the new source than the old.",
+            "minimum": 0
+          },
+          "matte_start_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Where the matte starts and finishes moving: the first frame with any\nof the new source, and the first with all of it.",
+            "minimum": 0
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Decoded frame size of the whole clip.",
+            "minimum": 0
+          }
+        }
+      },
+      "StingerClipSettings": {
+        "type": "object",
+        "description": "Per-clip stinger settings, stored on the clip's Media Player.",
+        "properties": {
+          "beneath": {
+            "$ref": "#/components/schemas/StingerBeneath",
+            "description": "Classic: cut or mix at the cut point."
+          },
+          "cut_point_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Classic: how far into the clip the program changes. `None` takes it\nfrom the clip: the frame where the graphic covers most, or where the\nmatte crosses half way.",
+            "minimum": 0
+          },
+          "invert_matte": {
+            "type": "boolean",
+            "description": "Swap black and white in the matte."
+          },
+          "layout": {
+            "$ref": "#/components/schemas/StingerLayout",
+            "description": "Clip layout. `auto` detects it."
+          },
+          "mix_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Classic: length of the mix beneath, when `beneath` is `mix`.",
+            "minimum": 0
+          },
+          "premultiplied": {
+            "type": "boolean",
+            "description": "The graphic's colour is premultiplied by its alpha (After Effects'\n\"Premultiplied (Matted)\" export)."
+          }
+        }
+      },
+      "StingerCueRequest": {
+        "type": "object",
+        "description": "Cue a stinger clip.",
+        "required": [
+          "index"
+        ],
+        "properties": {
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When set, the playlist entry at `index` must be this file; a library\nchanged by someone else since the client read it fails with 409."
+          },
+          "index": {
+            "type": "integer",
+            "description": "Playlist index on the stinger source.",
+            "minimum": 0
+          }
+        }
+      },
+      "StingerExamplesResponse": {
+        "type": "object",
+        "description": "Example stinger clips written to the media directory.",
+        "required": [
+          "files",
+          "added_to_playlist"
+        ],
+        "properties": {
+          "added_to_playlist": {
+            "type": "boolean",
+            "description": "Whether they were added to the stinger source's playlist."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Paths relative to the media directory, one per variant."
+          }
+        }
+      },
+      "StingerLayout": {
+        "type": "string",
+        "description": "How a stinger clip lays out its graphic and matte.",
+        "enum": [
+          "auto",
+          "classic",
+          "side_by_side",
+          "stacked",
+          "mask_only"
+        ]
+      },
+      "StingerState": {
+        "type": "object",
+        "description": "Stinger state of one vision mixer.",
+        "required": [
+          "matte_supported",
+          "preroll_ms",
+          "clips",
+          "ready",
+          "running"
+        ],
+        "properties": {
+          "clips": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StingerClip"
+            }
+          },
+          "cued_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "The clip a take plays when it names none.",
+            "minimum": 0
+          },
+          "last_cue_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long the last cue took.",
+            "minimum": 0
+          },
+          "last_take": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerTakeReport"
+              }
+            ]
+          },
+          "matte_supported": {
+            "type": "boolean",
+            "description": "Whether the matte variants run here (GPU mixer)."
+          },
+          "preroll_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Take-to-air delay.",
+            "minimum": 0
+          },
+          "problem": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why stingers cannot run, when they cannot."
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "The cued clip is loaded and parked on its first frame."
+          },
+          "running": {
+            "type": "boolean",
+            "description": "A take is on air."
+          },
+          "source_block_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Media Player wired to the stinger input."
+          }
+        }
+      },
+      "StingerTakeReport": {
+        "type": "object",
+        "description": "A finished take, with what was measured.",
+        "required": [
+          "take_id",
+          "index",
+          "file",
+          "variant",
+          "from_input",
+          "to_input",
+          "take_to_air_ms",
+          "duration_ms",
+          "frames_expected",
+          "frames_arrived",
+          "frames_late"
+        ],
+        "properties": {
+          "cue_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Time spent loading the clip, when the take had to cue it first.",
+            "minimum": 0
+          },
+          "cut_point_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Classic: where the program changed, into the clip.",
+            "minimum": 0
+          },
+          "downgraded_from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerVariant"
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Clip length.",
+            "minimum": 0
+          },
+          "file": {
+            "type": "string"
+          },
+          "frames_arrived": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clip frames that reached it in time to go on air. A frame that\narrives after its output frame is not counted: the mixer has already\ncomposited that frame without it.",
+            "minimum": 0
+          },
+          "frames_expected": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clip frames that should have reached the mixer.",
+            "minimum": 0
+          },
+          "frames_late": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clip frames, on the graphic or the matte pad, that reached the mixer\nafter their time on air had begun.",
+            "minimum": 0
+          },
+          "from_input": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "take_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The take this reports on, as returned by the take request.",
+            "minimum": 0
+          },
+          "take_to_air_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Time from the take request to the clip's first frame on air."
+          },
+          "to_input": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "variant": {
+            "$ref": "#/components/schemas/StingerVariant"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the take ran but did not go as planned, such as a classic\nclip whose frame at the cut point arrived late, so the program changed\nwith no graphic over it. `None` is a clean take."
+          },
+          "worst_margin_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Smallest lead a clip frame had on its time on air; negative is late."
+          }
+        }
+      },
+      "StingerTakeRequest": {
+        "type": "object",
+        "description": "Take a stinger from PGM to PVW.",
+        "properties": {
+          "file": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When set, the clip played must be this file (the entry at `index`,\nor the cued one); otherwise the take fails with 409."
+          },
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Playlist index to play. Defaults to the cued clip.",
+            "minimum": 0
+          }
+        }
+      },
+      "StingerTakeResponse": {
+        "type": "object",
+        "description": "Result of a take request.",
+        "required": [
+          "take_id",
+          "index",
+          "file",
+          "variant",
+          "take_to_air_ms",
+          "duration_ms"
+        ],
+        "properties": {
+          "downgraded_from": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/StingerVariant"
+              }
+            ]
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "file": {
+            "type": "string",
+            "description": "The clip played."
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "take_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Identifies this take in `StingerStarted`, `StingerCompleted` and\n`StingerFailed`.",
+            "minimum": 0
+          },
+          "take_to_air_ms": {
+            "type": "number",
+            "format": "double",
+            "description": "Time from the request to the clip's first frame on air."
+          },
+          "variant": {
+            "$ref": "#/components/schemas/StingerVariant"
+          }
+        }
+      },
+      "StingerVariant": {
+        "type": "string",
+        "description": "How a stinger switches the program beneath the clip.",
+        "enum": [
+          "classic",
+          "track_matte",
+          "mask_only"
+        ]
       },
       "String": {
         "type": "string"
@@ -10569,6 +13112,249 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "A URL download into the media library started, progressed, or ended.\nProgress is throttled per job; the final state (done, failed or\ncancelled) is always sent.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/MediaDownloadJob",
+                "description": "A URL download into the media library started, progressed, or ended.\nProgress is throttled per job; the final state (done, failed or\ncancelled) is always sent."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "MediaDownloadProgress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A stinger clip was cued on a vision mixer, or failed to load.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "description": "A stinger clip was cued on a vision mixer, or failed to load.",
+                "required": [
+                  "flow_id",
+                  "block_id",
+                  "index",
+                  "ready",
+                  "cue_ms"
+                ],
+                "properties": {
+                  "block_id": {
+                    "type": "string"
+                  },
+                  "cue_ms": {
+                    "type": "integer",
+                    "format": "int64",
+                    "description": "How long loading took.",
+                    "minimum": 0
+                  },
+                  "flow_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "index": {
+                    "type": "integer",
+                    "description": "Playlist index on the stinger source.",
+                    "minimum": 0
+                  },
+                  "ready": {
+                    "type": "boolean",
+                    "description": "Loaded and parked on its first frame."
+                  }
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "StingerCued"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A stinger take started: its first frame goes on air `take_to_air_ms`\nafter the request.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "description": "A stinger take started: its first frame goes on air `take_to_air_ms`\nafter the request.",
+                "required": [
+                  "flow_id",
+                  "block_id",
+                  "take_id",
+                  "index",
+                  "file",
+                  "variant",
+                  "from_input",
+                  "to_input",
+                  "take_to_air_ms",
+                  "duration_ms"
+                ],
+                "properties": {
+                  "block_id": {
+                    "type": "string"
+                  },
+                  "downgraded_from": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "$ref": "#/components/schemas/StingerVariant"
+                      }
+                    ]
+                  },
+                  "duration_ms": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "flow_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "from_input": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "take_id": {
+                    "type": "integer",
+                    "format": "int64",
+                    "description": "As returned by the take request.",
+                    "minimum": 0
+                  },
+                  "take_to_air_ms": {
+                    "type": "number",
+                    "format": "double"
+                  },
+                  "to_input": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "variant": {
+                    "$ref": "#/components/schemas/StingerVariant"
+                  }
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "StingerStarted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A stinger take finished, with what was measured.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "description": "A stinger take finished, with what was measured.",
+                "required": [
+                  "flow_id",
+                  "block_id",
+                  "report"
+                ],
+                "properties": {
+                  "block_id": {
+                    "type": "string"
+                  },
+                  "flow_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "report": {
+                    "$ref": "#/components/schemas/StingerTakeReport"
+                  }
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "StingerCompleted"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A stinger take could not play its clip.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "description": "A stinger take could not play its clip.",
+                "required": [
+                  "flow_id",
+                  "block_id",
+                  "reason",
+                  "program_changed"
+                ],
+                "properties": {
+                  "block_id": {
+                    "type": "string"
+                  },
+                  "flow_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "program_changed": {
+                    "type": "boolean",
+                    "description": "The program still changed, without the clip."
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "take_id": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "format": "int64",
+                    "description": "The failed take, when it got as far as being given an id.",
+                    "minimum": 0
+                  }
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "StingerFailed"
+                ]
+              }
+            }
           }
         ],
         "description": "Event types that can be broadcast to all connected clients.",
@@ -10960,10 +13746,6 @@
       "TriggerTransitionRequest": {
         "type": "object",
         "description": "Request to trigger a transition on a compositor block.",
-        "required": [
-          "from_input",
-          "to_input"
-        ],
         "properties": {
           "duration_ms": {
             "type": "integer",
@@ -10972,13 +13754,27 @@
             "minimum": 0
           },
           "from_input": {
-            "type": "integer",
-            "description": "Index of the currently active input (0-based)",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Index of the currently active input (0-based). Required, except for a\n\"stinger\", which always takes the vision mixer's PGM to its PVW.",
+            "minimum": 0
+          },
+          "stinger_clip": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Stinger only (`transition_type` \"stinger\"): playlist index of the clip\nto play on the stinger source. Defaults to the cued clip. A stinger's\nlength is the clip's, so `duration_ms` is ignored for it.",
             "minimum": 0
           },
           "to_input": {
-            "type": "integer",
-            "description": "Index of the input to transition to (0-based)",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Index of the input to transition to (0-based). Required, except for a\n\"stinger\".",
             "minimum": 0
           },
           "transition_type": {
@@ -11779,7 +14575,7 @@
       },
       "Zone": {
         "type": "object",
-        "description": "A sub-region of a PiP that hosts one or more overlay sources.\n\nSources inside a zone auto-tile within its `rect` (using\n[`compute_pip_overlay_rects`]) so the zone behaves like a \"mini-PiP\"\nnested inside the parent PiP region. The `capacity` puts a cap on how\nmany sources can occupy the zone; pushing a new source into a full zone\nis expected to evict the oldest (client-side FIFO).",
+        "description": "A sub-region of a PiP that hosts one or more overlay sources.\n\nSources inside a zone auto-tile within its `rect` (using\n[`compute_pip_overlay_rects`]) so the zone behaves like a \"mini-PiP\"\nnested inside the parent PiP region. The `capacity` puts a cap on how\nmany sources can occupy the zone; pushing a new source into a full zone\nis expected to evict the oldest (client-side FIFO). The `/pip` endpoint\nrejects a zone whose `sources` outgrow its `capacity` rather than\ntruncating it, so stored state always matches what renders.",
         "properties": {
           "border": {
             "oneOf": [
@@ -11864,6 +14660,10 @@
       "description": "Network interface discovery endpoints"
     },
     {
+      "name": "ports",
+      "description": "Port numbers Strom administers and hands out"
+    },
+    {
       "name": "System",
       "description": "System information endpoints"
     },
@@ -11902,6 +14702,10 @@
     {
       "name": "websocket",
       "description": "WebSocket real-time communication"
+    },
+    {
+      "name": "devtools",
+      "description": "Remote control of the browsers behind HTML sources"
     }
   ]
 }

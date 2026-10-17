@@ -1,11 +1,20 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# Dependabot opens security updates only.
+#
+# Version updates are switched off with `open-pull-requests-limit: 0`, which is
+# GitHub's documented way to keep security updates while dropping version
+# updates. Security updates are enabled in the repository settings and do not
+# depend on this limit.
+#
+# Version updates were costing more than they gave: each pull request
+# re-resolved Cargo.lock on its own, so they conflicted with each other, every
+# rebase cost another CI run, and GStreamer bumps broke the build from patch
+# releases (#861). Keeping up now happens once a month, in one pull request
+# from the implementation agent: scripts/agent/DEPS.md.
 
 version: 2
 updates:
-  - package-ecosystem: "cargo" # See documentation for possible values
-    directory: "/" # Location of package manifests
+  - package-ecosystem: "cargo"
+    directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 0

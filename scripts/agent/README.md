@@ -20,6 +20,7 @@ wiring, and a pointer to `ROLE_REVIEW.md` or `ROLE_FIX.md`.
 | `REVIEW.md` | Reviewing a pull request. |
 | `TRIAGE.md` | Triaging an issue. |
 | `FIX.md` | Turning an approved design into a PR. |
+| `DEPS.md` | The implementation stage, before it picks an issue. The monthly dependency round. |
 | `SUMMARY.md` | Writing the run summary. Every run, last. |
 | `board.sh` | Reporting the state of the open board before implementing anything. |
 | `verify-citations.sh` | Before posting anything that cites code, or that has a length ceiling. |
@@ -86,6 +87,16 @@ permission is a finding rather than an instruction.
   rubber stamp.
 - **`excluded=` means "would break", not "touches".** That distinction is what keeps gate 4 a
   real check.
+- **`overlaps=` exists because a `LOCAL` diff can settle a `GLOBAL` design question.** Issue
+  #837 (a macOS camera that cannot negotiate a system-memory capture front) was triaged on its
+  own merits: two options, both inside the one block, radius `SHARED`, recommend the smaller.
+  Both the reporter and the triage cited #682, the open issue that owns *where* GL memory gets
+  downloaded — and neither drew the conclusion that the fix therefore did not belong in the
+  block. Open PR #802, which changes the very linker the block's internal links go through,
+  was not mentioned at all. Radius did not catch it, because radius scores code touched, not
+  design committed to. So the searches are now mandatory for triage and review alike, "wait
+  for #N, change nothing here" is an option a triage must offer where one applies, and the
+  choice to pause stays with a human.
 - **The implementation stage opens a PR ready for review, and holds other people's drafts.**
   The two rules look contradictory and are not. A draft means "the author is not finished",
   and the implementation stage stops only when it is finished — it opened drafts for a while,
@@ -237,6 +248,25 @@ which is exactly when it gets "simplified" away.
   else**, which is why class C is exempt from the 14-day closure.
 - **Class B and class C are distinct** because "no evidence yet" and "evidence that needs a
   human to fire it" call for different things from the reader.
+
+### Reasoning behind `DEPS.md`
+
+- **Dependabot version updates were switched off because they cost more than they gave.** In
+  the month before, they opened 17 pull requests, of which 5 were merged. Each one re-resolved
+  `Cargo.lock` on its own, so they conflicted with each other and every rebase cost another CI
+  run. Security updates are a separate Dependabot feature and still arrive as they happen.
+- **One round a month keeps the lockfile from rotting** without a stream of pull requests.
+  Falling far behind is its own risk: a security fix then lands on top of a year of breaking
+  changes.
+- **A breaking compatible release is held back, not worked around.** The first grouped
+  Dependabot run failed because gstreamer-video 0.25.4 called a gstreamer-video-sys symbol its
+  own declared floor did not have. Code bent around that would have to be unbent when upstream
+  fixed it.
+- **GStreamer, glib, egui and wgpu are listed, never bumped.** They are the core of the
+  backend and the frontend, they move as families, and a 0.x minor bump in them is a migration (egui-phosphor 0.13
+  existed only to follow egui to 0.35 and could never pass CI on its own).
+- **Each requirement bump is its own commit** so the maintainer can drop one without redoing
+  the round.
 
 ## Changing the protocol
 

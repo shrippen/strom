@@ -14,7 +14,7 @@
 //! Unspecified properties allow passthrough - elements will not modify those aspects.
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
-use crate::gpu::video_convert_mode;
+use crate::gpu::{self, video_convert_mode};
 use gstreamer as gst;
 use std::collections::HashMap;
 use strom_types::{
@@ -113,6 +113,7 @@ impl BlockBuilder for VideoFormatBuilder {
             .name(&scale_id)
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("videoscale: {}", e)))?;
+        gpu::configure_video_convert(&videoscale);
 
         // TEMPORARY: videorate removed to avoid frame duplication issues
         // let videorate = gst::ElementFactory::make("videorate")
@@ -126,6 +127,7 @@ impl BlockBuilder for VideoFormatBuilder {
             .map_err(|e| {
                 BlockBuildError::ElementCreation(format!("{}: {}", convert_element_name, e))
             })?;
+        gpu::configure_video_convert(&videoconvert);
 
         // capsfilter with caps (only constraints specified properties)
         let caps = caps_str.parse::<gst::Caps>().map_err(|_| {
@@ -250,5 +252,46 @@ fn videoformat_definition() -> BlockDefinition {
             height: Some(2.0),
             ..Default::default()
         }),
+    }
+}
+
+// The only test checks thread counts, which are only raised on macOS.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::blocks::BlockBuildContext;
+    use gst::prelude::*;
+
+    fn build(pairs: &[(&str, &str)]) -> BlockBuildResult {
+        let _ = gst::init();
+        // video_convert_mode() panics until this has run.
+        crate::gpu::detect_gpu_capabilities();
+        let props: HashMap<String, PropertyValue> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), PropertyValue::String(v.to_string())))
+            .collect();
+        let ctx = BlockBuildContext::new(Vec::new(), "all".to_string());
+        VideoFormatBuilder
+            .build("vf0", &props, &ctx)
+            .expect("VideoFormat block must build")
+    }
+
+    /// Both the scaling and the converting element must get the configured
+    /// thread count, or a resize to or from 4K runs on one core.
+    #[test]
+    fn scale_and_convert_are_threaded() {
+        let result = build(&[("resolution", "1280x720"), ("format", "I420")]);
+
+        for (id, element) in &result.elements {
+            if !element.has_property("n-threads") {
+                continue;
+            }
+            assert_eq!(
+                element.property::<u32>("n-threads"),
+                crate::gpu::video_convert_threads(),
+                "configure_video_convert did not reach '{}'",
+                id
+            );
+        }
     }
 }

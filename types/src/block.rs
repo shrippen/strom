@@ -565,6 +565,91 @@ pub fn common_video_framerate_enum_values(include_empty: bool) -> Vec<EnumValue>
     values
 }
 
+/// Common audio sample rates for use in block property dropdowns.
+/// Each entry is (rate in Hz, label).
+pub const COMMON_AUDIO_SAMPLE_RATES: &[(u32, &str)] = &[
+    (8000, "8 kHz - Telephony"),
+    (11025, "11.025 kHz - Low Quality"),
+    (16000, "16 kHz - Wideband"),
+    (22050, "22.05 kHz - Medium Quality"),
+    (32000, "32 kHz - Miniature Disc"),
+    (44100, "44.1 kHz - CD Quality"),
+    (48000, "48 kHz - Professional"),
+    (88200, "88.2 kHz - High-Res 2x CD"),
+    (96000, "96 kHz - High-Res Professional"),
+    (176400, "176.4 kHz - Very High-Res 4x CD"),
+    (192000, "192 kHz - Very High-Res Professional"),
+];
+
+/// Default sample rate for blocks that run all their audio at one rate
+/// (the audio mixer, the live audio router).
+pub const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 48_000;
+
+/// Get common audio sample rates as EnumValue list for block properties.
+/// Values are the rate in Hz as a decimal string. Set `include_empty` to true
+/// to add an empty "-" option at the start.
+pub fn common_audio_sample_rate_enum_values(include_empty: bool) -> Vec<EnumValue> {
+    let mut values = Vec::new();
+
+    if include_empty {
+        values.push(EnumValue {
+            value: String::new(),
+            label: Some("-".to_string()),
+        });
+    }
+
+    for (rate, label) in COMMON_AUDIO_SAMPLE_RATES {
+        values.push(EnumValue {
+            value: rate.to_string(),
+            label: Some((*label).to_string()),
+        });
+    }
+
+    values
+}
+
+/// Look up a sample rate in `COMMON_AUDIO_SAMPLE_RATES`. Accepts the enum's
+/// string form ("48000") or an integer. Returns `None` for an empty, unknown
+/// or malformed value.
+pub fn parse_common_audio_sample_rate(value: &PropertyValue) -> Option<u32> {
+    let rate = match value {
+        PropertyValue::String(s) => s.trim().parse::<u32>().ok()?,
+        PropertyValue::Int(i) => u32::try_from(*i).ok()?,
+        PropertyValue::UInt(u) => u32::try_from(*u).ok()?,
+        _ => return None,
+    };
+    COMMON_AUDIO_SAMPLE_RATES
+        .iter()
+        .any(|(r, _)| *r == rate)
+        .then_some(rate)
+}
+
+/// An audio channel choice as audio channel properties store it: `"N"` for a
+/// channel count, or `"N:0xMASK"` for a count with an explicit GStreamer
+/// `channel-mask` (`0x0` = unpositioned, `0x3f` = 5.1, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioChannelConfig {
+    pub channels: u32,
+    pub channel_mask: Option<u64>,
+}
+
+/// Parse `"N"` or `"N:0xMASK"` into an [`AudioChannelConfig`]. Returns `None`
+/// for an empty or malformed value, or a zero channel count.
+pub fn parse_audio_channel_config(value: &str) -> Option<AudioChannelConfig> {
+    let (channels, mask) = match value.trim().split_once(':') {
+        Some((channels, mask)) => {
+            let hex = mask.trim().strip_prefix("0x")?;
+            (channels, Some(u64::from_str_radix(hex, 16).ok()?))
+        }
+        None => (value.trim(), None),
+    };
+    let channels = channels.trim().parse::<u32>().ok().filter(|c| *c > 0)?;
+    Some(AudioChannelConfig {
+        channels,
+        channel_mask: mask,
+    })
+}
+
 /// Pixel formats accepted by `decklinkvideosrc` and `decklinkvideosink`'s
 /// `video-format` property. These are GstDecklinkVideoFormat enum nicks, not
 /// GStreamer caps `format=` strings — see `COMMON_VIDEO_PIXEL_FORMATS` for the
@@ -616,4 +701,69 @@ where
 {
     let sorted: BTreeMap<_, _> = map.iter().collect();
     sorted.serialize(serializer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_channel_config_parses_count_and_mask() {
+        type Expected = Option<(u32, Option<u64>)>;
+        let cases: &[(&str, Expected)] = &[
+            ("2", Some((2, None))),
+            ("6", Some((6, None))),
+            ("4:0x0", Some((4, Some(0)))),
+            ("6:0x3f", Some((6, Some(0x3f)))),
+            ("8:0xc3f", Some((8, Some(0xc3f)))),
+            ("", None),
+            ("0", None),
+            ("six", None),
+            ("6:3f", None),
+            ("6:0xzz", None),
+        ];
+        for (value, expected) in cases {
+            let parsed = parse_audio_channel_config(value).map(|c| (c.channels, c.channel_mask));
+            assert_eq!(parsed, *expected, "{:?}", value);
+        }
+    }
+
+    #[test]
+    fn parse_common_audio_sample_rate_accepts_listed_rates_only() {
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::String("44100".into())),
+            Some(44100)
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::Int(48000)),
+            Some(48000)
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::UInt(96000)),
+            Some(96000)
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::String(String::new())),
+            None
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::String("12345".into())),
+            None
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::Int(-1)),
+            None
+        );
+        assert_eq!(
+            parse_common_audio_sample_rate(&PropertyValue::Float(48000.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn default_audio_sample_rate_is_a_common_rate() {
+        assert!(COMMON_AUDIO_SAMPLE_RATES
+            .iter()
+            .any(|(r, _)| *r == DEFAULT_AUDIO_SAMPLE_RATE));
+    }
 }

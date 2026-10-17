@@ -317,6 +317,35 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Stinger input
+        ExposedProperty {
+            name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),
+            label: "Stinger Input".to_string(),
+            description: "Add a stinger input: wire a Media Player with Stinger Clip Source turned on into it, and take stingers from the vision mixer panel. Classic stingers run on both backends; track-matte and mask-only stingers need the GPU backend and play as classic on the CPU one.".to_string(),
+            property_type: PropertyType::Bool,
+            default_value: Some(PropertyValue::Bool(false)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::stinger::STINGER_PREROLL_PROPERTY.to_string(),
+            label: "Stinger Preroll (ms)".to_string(),
+            description: "Delay from a stinger take to its first frame on air. Every take is programmed for that frame before the clip starts, so it lands frame-accurately; too short a delay for the machine and the clip's first frames arrive late (the take report says so).".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(strom_types::stinger::DEFAULT_STINGER_PREROLL_MS)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::stinger::STINGER_PREROLL_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Show VU meters in multiview overlay
         ExposedProperty {
             name: "show_vu_meters".to_string(),
@@ -400,7 +429,10 @@ fn vision_mixer_definition() -> BlockDefinition {
         exposed_properties.push(ExposedProperty {
             name: format!("input_{}_label", i),
             label: format!("Input {} Label", i + 1),
-            description: format!("Label for input {} shown on multiview", i + 1),
+            description: format!(
+                "Label for input {} shown on multiview. Can be changed while the flow runs.",
+                i + 1
+            ),
             property_type: PropertyType::String,
             default_value: Some(PropertyValue::String(format!("In {}", i + 1))),
             mapping: PropertyMapping {
@@ -408,7 +440,7 @@ fn vision_mixer_definition() -> BlockDefinition {
                 property_name: format!("input_{}_label", i),
                 transform: None,
             },
-            live: false,
+            live: true,
             persist: None,
         });
     }
@@ -449,7 +481,7 @@ fn vision_mixer_definition() -> BlockDefinition {
     // the operator picks its bg and overlays from the dedicated PiP panel.
 
     BlockDefinition {
-        id: "builtin.vision_mixer".to_string(),
+        id: super::BLOCK_ID.to_string(),
         name: "Vision Mixer".to_string(),
         description:
             "TV broadcast vision mixer with PVW/PGM workflow, transitions, and multiview output"
@@ -474,7 +506,7 @@ fn vision_mixer_definition() -> BlockDefinition {
                         format!("audio_in_{}", i),
                         format!("A{}", i),
                         MediaType::Audio,
-                        format!("queue_audio_{}", i),
+                        format!("audioconvert_audio_{}", i),
                         "sink".to_string(),
                     ));
                 }
@@ -482,7 +514,7 @@ fn vision_mixer_definition() -> BlockDefinition {
                     "pgm_audio_in",
                     "PGM Audio",
                     MediaType::Audio,
-                    "queue_audio_pgm",
+                    "audioconvert_audio_pgm",
                     "sink".to_string(),
                 ));
                 pads

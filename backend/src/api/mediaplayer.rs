@@ -16,6 +16,18 @@ use tracing::info;
 use crate::blocks::builtin::mediaplayer::{MediaPlayerKey, MEDIA_PLAYER_REGISTRY};
 use crate::state::AppState;
 
+/// Run a player control call off the async runtime. It waits for the
+/// player's other control calls and, after a file switch, for the source to
+/// set up the new stream, none of which may stall a runtime worker.
+async fn control<F>(call: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(call)
+        .await
+        .unwrap_or_else(|e| Err(format!("control call failed: {}", e)))
+}
+
 /// Get the current state of a media player block.
 #[utoipa::path(
     get,
@@ -58,6 +70,23 @@ pub async fn get_player_state(
     }))
 }
 
+/// Refuse a change to a stinger clip source while it plays a take: the take
+/// owns its playlist and transport until the clip has played out.
+fn refuse_while_stinger_on_air(
+    flow_id: &FlowId,
+    block_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if crate::state::stinger::source_on_air(flow_id, block_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse::new(
+                "This Media Player is playing a stinger take; try again when it has finished",
+            )),
+        ));
+    }
+    Ok(())
+}
+
 /// Set the playlist for a media player block.
 #[utoipa::path(
     post,
@@ -70,7 +99,8 @@ pub async fn get_player_state(
     request_body = SetPlaylistRequest,
     responses(
         (status = 200, description = "Playlist set"),
-        (status = 404, description = "Flow or block not found", body = ErrorResponse)
+        (status = 404, description = "Flow or block not found", body = ErrorResponse),
+        (status = 409, description = "The player is playing a stinger take", body = ErrorResponse)
     )
 )]
 pub async fn set_playlist(
@@ -78,6 +108,7 @@ pub async fn set_playlist(
     Path((flow_id, block_id)): Path<(FlowId, String)>,
     ValidatedJson(req): ValidatedJson<SetPlaylistRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    refuse_while_stinger_on_air(&flow_id, &block_id)?;
     info!(
         "Setting playlist for player {}: {} files",
         block_id,
@@ -136,8 +167,14 @@ pub async fn set_playlist(
 
         // Only auto-start from the beginning if the player was stopped and
         // got other files: a loop change alone leaves a held end as it is.
-        if was_stopped && !same_files && player.playlist_len() > 0 {
-            let _ = player.goto(0);
+        // A stinger clip source parks its first clip instead of playing it.
+        if player.stinger.enabled {
+            if player.playlist_len() > 0 && !player.is_parked_on(player.current_index()) {
+                let index = player.current_index();
+                let _ = control(move || player.cue(index).map(|_| ())).await;
+            }
+        } else if was_stopped && !same_files && player.playlist_len() > 0 {
+            let _ = control(move || player.goto(0)).await;
         }
     }
 
@@ -157,7 +194,8 @@ pub async fn set_playlist(
     responses(
         (status = 200, description = "Action performed"),
         (status = 400, description = "Action failed", body = ErrorResponse),
-        (status = 404, description = "Player not found", body = ErrorResponse)
+        (status = 404, description = "Player not found", body = ErrorResponse),
+        (status = 409, description = "The player is playing a stinger take", body = ErrorResponse)
     )
 )]
 pub async fn control_player(
@@ -165,6 +203,7 @@ pub async fn control_player(
     Path((flow_id, block_id)): Path<(FlowId, String)>,
     JsonBody(req): JsonBody<PlayerControlRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    refuse_while_stinger_on_air(&flow_id, &block_id)?;
     let key = MediaPlayerKey {
         flow_id,
         block_id: block_id.clone(),
@@ -177,13 +216,15 @@ pub async fn control_player(
 
     info!("Player {} control: {:?}", block_id, req.action);
 
-    let result = match req.action {
+    let action = req.action;
+    let result = control(move || match action {
         PlayerAction::Play => player.play(),
         PlayerAction::Pause => player.pause(),
         PlayerAction::Stop => player.stop(),
         PlayerAction::Next => player.next(),
         PlayerAction::Previous => player.previous(),
-    };
+    })
+    .await;
 
     result.map_err(|e| {
         (
@@ -208,7 +249,8 @@ pub async fn control_player(
     responses(
         (status = 200, description = "Seek performed"),
         (status = 400, description = "Seek failed", body = ErrorResponse),
-        (status = 404, description = "Player not found", body = ErrorResponse)
+        (status = 404, description = "Player not found", body = ErrorResponse),
+        (status = 409, description = "The player is playing a stinger take", body = ErrorResponse)
     )
 )]
 pub async fn seek_player(
@@ -216,6 +258,7 @@ pub async fn seek_player(
     Path((flow_id, block_id)): Path<(FlowId, String)>,
     JsonBody(req): JsonBody<SeekRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    refuse_while_stinger_on_air(&flow_id, &block_id)?;
     let key = MediaPlayerKey {
         flow_id,
         block_id: block_id.clone(),
@@ -243,12 +286,15 @@ pub async fn seek_player(
     }
 
     info!("Player {} seek to {} ns", block_id, req.position_ns);
-    player.seek(req.position_ns).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::with_details("Seek failed", e)),
-        )
-    })?;
+    let position_ns = req.position_ns;
+    control(move || player.seek(position_ns))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::with_details("Seek failed", e)),
+            )
+        })?;
 
     Ok(StatusCode::OK)
 }
@@ -266,7 +312,8 @@ pub async fn seek_player(
     responses(
         (status = 200, description = "Goto performed"),
         (status = 400, description = "Goto failed", body = ErrorResponse),
-        (status = 404, description = "Player not found", body = ErrorResponse)
+        (status = 404, description = "Player not found", body = ErrorResponse),
+        (status = 409, description = "The player is playing a stinger take", body = ErrorResponse)
     )
 )]
 pub async fn goto_file(
@@ -274,6 +321,7 @@ pub async fn goto_file(
     Path((flow_id, block_id)): Path<(FlowId, String)>,
     JsonBody(req): JsonBody<GotoRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    refuse_while_stinger_on_air(&flow_id, &block_id)?;
     let key = MediaPlayerKey {
         flow_id,
         block_id: block_id.clone(),
@@ -286,7 +334,8 @@ pub async fn goto_file(
 
     info!("Player {} goto file index {}", block_id, req.index);
 
-    player.goto(req.index).map_err(|e| {
+    let index = req.index;
+    control(move || player.goto(index)).await.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::with_details("Goto failed", e)),
