@@ -141,3 +141,31 @@ pub const REMOTE_CONTROL_WARNING: &str = "Remote control is a debugging tool. \
     to, and the files on the host. Give it only to someone you would trust with \
     the instance itself. To keep customers apart, run a Strom process per \
     customer.";
+
+/// A command for the page an HTML Input block renders, sent through
+/// Chromium's DevTools protocol. Only for blocks with Page Scripting on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HtmlPageCommand {
+    /// Run JavaScript in the page, such as one of its functions, and return
+    /// the value. A promise is awaited.
+    Evaluate { expression: String },
+    /// Replace the stylesheet added to the page; empty removes it. It lasts
+    /// until the page loads again.
+    SetCss { css: String },
+    /// Freeze the page: its scripts and animations stop until it resumes.
+    Freeze,
+    /// Run a frozen page again.
+    Resume,
+}
+
+/// What a page command returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct HtmlPageResult {
+    /// For `evaluate`, the value as JSON; null otherwise and for a value
+    /// JSON cannot carry.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub value: serde_json::Value,
+}

@@ -1041,6 +1041,73 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/devtools/page": {
+      "post": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Run a command in the page an HTML Input block renders: JavaScript, CSS,\nfreeze or resume (see [`HtmlPageCommand`]).",
+        "description": "The block needs Page Scripting on. Unlike a remote control link this is\nfor a control system, not a person: it goes straight to the page's own\nDevTools endpoint, outside the link filter, which refuses\n`Runtime.evaluate` on purpose.",
+        "operationId": "page_command",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block instance id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HtmlPageCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What the command returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlPageResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The block has Page Scripting switched off"
+          },
+          "404": {
+            "description": "No such block, or it is not rendering a page yet"
+          },
+          "422": {
+            "description": "The page refused the command, or the script threw"
+          },
+          "502": {
+            "description": "The page did not answer"
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/dsk": {
       "post": {
         "tags": [
@@ -8160,6 +8227,92 @@
           "default": {
             "type": "string",
             "description": "The default GST_DEBUG filter the server started with"
+          }
+        }
+      },
+      "HtmlPageCommand": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Run JavaScript in the page, such as one of its functions, and return\nthe value. A promise is awaited.",
+            "required": [
+              "expression",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "evaluate"
+                ]
+              },
+              "expression": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Replace the stylesheet added to the page; empty removes it. It lasts\nuntil the page loads again.",
+            "required": [
+              "css",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_css"
+                ]
+              },
+              "css": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Freeze the page: its scripts and animations stop until it resumes.",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "freeze"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Run a frozen page again.",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "resume"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A command for the page an HTML Input block renders, sent through\nChromium's DevTools protocol. Only for blocks with Page Scripting on."
+      },
+      "HtmlPageResult": {
+        "type": "object",
+        "description": "What a page command returned.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "type": "object",
+            "description": "For `evaluate`, the value as JSON; null otherwise and for a value\nJSON cannot carry."
           }
         }
       },

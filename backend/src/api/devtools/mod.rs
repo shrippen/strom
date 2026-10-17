@@ -66,6 +66,7 @@
 //! and it must stay off on a Strom shared between customers.
 
 mod filter;
+mod page_control;
 mod pages;
 mod placement;
 mod session;
@@ -85,7 +86,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use strom_types::devtools::{
     DevToolsLink, DevToolsLinkSummary, DevToolsLinks, DevToolsRevokedLinks, DevToolsTarget,
-    DevToolsTargets, REMOTE_CONTROL_WARNING, SCREENCAST_CONTROL_WARNING, SHARED_CONTEXT_WARNING,
+    DevToolsTargets, HtmlPageCommand, HtmlPageResult, REMOTE_CONTROL_WARNING,
+    SCREENCAST_CONTROL_WARNING, SHARED_CONTEXT_WARNING,
 };
 use strom_types::{FlowId, StromEvent};
 use tokio::sync::broadcast;
@@ -886,6 +888,91 @@ pub async fn create_block_link(
             .into_response();
     }
     minted(&state, source.link_source())
+}
+
+/// Run a command in the page an HTML Input block renders: JavaScript, CSS,
+/// freeze or resume (see [`HtmlPageCommand`]).
+///
+/// The block needs Page Scripting on. Unlike a remote control link this is
+/// for a control system, not a person: it goes straight to the page's own
+/// DevTools endpoint, outside the link filter, which refuses
+/// `Runtime.evaluate` on purpose.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/devtools/page",
+    tag = "devtools",
+    params(
+        ("flow_id" = String, Path, description = "Flow id"),
+        ("block_id" = String, Path, description = "Block instance id")
+    ),
+    request_body = HtmlPageCommand,
+    responses(
+        (status = 200, description = "What the command returned", body = HtmlPageResult),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "The block has Page Scripting switched off"),
+        (status = 404, description = "No such block, or it is not rendering a page yet"),
+        (status = 422, description = "The page refused the command, or the script threw"),
+        (status = 502, description = "The page did not answer")
+    )
+)]
+pub async fn page_command(
+    State(app): State<AppState>,
+    Extension(state): Extension<DevToolsState>,
+    Path((flow_id, block_id)): Path<(FlowId, String)>,
+    Json(command): Json<HtmlPageCommand>,
+) -> Response {
+    let Some(port) = state.config.debug_port else {
+        return disabled();
+    };
+    let Some(flow) = app.get_flow(&flow_id).await else {
+        return (StatusCode::NOT_FOUND, "Flow not found").into_response();
+    };
+    let Some(block) = flow.blocks.iter().find(|b| b.id == block_id) else {
+        return (StatusCode::NOT_FOUND, "Block not found").into_response();
+    };
+    if block.block_definition_id != crate::blocks::builtin::html_input::BLOCK_ID {
+        return (StatusCode::NOT_FOUND, "Only an HTML source has a page").into_response();
+    }
+    if !crate::blocks::builtin::html_input::page_scripting_enabled(&block.properties) {
+        return (
+            StatusCode::FORBIDDEN,
+            "This HTML source has Page Scripting switched off. Turn on its Page Scripting \
+             property to send it commands.",
+        )
+            .into_response();
+    }
+    let Some(source) = running_source(&app, &flow_id, &block_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            "This block is not rendering a page - is the flow running?",
+        )
+            .into_response();
+    };
+    let page = match page_targets(port).await {
+        Some(targets) => page_of(&source, &targets),
+        None => None,
+    };
+    let Some(page) = page else {
+        return (
+            StatusCode::NOT_FOUND,
+            "This block's page is still starting. Try again in a moment.",
+        )
+            .into_response();
+    };
+    let url = format!("ws://127.0.0.1:{}/devtools/page/{}", port, page.id);
+    match page_control::run(&url, &command).await {
+        Ok(value) => Json(HtmlPageResult { value }).into_response(),
+        Err(page_control::PageError::Failed(message)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message).into_response()
+        }
+        Err(page_control::PageError::Unreachable(message)) => {
+            warn!(
+                "Page of {}/{} did not answer: {}",
+                flow_id, block_id, message
+            );
+            (StatusCode::BAD_GATEWAY, "The page did not answer").into_response()
+        }
+    }
 }
 
 /// List the links that are alive right now.

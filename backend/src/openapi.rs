@@ -26,7 +26,7 @@ use strom_types::block::{
 };
 use strom_types::devtools::{
     DevToolsLink, DevToolsLinkSummary, DevToolsLinks, DevToolsRevokedLinks, DevToolsTarget,
-    DevToolsTargets,
+    DevToolsTargets, HtmlPageCommand, HtmlPageResult,
 };
 use strom_types::discovery::{
     AnnouncedStreamResponse, DeviceCategory, DeviceCountByCategory, DeviceDiscoveryStatus,
@@ -195,6 +195,7 @@ use utoipa::OpenApi;
         crate::api::devtools::list_targets,
         crate::api::devtools::create_link,
         crate::api::devtools::create_block_link,
+        crate::api::devtools::page_command,
         crate::api::devtools::list_links,
         crate::api::devtools::revoke_all_links,
         crate::api::devtools::revoke_link,
@@ -212,6 +213,8 @@ use utoipa::OpenApi;
             PortSpan,
             DevToolsLink,
             DevToolsLinkSummary,
+            HtmlPageCommand,
+            HtmlPageResult,
             DevToolsLinks,
             DevToolsRevokedLinks,
             DevToolsTarget,
