@@ -404,6 +404,10 @@ pub async fn create_app_with_config(
             "/flows/{flow_id}/blocks/{block_id}/devtools/link",
             post(api::devtools::create_block_link),
         )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/devtools/page",
+            post(api::devtools::page_command),
+        )
         .route("/devtools/links", get(api::devtools::list_links))
         .route("/devtools/links", delete(api::devtools::revoke_all_links))
         .route("/devtools/links/{id}", delete(api::devtools::revoke_link))
