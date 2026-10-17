@@ -5,6 +5,7 @@
 //! [`ShowPlayback`], which hold weak element references only, so no pad keeps
 //! the pipeline alive.
 
+use super::repeat::{self, Repeats, Seam};
 use super::{zone_caps, ShowPlayback, ZONE_RATE};
 use gstreamer as gst;
 use gstreamer::glib;
@@ -15,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use strom_types::show_playback::{
     gain_of_db, s_curve, AddSoundRequest, FadeEnd, ShowPlaybackState, SoundFadeRequest, SoundInfo,
-    SoundRepeat, SoundRoute, SoundStart, SoundState, ZoneLevelRequest, FADE_MAX_MS, MAX_SOUNDS,
+    SoundRoute, SoundStart, SoundState, ZoneLevelRequest, FADE_MAX_MS, MAX_SOUNDS,
 };
 use tracing::{debug, info, warn};
 
@@ -40,10 +41,7 @@ pub struct Sound {
     /// Its src pad holds a preloaded sound; seeks go up from its sink.
     volume: glib::WeakRef<gst::Element>,
     level: Mutex<Level>,
-    /// Plays still to come after this one; `u32::MAX`: forever.
-    plays_left: std::sync::atomic::AtomicU32,
-    /// The first buffer is being thrown away for the first segment seek.
-    seeking: std::sync::atomic::AtomicBool,
+    repeats: Repeats,
     gate: Mutex<Option<gst::PadProbeId>>,
     /// Running time the file's start plays at, once released.
     started_at: Mutex<Option<gst::ClockTime>>,
@@ -154,12 +152,7 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
             gain: gain_of_db(request.gain_db),
             ramp: None,
         }),
-        plays_left: std::sync::atomic::AtomicU32::new(match request.repeat {
-            SoundRepeat::Once => 0,
-            SoundRepeat::Times(n) => n.saturating_sub(1),
-            SoundRepeat::Forever => u32::MAX,
-        }),
-        seeking: std::sync::atomic::AtomicBool::new(false),
+        repeats: Repeats::new(request.repeat),
         gate: Mutex::new(None),
         started_at: Mutex::new(None),
         open_zones: std::sync::atomic::AtomicUsize::new(0),
@@ -171,11 +164,6 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
     bin.add_many(chain).map_err(|e| e.to_string())?;
     gst::Element::link_many([&convert, &resample, &caps, &volume, &tee])
         .map_err(|e| e.to_string())?;
-    // A repeated sound plays from segment seeks: its end is then a seam
-    // (SEGMENT_DONE) the next play follows without a gap, not an EOS.
-    let first_seek = std::sync::atomic::AtomicBool::new(
-        sound.plays_left.load(std::sync::atomic::Ordering::SeqCst) > 0,
-    );
 
     // The first buffer waits here until `play`.
     let gate_pad = volume.static_pad("src").ok_or("volume has no src pad")?;
@@ -186,13 +174,11 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
             let (Some(block), Some(sound)) = (gated.0.upgrade(), gated.1.upgrade()) else {
                 return gst::PadProbeReturn::Remove;
             };
-            if first_seek.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                // The first buffer stays here, blocking the decoder, until
-                // the seek's flush lets it go; nothing passed the gate yet.
-                sound
-                    .seeking
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                seek_from_start(&block, &sound, true);
+            if sound.repeats.first_buffer() {
+                // A repeated sound plays from segment seeks (`repeat`); the
+                // first buffer waits here, blocking the decoder, until the
+                // first seek's flush.
+                seek_again(&block, &sound, true);
                 return gst::PadProbeReturn::Ok;
             }
             if sound.state().0 == SoundState::Loading {
@@ -217,30 +203,16 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
             let (Some(block), Some(sound)) = (ending.0.upgrade(), ending.1.upgrade()) else {
                 return gst::PadProbeReturn::Ok;
             };
-            let seeking = sound.seeking.load(std::sync::atomic::Ordering::SeqCst);
-            match event.type_() {
-                gst::EventType::FlushStart if seeking => {}
-                gst::EventType::FlushStop if seeking => {
-                    sound
-                        .seeking
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                gst::EventType::SegmentDone => {
-                    let left = sound.plays_left.load(std::sync::atomic::Ordering::SeqCst);
-                    if left != u32::MAX {
-                        sound
-                            .plays_left
-                            .store(left.saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
-                    }
-                    seek_from_start(&block, &sound, false);
-                }
-                gst::EventType::Eos => {
-                    if sound.open_zones.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            match sound.repeats.event(event.type_()) {
+                Seam::Swallow => {}
+                Seam::Next => seek_again(&block, &sound, false),
+                Seam::Pass => {
+                    let eos = event.type_() == gst::EventType::Eos;
+                    if eos && sound.open_zones.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                         end(block, sound);
                     }
                     return gst::PadProbeReturn::Ok;
                 }
-                _ => return gst::PadProbeReturn::Ok,
             }
             // Handled, not Drop: dropping an event in a push probe makes
             // GStreamer 1.24 unref a NULL event.
@@ -395,48 +367,21 @@ fn become_ready(block: Arc<ShowPlayback>, sound: Arc<Sound>) {
     }
 }
 
-/// Seek `sound`'s file back to its start, from another thread (a seek
-/// from a streaming thread would wait for itself). `flush` for the first
-/// seek; a segment seek while more plays are to come, so the play after
-/// it follows without a gap, a plain one for the last play (it ends with
-/// EOS). A first seek the file refuses leaves the sound playing once.
-fn seek_from_start(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, flush: bool) {
-    let segment = sound.plays_left.load(std::sync::atomic::Ordering::SeqCst) > 0;
-    let mut flags = gst::SeekFlags::ACCURATE;
-    if flush {
-        flags |= gst::SeekFlags::FLUSH;
-    }
-    if segment {
-        flags |= gst::SeekFlags::SEGMENT;
-    }
-    let (block, sound) = (Arc::downgrade(block), Arc::downgrade(sound));
-    std::thread::spawn(move || {
-        let (Some(block), Some(sound)) = (block.upgrade(), sound.upgrade()) else {
+/// Seek `sound`'s file back to its start for its next play. A first
+/// seek the file refuses leaves the sound playing once.
+fn seek_again(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, flush: bool) {
+    let Some(pad) = sound.volume.upgrade().and_then(|v| v.static_pad("sink")) else {
+        return;
+    };
+    let (block, weak) = (Arc::downgrade(block), Arc::downgrade(sound));
+    repeat::seek_from_start(&pad, sound.repeats.flags(flush), move || {
+        let (Some(block), Some(sound)) = (block.upgrade(), weak.upgrade()) else {
             return;
         };
-        let Some(pad) = sound.volume.upgrade().and_then(|v| v.static_pad("sink")) else {
-            return;
-        };
-        let seek = gst::event::Seek::new(
-            1.0,
-            flags,
-            gst::SeekType::Set,
-            gst::ClockTime::ZERO,
-            gst::SeekType::None,
-            gst::ClockTime::NONE,
-        );
-        if !pad.push_event(seek) {
-            warn!("Show Playback: {} cannot repeat (seek refused)", sound.id);
-            sound
-                .plays_left
-                .store(0, std::sync::atomic::Ordering::SeqCst);
-            if flush {
-                // Its first buffer still waits at the gate.
-                sound
-                    .seeking
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                become_ready(block, sound);
-            }
+        sound.repeats.refused();
+        if flush {
+            // Its first buffer still waits at the gate.
+            become_ready(block, sound);
         }
     });
 }

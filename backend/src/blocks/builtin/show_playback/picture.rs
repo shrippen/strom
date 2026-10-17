@@ -14,6 +14,7 @@
 //! Like a sound, a preloaded picture waits at the gate with its first
 //! frame until `play`, which shifts it to the stage's running time.
 
+use super::repeat::{self, Repeats, Seam};
 use super::sound::{program, MIN_RAMP_MS};
 use super::ShowPlayback;
 use gstreamer as gst;
@@ -41,6 +42,7 @@ pub struct Picture {
     gate: glib::WeakRef<gst::Element>,
     gate_probe: Mutex<Option<gst::PadProbeId>>,
     opacity: Mutex<Opacity>,
+    repeats: Repeats,
 }
 
 /// The pad's alpha and the control source its fades program.
@@ -148,6 +150,7 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddPictureRequest) -> Result<(),
             value: opacity,
             source,
         }),
+        repeats: Repeats::new(request.repeat),
     });
     picture.keep(&decoder);
     picture.keep(&gate);
@@ -160,47 +163,51 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddPictureRequest) -> Result<(),
             let (Some(block), Some(picture)) = (gated.0.upgrade(), gated.1.upgrade()) else {
                 return gst::PadProbeReturn::Remove;
             };
+            if picture.repeats.first_buffer() {
+                // A repeated video plays from segment seeks (`repeat`);
+                // its first frame waits here until the first seek's flush.
+                seek_again(&block, &picture, true);
+                return gst::PadProbeReturn::Ok;
+            }
             if picture.state().0 == SoundState::Loading {
-                picture.set_state(SoundState::Ready, None);
-                debug!("Show Playback {}: {} is ready", block.block_id, picture.id);
-                if picture
-                    .play_on_ready
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    // Not from inside the probe: removing it waits for it.
-                    std::thread::spawn(move || {
-                        if let Err(e) = release(&block, &picture) {
-                            warn!(
-                                "Show Playback {}: {} did not start: {}",
-                                block.block_id, picture.id, e
-                            );
-                        }
-                    });
-                }
+                become_ready(block, picture);
             }
             gst::PadProbeReturn::Ok
         },
     );
     *picture.gate_probe.lock().unwrap_or_else(|p| p.into_inner()) = probe;
 
-    // A video's end: it holds its last frame, or leaves the stage.
-    if request.end == PictureEnd::Stop {
-        let ending = (Arc::downgrade(block), Arc::downgrade(&picture));
-        gate_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-            let eos = matches!(
-                &info.data,
-                Some(gst::PadProbeData::Event(e)) if e.type_() == gst::EventType::Eos
-            );
-            if !eos {
+    // A video's seams, and its end: it holds its last frame, or leaves
+    // the stage.
+    let leaves = request.end == PictureEnd::Stop;
+    let ending = (Arc::downgrade(block), Arc::downgrade(&picture));
+    gate_src.add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH,
+        move |_pad, info| {
+            let Some(gst::PadProbeData::Event(event)) = &info.data else {
                 return gst::PadProbeReturn::Ok;
+            };
+            let (Some(block), Some(picture)) = (ending.0.upgrade(), ending.1.upgrade()) else {
+                return gst::PadProbeReturn::Ok;
+            };
+            match picture.repeats.event(event.type_()) {
+                Seam::Swallow => {}
+                Seam::Next => seek_again(&block, &picture, false),
+                Seam::Pass => {
+                    if leaves && event.type_() == gst::EventType::Eos {
+                        end(block, picture);
+                    }
+                    // On to the compositor: the stage's live black keeps
+                    // it going.
+                    return gst::PadProbeReturn::Ok;
+                }
             }
-            if let (Some(block), Some(picture)) = (ending.0.upgrade(), ending.1.upgrade()) {
-                end(block, picture);
-            }
-            // On to the compositor: the stage's live black keeps it going.
-            gst::PadProbeReturn::Ok
-        });
-    }
+            // Handled, not Drop: dropping an event in a push probe makes
+            // GStreamer 1.24 unref a NULL event.
+            info.data = None;
+            gst::PadProbeReturn::Handled
+        },
+    );
 
     // What to put between decoder and gate is known from the decoded caps:
     // a still image needs repeating, `fill` a crop to the stage's aspect.
@@ -241,6 +248,9 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddPictureRequest) -> Result<(),
         let still = structure
             .get::<gst::Fraction>("framerate")
             .is_ok_and(|rate| rate.numer() == 0);
+        if still {
+            picture.repeats.once();
+        }
         if let Err(e) = wire(&bin, &picture, pad, &gate_sink, still, fit, aspect) {
             warn!(
                 "Show Playback {}: {} cannot reach its stage: {}",
@@ -332,6 +342,46 @@ fn discard(bin: &gst::Bin, picture: &Picture, pad: &gst::Pad) -> Result<(), Stri
     pad.link(&sink.static_pad("sink").ok_or("no sink pad")?)
         .map_err(|e| format!("{:?}", e))?;
     Ok(())
+}
+
+/// Seek `picture`'s video back to its start for its next play. A first
+/// seek the file refuses leaves it playing once.
+fn seek_again(block: &Arc<ShowPlayback>, picture: &Arc<Picture>, flush: bool) {
+    let Some(pad) = picture.gate.upgrade().and_then(|g| g.static_pad("sink")) else {
+        return;
+    };
+    let (block, weak) = (Arc::downgrade(block), Arc::downgrade(picture));
+    repeat::seek_from_start(&pad, picture.repeats.flags(flush), move || {
+        let (Some(block), Some(picture)) = (block.upgrade(), weak.upgrade()) else {
+            return;
+        };
+        picture.repeats.refused();
+        if flush {
+            // Its first frame still waits at the gate.
+            become_ready(block, picture);
+        }
+    });
+}
+
+/// The first frame is held at the gate: the picture is ready, and shows
+/// at once if it should.
+fn become_ready(block: Arc<ShowPlayback>, picture: Arc<Picture>) {
+    picture.set_state(SoundState::Ready, None);
+    debug!("Show Playback {}: {} is ready", block.block_id, picture.id);
+    if picture
+        .play_on_ready
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // Not from inside the probe: removing it waits for it.
+        std::thread::spawn(move || {
+            if let Err(e) = release(&block, &picture) {
+                warn!(
+                    "Show Playback {}: {} did not start: {}",
+                    block.block_id, picture.id, e
+                );
+            }
+        });
+    }
 }
 
 /// Show picture `id`: a preloaded one at once, one still loading as soon
