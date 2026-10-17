@@ -186,4 +186,49 @@ mod tests {
         );
         pipeline.set_state(gst::State::Null).unwrap();
     }
+
+    /// Once released, the repeat holds no reference to the main pipeline,
+    /// so a flow torn down right after (paused clip removed) finalizes
+    /// instead of showing up as leaked.
+    #[test]
+    fn release_lets_go_of_pipeline() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                sink.upcast_ref::<gst::Element>(),
+            ])
+            .unwrap();
+        appsrc.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        // 2 fps: the repeat spends almost all its time asleep.
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "GRAY8")
+            .field("width", 2)
+            .field("height", 2)
+            .field("framerate", gst::Fraction::new(2, 1))
+            .build();
+        let sample = gst::Sample::builder()
+            .buffer(&gst::Buffer::from_slice([0u8; 4]))
+            .caps(&caps)
+            .build();
+        let still = Arc::new(StillFrame::default());
+        still.store(&sample);
+        still.hold(&appsrc, pipeline.downgrade());
+        sink.try_pull_sample(gst::ClockTime::from_seconds(2))
+            .expect("held frame repeats");
+
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        let weak = pipeline.downgrade();
+        drop((pipeline, appsrc, sink));
+        assert!(weak.upgrade().is_none(), "pipeline still referenced");
+    }
 }
