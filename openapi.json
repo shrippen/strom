@@ -6960,6 +6960,10 @@
             "format": "double",
             "description": "0 (clear) to 1."
           },
+          "repeat": {
+            "$ref": "#/components/schemas/SoundRepeat",
+            "description": "Plays of a video; `end` applies after the last (a still image\nshows until stopped anyway)."
+          },
           "stage": {
             "type": "integer",
             "description": "Stage, by its index in the block's `stages`.",
@@ -11296,7 +11300,7 @@
             ]
           }
         ],
-        "description": "How often a sound plays (SND.3); its plays follow each other without a\ngap."
+        "description": "How often a sound or video plays (SND.3, VIS.2); its plays follow\neach other without a gap."
       },
       "SoundRoute": {
         "type": "object",

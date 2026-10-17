@@ -79,8 +79,8 @@ pub enum SoundStart {
     Play,
 }
 
-/// How often a sound plays (SND.3); its plays follow each other without a
-/// gap.
+/// How often a sound or video plays (SND.3, VIS.2); its plays follow
+/// each other without a gap.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -207,6 +207,10 @@ pub struct AddPictureRequest {
     pub end: PictureEnd,
     #[serde(default)]
     pub start: SoundStart,
+    /// Plays of a video; `end` applies after the last (a still image
+    /// shows until stopped anyway).
+    #[serde(default)]
+    pub repeat: SoundRepeat,
 }
 
 fn one() -> f64 {

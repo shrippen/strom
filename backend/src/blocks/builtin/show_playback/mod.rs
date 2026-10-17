@@ -32,6 +32,7 @@
 //! ```
 
 pub mod picture;
+mod repeat;
 pub mod sound;
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};

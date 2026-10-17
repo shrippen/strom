@@ -12,8 +12,8 @@ use strom::blocks::builtin::show_playback::{self, picture, ShowPlaybackBuilder, 
 use strom::blocks::{BlockBuildContext, BlockBuilder};
 use strom_types::element::ElementPadRef;
 use strom_types::show_playback::{
-    AddPictureRequest, PictureEnd, PictureFadeRequest, PictureFit, SoundStart, SoundState,
-    StageLevelRequest,
+    AddPictureRequest, PictureEnd, PictureFadeRequest, PictureFit, SoundRepeat, SoundStart,
+    SoundState, StageLevelRequest,
 };
 use strom_types::PropertyValue;
 
@@ -214,6 +214,7 @@ fn request(id: &str, uri: String) -> AddPictureRequest {
         fit: PictureFit::Fit,
         end: PictureEnd::Hold,
         start: SoundStart::Preload,
+        repeat: SoundRepeat::Once,
     }
 }
 
@@ -345,6 +346,30 @@ fn a_video_holds_or_leaves_at_its_end() {
             }
         }
     }
+}
+
+/// VIS.2: a video played 3 times shows for 3 of its lengths, then leaves.
+#[test]
+fn a_repeated_video_plays_its_times_then_leaves() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut req = request("clip", green_video(rig.dir.path(), 15));
+    req.end = PictureEnd::Stop;
+    req.start = SoundStart::Play;
+    req.repeat = SoundRepeat::Times(3);
+    picture::add(&block, &req).unwrap();
+    wait_for("the stage shows green", || is_green(center(&rig)));
+    let shown = Instant::now();
+    // Half a second of video: once alone it would be gone by now.
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(is_green(center(&rig)), "gone after its first play");
+    assert_eq!(state_of(&rig, "clip"), Some(SoundState::Playing));
+    wait_for("the clip is gone", || state_of(&rig, "clip").is_none());
+    let played = shown.elapsed();
+    assert!(
+        played > Duration::from_millis(1300) && played < Duration::from_millis(2100),
+        "3 plays of 0.5 s took {played:?}"
+    );
 }
 
 /// A pipeline with pictures on its stage is freed when it stops: the
