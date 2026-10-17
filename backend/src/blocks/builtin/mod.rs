@@ -29,6 +29,7 @@ pub mod ndi;
 pub mod recorder;
 pub(crate) mod refusal;
 pub mod rtmp;
+pub mod show_sound;
 pub mod spectrum;
 pub mod start_time;
 pub mod tams_output;
@@ -150,6 +151,7 @@ pub fn get_all_builtin_blocks() -> Vec<BlockDefinition> {
 
     // Add RTMP blocks
     blocks.extend(rtmp::get_blocks());
+    blocks.extend(show_sound::get_blocks());
 
     // Future: Add more protocols here
     // blocks.extend(hls::get_blocks());
@@ -191,6 +193,7 @@ pub fn get_builder(block_definition_id: &str) -> Option<Arc<dyn BlockBuilder>> {
         "builtin.recorder" => Some(Arc::new(recorder::RecorderBuilder)),
         "builtin.liverecorder" => Some(Arc::new(live_recorder::LiveRecorderBuilder)),
         "builtin.rtmp_output" => Some(Arc::new(rtmp::RtmpOutputBuilder)),
+        show_sound::BLOCK_ID => Some(Arc::new(show_sound::ShowSoundBuilder)),
         "builtin.spectrum" => Some(Arc::new(spectrum::SpectrumBuilder)),
         "builtin.tams_output" => Some(Arc::new(tams_output::TamsOutputBuilder)),
         "builtin.thumbnail" => Some(Arc::new(thumbnail::ThumbnailBuilder)),
