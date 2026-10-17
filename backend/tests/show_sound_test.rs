@@ -21,6 +21,7 @@ use strom_types::PropertyValue;
 struct Ear {
     peak: f32,
     first_sound: Option<Instant>,
+    buffers: u64,
 }
 
 struct Rig {
@@ -127,6 +128,7 @@ fn rig() -> Rig {
                         .fold(0.0, f32::max);
                     let mut ear = heard.lock().unwrap();
                     ear.peak = peak;
+                    ear.buffers += 1;
                     if peak > 0.05 && ear.first_sound.is_none() {
                         ear.first_sound = Some(Instant::now());
                     }
@@ -251,6 +253,46 @@ fn a_stopped_sound_fades_out_and_leaves_the_pipeline() {
         rig.pipeline.children().len(),
         before,
         "the branch stayed in the pipeline"
+    );
+}
+
+/// A sound plays to the end of its file, however fast it was decoded,
+/// and the zone runs on after it.
+#[test]
+fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
+    let rig = rig();
+    let block = show_sound::running(&rig.key).unwrap();
+    let mut request = hall_tone(&rig, "tone");
+    request.start = SoundStart::Play;
+    sound::add(&block, &request).unwrap();
+    wait_for("the Hall hears the tone", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    let heard = rig.ears[0].lock().unwrap().first_sound.unwrap();
+
+    // The file is 3 s; it is decoded in a few ms.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        state_of(&rig, "tone"),
+        Some(SoundState::Playing),
+        "gone before its end"
+    );
+    assert!(
+        rig.ears[0].lock().unwrap().peak > 0.05,
+        "silent in the middle"
+    );
+    wait_for("the tone is over", || state_of(&rig, "tone").is_none());
+    let played = heard.elapsed();
+    assert!(
+        played > Duration::from_millis(2700),
+        "over after {played:?} of a 3 s file"
+    );
+
+    let buffers = rig.ears[0].lock().unwrap().buffers;
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        rig.ears[0].lock().unwrap().buffers > buffers,
+        "the zone stopped with the sound"
     );
 }
 
