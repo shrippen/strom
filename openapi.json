@@ -5535,6 +5535,12 @@
             "description": "DSK layer number (1 or 2, 1-based)",
             "minimum": 0
           },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fade duration in milliseconds (0 = instant, the default)",
+            "minimum": 0
+          },
           "enabled": {
             "type": "boolean",
             "description": "Enable or disable the DSK layer"
@@ -8100,6 +8106,13 @@
               "type": "string"
             },
             "description": "List of file URIs (e.g., \"file:///path/to/video.mp4\")"
+          },
+          "loop_playlist": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Loop back to the first file at the end; unchanged when absent."
           }
         }
       },
@@ -10729,6 +10742,15 @@
           "num_cores": {
             "type": "integer",
             "description": "Number of CPU cores available to this process (cgroup-aware)",
+            "minimum": 0
+          },
+          "process_memory": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Resident memory of the strom process in bytes (if available)",
             "minimum": 0
           },
           "timestamp": {
