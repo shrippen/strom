@@ -11,7 +11,8 @@ use strom::blocks::builtin::show_playback::{self, sound, ShowPlaybackBuilder, Sh
 use strom::blocks::{BlockBuildContext, BlockBuilder};
 use strom_types::element::ElementPadRef;
 use strom_types::show_playback::{
-    AddSoundRequest, SoundRoute, SoundStart, SoundState, ZoneLevelRequest,
+    AddSoundRequest, FadeEnd, SoundFadeRequest, SoundRepeat, SoundRoute, SoundStart, SoundState,
+    ZoneLevelRequest,
 };
 use strom_types::PropertyValue;
 
@@ -22,6 +23,8 @@ struct Ear {
     peak: f32,
     first_sound: Option<Instant>,
     buffers: u64,
+    /// Peak of every buffer since the first sound.
+    peaks: Vec<f32>,
 }
 
 struct Rig {
@@ -132,6 +135,9 @@ fn rig() -> Rig {
                     if peak > 0.05 && ear.first_sound.is_none() {
                         ear.first_sound = Some(Instant::now());
                     }
+                    if ear.first_sound.is_some() {
+                        ear.peaks.push(peak);
+                    }
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -192,6 +198,7 @@ fn hall_tone(rig: &Rig, id: &str) -> AddSoundRequest {
             },
         ],
         start: SoundStart::Preload,
+        repeat: SoundRepeat::Once,
     }
 }
 
@@ -293,6 +300,117 @@ fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
     assert!(
         rig.ears[0].lock().unwrap().buffers > buffers,
         "the zone stopped with the sound"
+    );
+}
+
+/// A 1 s tone in the Hall, starting at once, repeated as `repeat` says.
+fn repeated(rig: &Rig, id: &str, repeat: SoundRepeat) -> AddSoundRequest {
+    let dir = std::path::Path::new(&rig.tone).parent().unwrap().join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    AddSoundRequest {
+        uri: write_tone(&dir, 1),
+        start: SoundStart::Play,
+        repeat,
+        ..hall_tone(rig, id)
+    }
+}
+
+/// SND.3: a sound played 3 times runs 3 s without a gap, then ends.
+#[test]
+fn a_repeated_sound_plays_its_times_without_a_gap() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    sound::add(&block, &repeated(&rig, "rain", SoundRepeat::Times(3))).unwrap();
+    wait_for("the Hall hears the rain", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    let heard = rig.ears[0].lock().unwrap().first_sound.unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        state_of(&rig, "rain"),
+        Some(SoundState::Playing),
+        "ended early"
+    );
+    wait_for("the rain is over", || state_of(&rig, "rain").is_none());
+    let played = heard.elapsed();
+    assert!(
+        played > Duration::from_millis(2800) && played < Duration::from_millis(3600),
+        "3 plays of 1 s took {played:?}"
+    );
+    let ear = rig.ears[0].lock().unwrap();
+    // 10 ms buffers: the first 2.9 s are all tone.
+    let quiet = ear.peaks.iter().take(290).filter(|p| **p < 0.05).count();
+    assert_eq!(quiet, 0, "{quiet} quiet buffers between the plays");
+}
+
+/// A preloaded sound waits through its first seek and still repeats.
+#[test]
+fn a_preloaded_repeated_sound_plays_twice() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let request = AddSoundRequest {
+        start: SoundStart::Preload,
+        ..repeated(&rig, "bell", SoundRepeat::Times(2))
+    };
+    sound::add(&block, &request).unwrap();
+    wait_for("the bell is ready", || {
+        state_of(&rig, "bell") == Some(SoundState::Ready)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        rig.ears[0].lock().unwrap().first_sound.is_none(),
+        "heard before play"
+    );
+    let go = Instant::now();
+    sound::play(&block, "bell").unwrap();
+    wait_for("the bell is over", || state_of(&rig, "bell").is_none());
+    let played = go.elapsed();
+    assert!(
+        played > Duration::from_millis(1800) && played < Duration::from_millis(2600),
+        "2 plays of 1 s took {played:?}"
+    );
+}
+
+/// A sound repeated forever runs on, and a fade over a repeat's seam
+/// still fades.
+#[test]
+fn a_forever_sound_runs_on_and_fades_across_its_seams() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    sound::add(&block, &repeated(&rig, "wind", SoundRepeat::Forever)).unwrap();
+    wait_for("the Hall hears the wind", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(2200));
+    assert_eq!(state_of(&rig, "wind"), Some(SoundState::Playing));
+    assert!(rig.ears[0].lock().unwrap().peak > 0.05);
+
+    // From 2.2 s to 3.4 s, over the seam at 3 s.
+    sound::fade(
+        &block,
+        "wind",
+        &SoundFadeRequest {
+            gain_db: -60.0,
+            duration_ms: 1200,
+            end: FadeEnd::Keep,
+        },
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    let half = rig.ears[0].lock().unwrap().peak;
+    assert!(
+        half > 0.01 && half < 0.45,
+        "halfway through the fade: {half}"
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        rig.ears[0].lock().unwrap().peak < 0.01,
+        "still heard after the fade, past the seam"
+    );
+    assert_eq!(
+        state_of(&rig, "wind"),
+        Some(SoundState::Playing),
+        "keep: it runs on"
     );
 }
 
