@@ -82,6 +82,7 @@ impl PipelineManager {
             properties: flow.properties.clone(),
             pad_properties: HashMap::new(),
             block_message_handlers: Vec::new(),
+            bus_signal_watches: 0,
             block_message_connect_fns: Vec::new(),
             element_setup_fns: Vec::new(),
             thread_priority_state: None,
@@ -106,6 +107,7 @@ impl PipelineManager {
             blocks: flow.blocks.clone(),
             block_definitions: HashMap::new(),
             volume_ramps: crate::gst::volume_ramp::VolumeRampManager::new(),
+            null_state_wedged: false,
         };
 
         // Expand blocks into GStreamer elements

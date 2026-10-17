@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use strom_types::{BlockDefinition, BlockInstance, FlowId, Link, PipelineState, PropertyValue};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, error};
 
 /// Result of processing links with automatic tee insertion.
 struct ProcessedLinks {
@@ -175,6 +175,12 @@ pub struct PipelineManager {
     pad_properties: HashMap<String, HashMap<String, HashMap<String, PropertyValue>>>,
     /// Block-specific bus message handler IDs (allows blocks to register their own bus message handlers)
     block_message_handlers: Vec<gst::glib::SignalHandlerId>,
+    /// Number of `add_signal_watch()` calls made on the flow bus, counted at
+    /// the call site. `remove_signal_watch()` is ref-counted and one call past
+    /// the matching add is a GStreamer CRITICAL, so the removes are driven by
+    /// this rather than by the handler count — a block may register a message
+    /// handler without taking a watch of its own.
+    bus_signal_watches: usize,
     /// Bus message handler connection functions from blocks (called when pipeline starts)
     block_message_connect_fns: Vec<crate::blocks::BusMessageConnectFn>,
     /// Element signal setup functions from blocks (called when pipeline starts)
@@ -231,6 +237,9 @@ pub struct PipelineManager {
     /// audio `volume` elements. Eliminates zipper noise on fader drags and
     /// click artifacts on mute toggles.
     volume_ramps: crate::gst::volume_ramp::VolumeRampManager,
+    /// Set when `stop()` gave up on `set_state(Null)`. The abandoned thread
+    /// still holds the pipeline's state lock, so `Drop` must not try again.
+    null_state_wedged: bool,
 }
 
 impl Drop for PipelineManager {
@@ -246,9 +255,22 @@ impl Drop for PipelineManager {
         self.stop_qos_broadcast_task();
 
         // Ensure pipeline is in Null state before releasing references.
-        // If stop() was already called this is a no-op.
+        // If stop() was already called this is a no-op. If stop() gave up on
+        // it, trying again would only block on the same wedged transition.
+        if self.null_state_wedged {
+            return;
+        }
         let pipeline = self.pipeline.clone();
-        let _ = std::thread::spawn(move || pipeline.set_state(gst::State::Null)).join();
+        if let Err(lifecycle::DeadlineError::TimedOut) = lifecycle::run_with_deadline(
+            move || pipeline.set_state(gst::State::Null),
+            lifecycle::NULL_STATE_TIMEOUT,
+        ) {
+            error!(
+                "Pipeline '{}': set_state(NULL) on drop did not complete within {}s — abandoning it, its resources will leak",
+                self.flow_name,
+                lifecycle::NULL_STATE_TIMEOUT.as_secs()
+            );
+        }
     }
 }
 
