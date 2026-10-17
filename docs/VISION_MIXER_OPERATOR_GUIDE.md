@@ -1,7 +1,7 @@
 # Vision Mixer — Operator Guide
 
-> **Code is the source of truth.** This guide describes intended behaviour and may have
-> drifted from the current implementation. When in doubt, read the code and check the in-app UI.
+> **Code is the source of truth** — this may have drifted; read the code for the current
+> implementation, and check the in-app UI.
 
 A reference to the production switcher block in strom: the PVW/PGM
 workflow, transitions, Picture-in-Picture, downstream keying, and the
@@ -114,6 +114,7 @@ A PiP can be put on PVW *or* on PGM, just like any other source.
 | `slide_left/right/up/down` | New picture slides in **over** the old one, which stays in place until covered. The direction names the motion. | Yes. |
 | `push_left/right/up/down` | Old and new picture move **together** — the new one pushes the old out of frame. | Yes. |
 | `dip_to_black` | Fade out to black over the first half, fade the new picture in over the second. | Yes. |
+| `stinger` | Plays the cued stinger clip over the program while the source changes beneath it (§3.6). | No (the clip sets the length). |
 
 **Shader transitions** (GPU backend with Shader FX enabled — see §3.4).
 On the operator page the production staples (directional wipes, iris,
@@ -217,6 +218,83 @@ FTB is independent of the take engine.
 While FTB is engaged, the multiview shows a centered **FTB** badge over
 the PGM big display so the state is impossible to miss.
 
+### 3.6 Stingers
+
+A stinger plays a clip over the program while the source changes beneath
+it, the way an ATEM, vMix or OBS stinger does. Three kinds of clip are
+supported:
+
+| Kind | What the clip holds | How the program changes | Backend |
+|---|---|---|---|
+| **Classic** | A graphic with an alpha channel | Cut (or mix) at the cut point, while the graphic covers the frame | GPU and CPU |
+| **Track matte** | Graphic and matte in one file, side by side or stacked (the OBS layout) | Pixel by pixel, following the matte: black shows the old source, white the new one, grey blends | GPU |
+| **Mask only** | A matte, no graphic: an animated wipe | As track matte | GPU |
+
+On the CPU backend a track-matte or mask-only clip plays as classic: its
+graphic (if any) on top and a cut where the matte crosses half way (a mix
+across the matte's movement for a mask). The panel marks such clips **CPU**.
+
+**Setting up.**
+
+1. Turn on **Stinger Input** on the Vision Mixer block. It gets a
+   `stinger_in` input.
+2. Add a **Media Player**, turn on **Stinger Clip Source**, and wire its
+   `video_out` to `stinger_in`. Its playlist is the stinger library. Its
+   `audio_out` carries the clip's sound, if you want it: wire it into your
+   audio mix.
+3. Put clips in that playlist, or press **EXAMPLES** in the stinger panel
+   to render Strom's four example clips into the media directory and add
+   them: `strom-sweep` (classic), `strom-blade` (track matte, side by
+   side), `strom-ribbons` (track matte, stacked) and `strom-shards` (mask
+   only).
+
+**Operating.** Select **STING** as the transition type. The panel lists the
+clips; click one to *cue* it (load it and park it on its first frame; a
+green dot shows it is ready). **AUTO** (or Space) takes the cued clip from
+PGM to PVW. The clip goes on air **Stinger Preroll** after the take
+(default 80 ms) and the take is finished when the clip has played out;
+other takes wait until then. After a take the clip is parked again, so the
+next take is just as quick. Taking a clip that is not cued cues it first,
+which adds the time that takes (usually tens of milliseconds for a local
+file).
+
+**Changing clip files.** Replaced a clip's file under the same name? Press
+**RELOAD**: changed files are analysed again, the cued clip is loaded again
+if its file changed, and clips whose files are gone are marked MISSING. A
+cue of a clip whose file changed also loads the new file. RELOAD is refused
+while a stinger is on air.
+
+**Clip settings** (SETTINGS, for the cued clip):
+
+- **Layout**: detected from the clip alone. Two standard frames (16:9, 4:3
+  or 9:16) next to each other, such as 32:9, are side by side; one above
+  the other, such as 16:18, stacked. A single picture with alpha is
+  classic, a grey one without is a mask. The program's format plays no
+  part.
+- **Cut point** (classic): left empty, it is the frame where the graphic
+  covers most of the picture, found when the clip is analysed.
+- **Beneath** (classic): cut, or mix for a set time from the cut point.
+- **Premultiplied**: for graphics exported with premultiplied alpha
+  (After Effects' "Premultiplied (Matted)"). GPU only; the software mixer
+  composites them as straight, with dark edges.
+- **Invert matte**: swap black and white in the matte.
+
+**Frame accuracy.** A take is planned for the frame its clip lands on before
+the clip starts, so the graphic comes up on that frame, a classic cut
+lands on the cut point's frame, and each matte frame drives the program
+frame it belongs to. Each take reports how many clip frames reached the
+mixer in time and the smallest margin any had; frames arriving late mean
+the machine needs a longer preroll.
+
+**Clip formats.** Anything the Media Player decodes. With alpha: VP9 with
+alpha in WebM (the usual format of stinger packs), ProRes 4444, FFV1 in
+Matroska, QuickTime Animation. H.264 has no alpha, which is fine for a
+mask or for the matte half of a track-matte clip, but not for a classic
+graphic. Stingers do not take PiP buses: PGM and PVW must be inputs.
+Stinger clips are meant to be local files: upload them with the media API.
+A URL plays, but it is fetched again on every cue, and a take depends on
+the server staying up.
+
 ---
 
 ## 4. Picture-in-Picture (PiP)
@@ -248,7 +326,7 @@ just like a regular input.
 |---|---|
 | **Background** | One input that fills the whole PiP region. Optional — a PiP can be overlay-only. |
 | **Zone** | A rectangular sub-region inside the PiP that hosts one or more overlay sources. Each zone has its own position, size and capacity. |
-| **Zone capacity** | Max number of overlay sources allowed in the zone. When full, pushing a new source **evicts the oldest** (FIFO). Capacity `1` is "swap mode" — replacing the source cross-fades. |
+| **Zone capacity** | Max number of overlay sources allowed in the zone. When full, pushing a new source **evicts the oldest** (FIFO) — the editor does this before it sends the change, and the API rejects a zone that arrives over-full. Capacity `1` is "swap mode" — replacing the source cross-fades. |
 | **Auto-tile** | When a zone holds multiple sources, they auto-tile in a grid (1, 2 side-by-side, 2+1, 2×2, 3×2, etc.). Each source is fitted with its **own** aspect ratio — a 2.39:1 source letterboxes inside its cell instead of being stretched. |
 | **Source crop ("punch-in")** | Each source in a PiP can carry a crop window: the visible part of the source that scales to fill its box. Think virtual PTZ — zoom into a person's face from a wide shot. See §4.4. |
 | **Zone border** | A colored frame around each source box in the zone — on the **PGM output** and mirrored on the multiview (PiP tiles and the PVW display, proportionally scaled). The border belongs to the box (it survives source swaps in the zone) and is composited as part of the mix, so it tracks morphs, takes and punch-ins frame-accurately and **fades with its box** (FTB, capacity-1 cross-fades). The frame sits fully *outside* the picture edge (it never covers content), and where zones overlap the upper zone covers the lower zone's frame — like stacked framed cards. Sits below the DSK stack. Set per zone: color (`#RRGGBB` or `#RRGGBBAA`) + width in PGM pixels — the width normalizes to each render target, so 4 px on air looks like 4 px-equivalent everywhere (0 = off). |
@@ -259,9 +337,14 @@ just like a regular input.
 |---|---|
 | Max PiPs in the mixer | 4 |
 | Max overlays per PiP (across all zones) | 15 (= max inputs − 1) |
-| Sources are deduplicated across zones | The same input cannot occupy two zones in the same PiP — first zone wins. |
+| Sources are deduplicated across zones | The same input cannot occupy two zones in the same PiP. The API rejects a config that names one twice. |
+| A zone's sources must fit its capacity | The API rejects an over-full zone rather than dropping the extras. Evicting the oldest is the caller's job — the built-in editor does it for you. |
 
 ### 4.3 How the operator configures a PiP
+
+> Driving the same compositions from a control surface or script instead of the page?
+> See the [Producer Switching over the API guide](PRODUCER_SWITCHING_API_GUIDE.md) for
+> the call-by-call recipes, what an on-air layout edit looks like, and the failure modes.
 
 A PiP is configured at runtime from the **operator control page** served
 by the backend. Press **Edit** on a PiP row to open the layout editor —
@@ -418,9 +501,10 @@ The multiview is the operator's monitor. Default resolution 1280×720 @
 | **Thumbnail grid** | Bottom half | One tile per input, then one tile per configured PiP. Grid columns/rows are chosen automatically based on slot count and source aspect (16:9). |
 | **PVW border** | Around the PVW display **and** around the source tile currently routed to PVW | **Green.** |
 | **PGM border** | Around the PGM display **and** around the source tile currently routed to PGM | **Red.** |
+| **Via-PiP border** | Source tiles not routed to PVW/PGM themselves but visible there inside a PiP | **Dark green** (in a PiP on PVW) / **dark red** (in a PiP on PGM). |
 | **Idle thumbnail border** | Tiles not currently on PVW or PGM | **Gray.** |
 | **"PVW" / "PGM" labels** | Bottom-center of each big display | Colored badge matching the border. |
-| **Tile labels** | Centered below each thumbnail | Uses the operator-set `Input N Label` (defaults to `In 1`, `In 2`, …). PiP tiles label as `PiP 1`, `PiP 2`, etc. |
+| **Tile labels** | Centered below each thumbnail | Uses the operator-set `Input N Label` (defaults to `In 1`, `In 2`, …). Labels can be changed while the flow runs, for example to name a guest who joins mid-show. PiP tiles label as `PiP 1`, `PiP 2`, etc. |
 | **Clock** | Top center of canvas | Local wall-clock time in `HH:MM:SS TZ` (e.g. `14:35:42 CEST`). Auto-tracks DST changes. |
 | **VU meters** | Thin vertical bar bottom-left of each thumbnail, plus one on PVW and one on PGM | See §6.2. Can be globally disabled with the **Show VU Meters** block property. |
 | **FTB badge** | Centered on PGM display | Appears when Fade-to-Black is engaged. |
@@ -445,7 +529,7 @@ dedicated meter on the PVW and PGM big displays. dBFS thresholds:
 |  `-6 …   0 dBFS` | Red |
 
 A thin **white tick** marks the decay peak so transients are easy to
-read. Meters update at 100 ms intervals.
+read. Meters update at 250 ms intervals.
 
 ### 6.3 What is *not* shown on the multiview
 
@@ -465,20 +549,38 @@ action.
 | Action | What it does | Parameters |
 |---|---|---|
 | **Select PVW source** | Route a regular Input or PiP onto the PVW bus. Updates the multiview PVW display immediately. Never touches the on-air feed. | Source: `input:N` or `pip:N` |
-| **Select PGM source** *(direct)* | Cut a source straight to PGM, bypassing PVW. | Source: `input:N` or `pip:N` |
 | **Take (Auto)** | Animate the transition from PGM to PVW using the currently selected type/duration. Old PGM becomes the new PVW. | Implicit (uses current PVW + selected transition) |
 | **Cut** | Take with `cut` (zero duration). Instant. | — |
-| **Set transition type** | Select which animation Auto will use. | One of `cut`, `fade`, `dip_to_black`, `slide_left/right/up/down`, `push_left/right/up/down` |
+| **Set transition type** | Select which animation Auto will use. | One of `cut`, `fade`, `dip_to_black`, `slide_left/right/up/down`, `push_left/right/up/down`, `stinger`, or a shader transition (§3.1) |
 | **Set transition duration** | Set the length of fade/slide takes. | 0 – 60 000 ms (default 300) |
 | **Fade-to-Black** | Toggle FTB on PGM (first press fades to black, second press fades back). | Duration in ms (0 = instant). |
 | **DSK on/off** | Toggle one DSK channel on or off. | DSK number (1 – 4) + `enabled: true/false` |
 | **Configure PiP** | Set a PiP's background, zones (positions, capacities, source lists, borders) and per-source crop transforms. Live, no restart — staying sources morph, crops animate. | `pip_idx`, `bg`, `zones[]`, `transforms{}` |
 | **Get PiP composition** | Export one PiP's current composition (the save half of save/restore — restore by sending it back to Configure PiP). Used by the layout presets and external tooling. | `pip_idx` |
+| **Looks** | Apply or clear a persistent shader look on a source or on the PGM master (GPU backend with Shader FX, §3.4). | Source or master + look parameters |
+| **Cue stinger** | Load a clip from the stinger library and park it on its first frame. | Playlist index |
+| **Take stinger** | Take from PGM to PVW under the cued (or named) stinger clip. Same as Take with type `stinger`. | Optional playlist index |
+| **Stinger clip settings** | Layout, cut point, cut/mix beneath, premultiplied alpha, matte inversion, per clip. Stored with the flow. | Playlist index + settings |
+| **Add / remove stinger clip** | Add a file to the stinger library, or remove one. Upload or download the file into the media library first. | `file` (media path, absolute path or URI) / playlist index |
+| **Example stingers** | Render Strom's example clips into the media directory and add them to the library. | — |
+| **Reload stingers** | Look at the library's files again: analyse changed files, load the cued clip again if its file changed, flag missing files. | — |
 | **Set multiview overlay alpha** | Fade the multiview overlay (borders, labels, clock, VU meters). | `alpha`: 0.0 – 1.0 |
 | **Get state** | Snapshot of current PVW/PGM/DSK/FTB/PiP state. Useful when reconnecting to the mixer mid-show. | — |
 
 All state-changing actions broadcast a `VisionMixerStateChanged`
 WebSocket event so multiple operator panels stay in sync in real time.
+Stinger takes also emit `StingerCued`, `StingerStarted`,
+`StingerCompleted` and `StingerFailed`.
+
+### 7.1 Keyboard shortcuts (operator page)
+
+| Key | Action |
+|---|---|
+| `1`–`9`, `0` | Select PVW source. Keys past the input count select PiPs (with 8 inputs, `9` is PiP 1 and `0` is PiP 2). |
+| `Space` / `Enter` | Take (Auto) |
+| `X` | Cut |
+| `F` | Fade-to-Black |
+| `M` | Minimize the controls |
 
 ---
 
@@ -488,7 +590,7 @@ WebSocket event so multiple operator panels stay in sync in real time.
 
 | Property | Default |
 |---|---|
-| Compositor backend | Auto (GPU first, fall back to CPU) |
+| Backend | Auto (GPU first, fall back to CPU) |
 | Number of inputs | 4 |
 | Number of DSK inputs | 0 |
 | Number of PiPs | 0 |
@@ -501,8 +603,10 @@ WebSocket event so multiple operator panels stay in sync in real time.
 | Show VU meters on multiview | **On** |
 | Initial PGM input | Input 0 |
 | Initial PVW input | Input 1 |
+| Initial PGM / PVW source | Empty (use the initial input). Set `input:N` or `pip:N` to start on a PiP. |
 | Swap PVW/PGM positions on multiview | Off (PVW left, PGM right) |
-| Compositor latency | 20 ms |
+| Shader FX | **On** (GPU backend only) |
+| Latency (ms) | 20 ms |
 | Min upstream latency | 20 ms |
 
 ### Transition defaults
@@ -522,7 +626,7 @@ WebSocket event so multiple operator panels stay in sync in real time.
 | Idle thumbnail border | Gray |
 | Border width (PVW / PGM / thumbnail) | 4 px @ 720p reference, scales with multiview height |
 | Clock refresh | 1 Hz, with timezone re-check every 60 s for DST |
-| VU meter interval | 100 ms |
+| VU meter interval | 250 ms |
 
 ---
 
@@ -536,9 +640,11 @@ WebSocket event so multiple operator panels stay in sync in real time.
 | Overlay sources per PiP | 0 | 15 |
 | Transition duration | 0 ms | 60 000 ms |
 
-Input count, DSK count and PiP count are **construction-time** properties
-— changing them requires restarting the flow. Everything else (PVW/PGM
-selection, transitions, DSK toggles, PiP configuration, overlay alpha)
+Input, DSK and PiP counts, resolutions, framerates, backend and Shader FX
+are **construction-time** properties — changing them requires restarting
+the flow. Everything else (PVW/PGM
+selection, transitions, DSK toggles, PiP configuration, overlay alpha,
+input labels)
 is live and takes effect immediately.
 
 ---
@@ -552,7 +658,7 @@ is live and takes effect immediately.
 | **Take** | Atomic swap of PVW ↔ PGM, animated (Auto) or instant (Cut). |
 | **Cut** | Zero-duration take. |
 | **Auto** | Animated take, using the currently selected transition type and duration. |
-| **Transition** | The animation that takes one source to another (`cut`, `fade`, `dip_to_black`, `slide_*`, `push_*`). |
+| **Transition** | The animation that takes one source to another (`cut`, `fade`, `dip_to_black`, `slide_*`, `push_*`, and the shader transitions). |
 | **Engine downgrade** | When the engine cannot honor the requested transition (any non-fade animation involving a PiP) it falls back to `fade`. The response reports both requested and actual. |
 | **FTB (Fade-to-Black)** | Forced fade of PGM to black, independent of takes. |
 | **DSK (Downstream Keyer)** | Alpha-keyed graphics overlay on the PGM output, sitting above the entire PGM composition. |

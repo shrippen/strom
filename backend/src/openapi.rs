@@ -24,18 +24,29 @@ use strom_types::block::{
     BlockCategoriesResponse, BlockDefinition, BlockInstance, BlockListResponse, BlockResponse,
     CreateBlockRequest, ExposedProperty, ExternalPad, ExternalPads, PropertyMapping, PropertyType,
 };
+use strom_types::devtools::{
+    DevToolsLink, DevToolsLinkSummary, DevToolsLinks, DevToolsRevokedLinks, DevToolsTarget,
+    DevToolsTargets,
+};
 use strom_types::discovery::{
     AnnouncedStreamResponse, DeviceCategory, DeviceCountByCategory, DeviceDiscoveryStatus,
     DeviceResponse, DiscoveredStreamResponse, NdiDiscoveryStatus,
 };
 use strom_types::events::StromEvent;
 use strom_types::flow::{FlowProperties, GStreamerClockType};
+use strom_types::media_download::{
+    MediaDownloadJob, MediaDownloadListResponse, MediaDownloadRequest, MediaDownloadState,
+};
 use strom_types::mediaplayer::{
     GotoRequest, PlayerAction, PlayerControlRequest, PlayerStateResponse, SeekRequest,
     SetPlaylistRequest,
 };
 use strom_types::network::{
     Ipv4AddressInfo, Ipv6AddressInfo, NetworkInterfaceInfo, NetworkInterfacesResponse,
+};
+use strom_types::ports::{
+    AssignPortsRequest, CreateReservationRequest, PortEntry, PortInUse, PortPoolStatus,
+    PortReservation, PortSpan, PortState, RenewReservationRequest,
 };
 use strom_types::stats::{BlockStats, StatMetadata, StatValue, Statistic};
 use strom_types::whep::{IceServer, IceServersResponse, WhepStreamInfo, WhepStreamsResponse};
@@ -66,6 +77,14 @@ use utoipa::OpenApi;
         crate::api::flows::get_vision_mixer_state,
         crate::api::flows::set_overlay_alpha,
         crate::api::flows::toggle_dsk,
+        crate::api::stinger::get_stinger_state,
+        crate::api::stinger::cue_stinger,
+        crate::api::stinger::reload_stinger,
+        crate::api::stinger::take_stinger,
+        crate::api::stinger::set_stinger_clip_settings,
+        crate::api::stinger::write_stinger_examples,
+        crate::api::stinger::add_stinger_clip,
+        crate::api::stinger::remove_stinger_clip,
         crate::api::flows::fade_to_black,
         crate::api::flows::set_vision_mixer_effect,
         crate::api::vision_mixer_page::get_multiview_endpoint,
@@ -97,6 +116,14 @@ use utoipa::OpenApi;
         crate::api::gst_launch::parse_gst_launch,
         crate::api::gst_launch::export_gst_launch,
         crate::api::network::list_interfaces,
+        crate::api::ports::get_pool,
+        crate::api::ports::list_reservations,
+        crate::api::ports::create_reservation,
+        crate::api::ports::get_reservation,
+        crate::api::ports::renew_reservation,
+        crate::api::ports::delete_reservation,
+        crate::api::ports::assign_ports,
+        crate::api::ports::unassign_ports,
         crate::api::version::get_version,
         crate::api::system_clock::get_system_clock,
         crate::api::logging::get_log_level,
@@ -113,6 +140,9 @@ use utoipa::OpenApi;
         crate::api::media::delete_file,
         crate::api::media::create_directory,
         crate::api::media::delete_directory,
+        crate::api::media::download_url,
+        crate::api::media::list_downloads,
+        crate::api::media::cancel_download,
         // Auth endpoints
         crate::auth::login_handler,
         crate::auth::logout_handler,
@@ -161,9 +191,31 @@ use utoipa::OpenApi;
         crate::api::probes::deactivate_probe,
         // WebSocket endpoint
         crate::api::websocket::websocket_handler,
+        // Remote control of HTML source browsers
+        crate::api::devtools::list_targets,
+        crate::api::devtools::create_link,
+        crate::api::devtools::create_block_link,
+        crate::api::devtools::list_links,
+        crate::api::devtools::revoke_all_links,
+        crate::api::devtools::revoke_link,
     ),
     components(
         schemas(
+            PortReservation,
+            PortInUse,
+            CreateReservationRequest,
+            RenewReservationRequest,
+            AssignPortsRequest,
+            PortPoolStatus,
+            PortEntry,
+            PortState,
+            PortSpan,
+            DevToolsLink,
+            DevToolsLinkSummary,
+            DevToolsLinks,
+            DevToolsRevokedLinks,
+            DevToolsTarget,
+            DevToolsTargets,
             FlowResponse,
             FlowListResponse,
             FlowProperties,
@@ -212,6 +264,10 @@ use utoipa::OpenApi;
             RenameMediaRequest,
             CreateDirectoryRequest,
             MediaOperationResponse,
+            MediaDownloadRequest,
+            MediaDownloadJob,
+            MediaDownloadState,
+            MediaDownloadListResponse,
             // Flow dynamic pads
             DynamicPadsResponse,
             // Flow additional types
@@ -257,6 +313,19 @@ use utoipa::OpenApi;
             OverlayAlphaResponse,
             DskToggleRequest,
             DskToggleResponse,
+            strom_types::stinger::StingerLayout,
+            strom_types::stinger::StingerVariant,
+            strom_types::stinger::StingerBeneath,
+            strom_types::stinger::StingerClipSettings,
+            strom_types::stinger::StingerClipInfo,
+            strom_types::stinger::StingerClip,
+            strom_types::stinger::StingerTakeReport,
+            strom_types::stinger::StingerState,
+            strom_types::stinger::StingerCueRequest,
+            strom_types::stinger::StingerTakeRequest,
+            strom_types::stinger::StingerTakeResponse,
+            strom_types::stinger::StingerExamplesResponse,
+            strom_types::stinger::StingerAddClipRequest,
             FadeToBlackRequest,
             FadeToBlackResponse,
             strom_types::effects::VideoEffect,
@@ -306,6 +375,7 @@ use utoipa::OpenApi;
         (name = "blocks", description = "Reusable block management endpoints"),
         (name = "gst-launch", description = "gst-launch-1.0 import/export endpoints"),
         (name = "Network", description = "Network interface discovery endpoints"),
+        (name = "ports", description = "Port numbers Strom administers and hands out"),
         (name = "System", description = "System information endpoints"),
         (name = "Media", description = "Media file management endpoints"),
         (name = "auth", description = "Authentication endpoints"),
@@ -315,7 +385,8 @@ use utoipa::OpenApi;
         (name = "discovery", description = "AES67 stream and device discovery endpoints"),
         (name = "media_player", description = "Media player control endpoints"),
         (name = "probes", description = "Buffer age probe endpoints"),
-        (name = "websocket", description = "WebSocket real-time communication")
+        (name = "websocket", description = "WebSocket real-time communication"),
+        (name = "devtools", description = "Remote control of the browsers behind HTML sources")
     ),
     info(
         title = "Strom API",

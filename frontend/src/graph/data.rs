@@ -272,6 +272,13 @@ impl GraphEditor {
         definition.map(|def| &def.external_pads)
     }
 
+    /// Whether a block has any input pads. A source block has none, so there
+    /// is nothing to measure buffer age on.
+    pub fn block_has_inputs(&self, block: &BlockInstance) -> bool {
+        self.get_block_external_pads(block, self.get_block_definition(block))
+            .is_some_and(|pads| !pads.inputs.is_empty())
+    }
+
     /// Get the list of pads to render for an element, expanding request pads into actual instances.
     /// For request pads, this returns all connected instances plus one empty pad.
     /// Also renders pads from links when element_info doesn't have pad information
@@ -313,15 +320,17 @@ impl GraphEditor {
                     });
                 }
 
-                // Add one empty pad
-                let next_name =
-                    allocate_next_pad_name(&element.id, &pad_info.name, &self.links, true);
-                sink_pads_to_render.push(PadToRender {
-                    name: next_name,
-                    template_name: pad_info.name.clone(),
-                    media_type: pad_info.media_type,
-                    is_empty: true,
-                });
+                // Add one empty pad, if the template has a name left to give
+                if let Some(next_name) =
+                    allocate_next_pad_name(&element.id, &pad_info.name, &self.links, true)
+                {
+                    sink_pads_to_render.push(PadToRender {
+                        name: next_name,
+                        template_name: pad_info.name.clone(),
+                        media_type: pad_info.media_type,
+                        is_empty: true,
+                    });
+                }
             } else {
                 // Static pad - render as-is
                 sink_pads_to_render.push(PadToRender {
@@ -354,15 +363,17 @@ impl GraphEditor {
                     });
                 }
 
-                // Add one empty pad
-                let next_name =
-                    allocate_next_pad_name(&element.id, &pad_info.name, &self.links, false);
-                src_pads_to_render.push(PadToRender {
-                    name: next_name,
-                    template_name: pad_info.name.clone(),
-                    media_type: pad_info.media_type,
-                    is_empty: true,
-                });
+                // Add one empty pad, if the template has a name left to give
+                if let Some(next_name) =
+                    allocate_next_pad_name(&element.id, &pad_info.name, &self.links, false)
+                {
+                    src_pads_to_render.push(PadToRender {
+                        name: next_name,
+                        template_name: pad_info.name.clone(),
+                        media_type: pad_info.media_type,
+                        is_empty: true,
+                    });
+                }
             } else {
                 // Static pad - render as-is
                 src_pads_to_render.push(PadToRender {
@@ -465,7 +476,8 @@ impl GraphEditor {
 
         for link in &self.links {
             // Extract element ID and pad name from link.to
-            if let Some((to_elem_id, pad_name)) = parse_pad_ref(&link.to) {
+            // Padless (element-level) ends name no pad to render
+            if let (to_elem_id, Some(pad_name)) = parse_link_endpoint(&link.to) {
                 if to_elem_id == element_id {
                     pads.insert(pad_name);
                 }
@@ -483,7 +495,8 @@ impl GraphEditor {
 
         for link in &self.links {
             // Extract element ID and pad name from link.from
-            if let Some((from_elem_id, pad_name)) = parse_pad_ref(&link.from) {
+            // Padless (element-level) ends name no pad to render
+            if let (from_elem_id, Some(pad_name)) = parse_link_endpoint(&link.from) {
                 if from_elem_id == element_id {
                     pads.insert(pad_name);
                 }

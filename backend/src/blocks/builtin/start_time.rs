@@ -2,6 +2,7 @@
 //! starts: block property `start_time_selection`, shared by the vision
 //! mixer and the audio mixer.
 
+use gstreamer as gst;
 use std::collections::HashMap;
 use strom_types::{block::*, EnumValue, PropertyValue};
 
@@ -25,6 +26,15 @@ impl StartTime {
             Self::Zero => "zero",
             Self::First => "first",
         }
+    }
+}
+
+/// Turn off an aggregator's start time selection when it starts at zero
+/// (see [`crate::gst::aggregator_start::disarm_start_time_selection`]).
+/// "first" needs the selection: it is what picks the first buffer.
+pub(crate) fn disarm_zero_start(element: &gst::Element, start: StartTime) {
+    if start == StartTime::Zero {
+        crate::gst::aggregator_start::disarm_start_time_selection(element);
     }
 }
 

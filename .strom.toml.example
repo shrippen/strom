@@ -36,6 +36,14 @@ port = 8080
 # Env: STROM_SERVER_ICE_TRANSPORT_POLICY=relay
 # ice_transport_policy = "all"
 
+# CORS allowed origins
+# If empty (default), any origin is allowed
+# Env: STROM_SERVER_CORS_ALLOWED_ORIGINS (comma-separated)
+# cors_allowed_origins = [
+#     "https://studio.example.com",
+#     "https://player.example.com"
+# ]
+
 # TLS/HTTPS (optional)
 # When both tls_cert and tls_key are set, the server serves HTTPS instead of HTTP.
 # Certificate and key must be in PEM format. The cert file can include intermediates.
@@ -74,6 +82,11 @@ port = 8080
 # Env: STROM_STORAGE_BLOCKS_PATH=/custom/blocks.json
 # blocks_path = "/custom/path/blocks.json"
 
+# Custom path to the media file directory (overrides data_dir)
+# CLI: --media-path /custom/media
+# Env: STROM_STORAGE_MEDIA_PATH=/custom/media
+# media_path = "/custom/path/media"
+
 # Directory for the CEF/Chromium profile used by HTML sources and DSK graphics
 # Each instance needs its own: Chromium keys its process singleton on this
 # directory, so instances sharing one cannot both run HTML sources
@@ -82,17 +95,84 @@ port = 8080
 # The profile is disposable — delete it to clear cached pages, cookies and
 # local storage
 # CLI: --cef-cache-path /path/to/cef-cache
-# Env: STROM_CEF_CACHE_PATH=/path/to/cef-cache
+# Env: STROM_CEF_CACHE_PATH or STROM_STORAGE_CEF_CACHE_PATH
 # GST_CEF_CACHE_LOCATION overrides all of the above if it is set
 # cef_cache_path = "/var/cache/strom/cef"
+
+# ============================================================================
+# Port Pool
+# ============================================================================
+[ports]
+# Port numbers Strom administers and hands out through /api/ports/reservations.
+# A caller that builds flows over the API reserves some under a stable owner id
+# and keeps them for as long as it lives, so several callers can share this
+# Strom without two flows binding the same number.
+#
+# Each entry is a range or a single port; both expand into one set, so a hole
+# is expressed by listing the pieces around it. Open every port inbound on the
+# firewall and publish it into the container.
+#
+# Empty (the default) switches the pool off entirely: the reservation routes
+# answer 503, and GET /api/ports reports enabled: false. Set this only on a
+# Strom that several callers share — on one that does not, a pool would only
+# narrow which ports its own flows may bind.
+#
+# Size it for the number of owners times what each reserves. A reservation can
+# grow but not shrink, so an owner reserves for what it may add later.
+# Default: empty (no pool)
+# Env: STROM_PORTS=47100-47999 (comma-separated, same grammar)
+# ports = ["47100-47199", 47250, "47300-47399"]
+
+# How long a reservation lives when the caller does not say, in seconds.
+# Callers renew well inside this; it is the window in which a caller that dies
+# without releasing keeps its numbers.
+# Default: 600
+# Env: STROM_PORT_LEASE_TTL=600
+# lease_ttl_seconds = 600
+
+# Bind a candidate port (UDP and TCP) before handing it out, and skip it if
+# something outside Strom already holds it. Turns an intermittent flow-start
+# failure into a log line and a `blocked` state in GET /api/ports.
+#
+# It only sees its own network namespace. Under network_mode: host that is the
+# host's real port space and the answer means something; behind Docker bridge
+# networking with published ports it is not, and a conflict on the host stays
+# invisible — that, not cost, is the reason to turn it off.
+# Default: true
+# Env: STROM_PORT_PROBE_BEFORE_HANDOUT=false
+# probe_before_handout = true
+
+# ============================================================================
+# Media library: download from URL
+# ============================================================================
+[media]
+# Let "Download from URL" (POST /api/media/download) fetch from loopback,
+# private (10/8, 172.16/12, 192.168/16, fc00::/7), link-local and
+# carrier-grade NAT addresses. For a lab or single-user setup with a local
+# file server. On a Strom others can reach, this lets anyone who can call the
+# API make the server fetch from its own network, so leave it off there.
+# Cloud metadata and unroutable addresses stay refused either way.
+# Default: false
+# Env: STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES=true
+# download_allow_private_addresses = false
+
+# Largest file a URL download may write, in bytes.
+# Default: 2147483648 (2 GiB)
+# Env: STROM_MEDIA_DOWNLOAD_MAX_BYTES
+# download_max_bytes = 2147483648
+
+# Time allowed for one whole URL download, in seconds.
+# Default: 7200
+# Env: STROM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS
+# download_timeout_seconds = 7200
 
 # ============================================================================
 # Logging Configuration
 # ============================================================================
 [logging]
 # Path to log file (if set, logs will be written to file in addition to stdout)
-# File logs include timestamps and module targets (no ANSI colors)
-# Console logs remain compact for readability
+# File logs include timestamps and module targets (no ANSI colors) and always stay
+# compact, regardless of stdout_log_format below.
 # Env: STROM_LOGGING_LOG_FILE=strom.log
 # log_file = "strom.log"
 # log_file = "/var/log/strom/strom.log"
@@ -112,3 +192,48 @@ port = 8080
 # 1. RUST_LOG environment variable (highest)
 # 2. log_level in this config file
 # 3. Default: "info"
+#
+# Note: this filter is global — it gates stdout, the log file, and structured
+# event logs (see structured_events below) alike. Lowering it at runtime (e.g.
+# to "warn", via RUST_LOG or PUT /api/log-level) silences structured event
+# logs along with everything else; there is no independent filter for them.
+
+# Stdout log output format. Only affects stdout: the log file (if log_file is set above)
+# always stays compact/human-readable.
+# "compact" keeps the current human-readable format.
+# "json" emits structured JSON logs suitable for log collectors (e.g. Kubernetes
+# log collection, OpenTelemetry-compatible collectors).
+# Default: "compact"
+# Env: STROM_LOGGING_STDOUT_LOG_FORMAT=json
+# stdout_log_format = "compact"
+
+# Emit selected Strom lifecycle/error events (flow created/started/stopped,
+# pipeline errors, ...) as structured tracing log records, in addition to the
+# normal log output. Useful for observability pipelines that group logs by
+# fields such as strom.flow.id. Disabled by default to preserve existing log
+# volume and behavior.
+# Default: false
+# Env: STROM_LOGGING_STRUCTURED_EVENTS=true
+# structured_events = false
+
+# Include high-frequency events (audio meters, QoS stats, media player
+# position, ...) in structured event logs. Note: system/thread/PTP stats are
+# sent directly per WebSocket connection rather than through the internal
+# event broadcaster, so they are not affected by this setting regardless of
+# its value. Disabled by default to avoid excessive log volume; only takes
+# effect when structured_events is also enabled.
+# Default: false
+# Env: STROM_LOGGING_INCLUDE_HIGH_FREQUENCY_EVENTS=true
+# include_high_frequency_events = false
+
+# ============================================================================
+# Discovery Configuration
+# ============================================================================
+[discovery]
+# SAP multicast addresses to listen on and announce to
+# Default: ["239.255.255.255", "224.2.127.254"] (AES67 + global scope)
+# Env: STROM_DISCOVERY_SAP_MULTICAST_ADDRESSES (comma-separated)
+# sap_multicast_addresses = [
+#     "239.255.255.255",
+#     "224.2.127.254"
+# ]

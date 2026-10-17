@@ -27,6 +27,11 @@ interests you, open a GitHub issue or discussion.
 - **Undo/redo** and **drag-drop flow import** in the editor.
 - **Connection validation hints** — pre-flight checks for element compatibility and required
   properties before starting.
+- **Restart a flow on error** — `auto_restart` today only means "start again when the
+  backend starts". A supervised restart after a runtime error, with backoff, would need to
+  tell transient failures (a lost SRT peer, a network drop) from permanent ones (a wrong
+  video profile, raw video into an output that needs it encoded), so that a configuration
+  mistake stops with its message instead of looping.
 
 ## Encoding & integration
 
@@ -34,13 +39,21 @@ interests you, open a GitHub issue or discussion.
   A/B comparison of encoder settings.
 - **Cloud storage integration** — S3-compatible sinks, CDN push for HLS/DASH, webhook
   notifications on pipeline events.
+- **Audio and video into an HTML source** — today the HTML Input block only takes media out
+  of a page, and a page asking for a camera or microphone gets synthetic ones. Giving the
+  block audio and video inputs would let a page send real media. One example is returning
+  program into a video call it has joined. Two ways to do it: a `getUserMedia` shim
+  injected into the page that hands it a `MediaStream` played from one of Strom's WHEP endpoints, or raw frames pushed
+  into the page and turned into tracks with WebCodecs. The WHEP shim reuses what Strom
+  already serves and keeps encoding in Strom. WebCodecs avoids a WebRTC round trip on the
+  same machine, but it needs a channel for raw frames into the page.
 - **Plugin manager** — discover installed GStreamer plugins, show element capabilities, and
   suggest which plugin to install for a missing element.
 
 ## Intelligence & collaboration
 
 - **AI troubleshooting (enhanced MCP)** — natural-language pipeline creation, error diagnosis
-  from QoS data, and best-practice/anti-pattern detection on top of the existing MCP server.
+  from QoS data, and best-practice/anti-pattern detection on top of the existing MCP endpoint.
 - **Flow version control** — git-like history with visual diff and one-click rollback.
 - **Multi-user collaboration** — real-time co-editing, presence, role-based permissions, and
   audit logging.

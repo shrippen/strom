@@ -110,15 +110,23 @@ impl ApiClient {
         );
 
         let request = TriggerTransitionRequest {
-            from_input,
-            to_input,
+            from_input: Some(from_input),
+            to_input: Some(to_input),
             transition_type: transition_type.to_string(),
             duration_ms,
+            stinger_clip: None,
         };
+
+        // The editor swaps its from/to pair optimistically and undoes it if this call
+        // fails, so the failure has to be bounded. Neither the native nor the WASM
+        // client carries a default request timeout, and a take is a control-plane POST
+        // that either lands promptly or is not going to.
+        const TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
         let response = self
             .with_auth(self.client.post(&url))
             .json(&request)
+            .timeout(TRANSITION_TIMEOUT)
             .send()
             .await
             .map_err(|e| {

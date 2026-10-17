@@ -20,6 +20,8 @@
 //! connects each replayed a byte-identical video-only PMT ahead of a live PMT
 //! carrying video and audio.
 
+pub mod common;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use strom::blocks::builtin::mpegtssrt::MpegTsSrtOutputBuilder;
@@ -43,25 +45,6 @@ const REQUIRED: &[&str] = &[
     "audioresample",
     "capsfilter",
 ];
-
-/// Skipping on a missing element passes green and guards nothing, so CI sets
-/// `STROM_REQUIRE_GST_PLUGINS=1` to turn a skip into a failure.
-fn plugins_available() -> bool {
-    let missing: Vec<&str> = REQUIRED
-        .iter()
-        .copied()
-        .filter(|e| gst::ElementFactory::find(e).is_none())
-        .collect();
-    if missing.is_empty() {
-        return true;
-    }
-    assert!(
-        strom_types::env::var_opt("STROM_REQUIRE_GST_PLUGINS").is_none(),
-        "STROM_REQUIRE_GST_PLUGINS is set but these elements are missing: {}",
-        missing.join(", ")
-    );
-    false
-}
 
 /// A free UDP port for the SRT listener. Binding one and dropping it races with
 /// anything else on the host, but the socket is never used — srtsink only has
@@ -210,7 +193,7 @@ fn caps_reaching_srtsink() -> CapsSeen {
     for setup in ctx.take_element_setups() {
         setup(
             uuid::Uuid::new_v4(),
-            strom::events::EventBroadcaster::new(16),
+            strom::events::EventBroadcaster::with_capacity(16),
         );
     }
 
@@ -290,7 +273,7 @@ fn caps_reaching_srtsink() -> CapsSeen {
 #[test]
 fn srtsink_receives_no_streamheader() {
     gst::init().unwrap();
-    if !plugins_available() {
+    if !common::plugins_available(REQUIRED) {
         eprintln!("skipping: required GStreamer elements are missing");
         return;
     }

@@ -4,7 +4,7 @@ members = ["types", "backend", "frontend"]
 default-members = ["backend"]
 
 [workspace.package]
-version = "0.6.8"
+version = "0.7.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
@@ -24,12 +24,14 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 tokio = { version = "1.52", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
-tower-http = { version = "0.7", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 cairo-rs = { version = "0.22", features = ["v1_16"] }
 gstreamer = { version = "0.25", features = ["v1_22"] }
 gstreamer-app = { version = "0.25", features = ["v1_22"] }
+gstreamer-base = { version = "0.25", features = ["v1_22"] }
 gstreamer-controller = { version = "0.25", features = ["v1_22"] }
 gstreamer-net = { version = "0.25", features = ["v1_22"] }
+gstreamer-rtp = { version = "0.25", features = ["v1_22"] }
 gstreamer-gl = { version = "0.25", features = ["v1_22"] }
 gstreamer-video = { version = "0.25", features = ["v1_22"] }
 # gio 0.22 matches the glib 0.22 transitive that gstreamer 0.25 pulls in.
@@ -40,8 +42,9 @@ gst-plugin-webrtchttp = { version = "0.15", default-features = false }
 gst-plugin-audiofx = "0.15"
 gst-plugin-inter = "0.15"
 gst-plugin-rtp = "0.15"
+gst-plugin-isobmff = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "json"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2.5"
 utoipa = { version = "5.5", features = ["axum_extras", "uuid"] }
@@ -60,3 +63,9 @@ egui_extras = { version = "0.34", features = ["image"] }
 egui_plot = "0.35"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 gloo-net = { version = "0.7", features = ["websocket"] }
+
+# gst-plugin-isobmff needs GStreamer 1.26 to build for a single function; this
+# fork does that one function in Rust so Strom still builds and runs on 1.24
+# (Ubuntu 24.04 LTS). Drop it once upstream no longer requires 1.26.
+[patch.crates-io]
+gst-plugin-isobmff = { git = "https://github.com/srperens/gst-plugin-isobmff", tag = "v0.15.4-strom1" }

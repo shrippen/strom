@@ -115,10 +115,10 @@ RUN if [ "$BUILDPLATFORM" != "$TARGETPLATFORM" ] && [ "$TARGETARCH" = "arm64" ];
         x86_64) echo "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea" ;; \
         aarch64) echo "041ac42323837eb5624068acd8b00cd5777dac4cf91179e8dad7a7e90dd0c556" ;; \
     esac) && \
-    CZB_VERSION="0.22.3" && \
+    CZB_VERSION="0.23.4" && \
     CZB_SHA256=$(case ${ZIG_ARCH} in \
-        x86_64) echo "6a014d41ba41ca4b69ca4c4819b9f78a41b0197b5d486904e31c1244e3686190" ;; \
-        aarch64) echo "6f86a78cf8be222ac08a68a944ffd8a1ef9d455c504097f0ffbd8bcfbe434a55" ;; \
+        x86_64) echo "6b69963040818ca1ef573d8135a95aa902e17cf7f873c32c6426642dadfe7f59" ;; \
+        aarch64) echo "25cf2cdc6cde848b33a761ff2cf46d1efe6ba7e1adfc4b6f3ee2d570cacb5419" ;; \
     esac) && \
     ZIG_TARBALL="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" && \
     # Prefer community mirror (faster, not throttled); fall back to upstream
@@ -255,12 +255,16 @@ ARG TARGETARCH
 # - libegl1, libegl-mesa0, libgbm1: Headless EGL/GBM rendering (no X11 required)
 # - libgl1-mesa-dri: Mesa DRI drivers for software fallback
 # The nvidia-container-toolkit mounts NVIDIA GL libraries at runtime via --gpus all
+#
+# gsettings-desktop-schemas: souphttpsrc asks GIO for the system proxy, and
+# GIO aborts the process when the org.gnome.system.proxy schema is missing.
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
         libgstreamer1.0-0 \
         libgstreamer-plugins-base1.0-0 \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
+        gsettings-desktop-schemas \
         libgstreamer-plugins-bad1.0-0 \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-plugins-ugly \
@@ -285,10 +289,25 @@ RUN apt-get update && apt-get install -y \
 # in this image because it was built against the 1.22 ABI.
 ARG PATCHED_PLUGINS_TAG=patched-plugins-v1.0-gst1.22.12
 ARG PATCHED_PLUGINS_REPO=Eyevinn/strom
+# Pin each artifact by digest. A GitHub release asset can be replaced in place,
+# so fetching by tag alone means a substituted .so would be written straight
+# into a system library path and loaded into the strom process, with nothing in
+# the build failing. Download to a temporary path, verify, then install.
+ARG PATCHED_DECKLINK_SHA256_AMD64=ffdcb4f89e3fd91deb1926bbca57adf02d67e89a8db1c265a62f5d4885a69e5b
+ARG PATCHED_DECKLINK_SHA256_ARM64=75309b22382e834f3caa25b9e177120f56826bdde231a00d66dd54866d3a090b
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && case "${TARGETARCH}" in \
+         amd64) expected="${PATCHED_DECKLINK_SHA256_AMD64}" ;; \
+         arm64) expected="${PATCHED_DECKLINK_SHA256_ARM64}" ;; \
+         *) echo "No pinned libgstdecklink digest for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
     && curl -fsSL \
         "https://github.com/${PATCHED_PLUGINS_REPO}/releases/download/${PATCHED_PLUGINS_TAG}/libgstdecklink-linux-${TARGETARCH}.so" \
-        -o "/usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/libgstdecklink.so" \
+        -o /tmp/libgstdecklink.so \
+    && echo "${expected}  /tmp/libgstdecklink.so" | sha256sum -c - \
+    && install -m 0644 /tmp/libgstdecklink.so \
+        "/usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/libgstdecklink.so" \
+    && rm -f /tmp/libgstdecklink.so \
     && apt-get remove -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

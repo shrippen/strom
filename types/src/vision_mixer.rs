@@ -164,6 +164,25 @@ pub const DIST_PGM_ZORDER: u32 = 1;
 /// Base z-order for DSK pads on the distribution compositor (+ dsk index).
 pub const DIST_DSK_BASE_ZORDER: u32 = 100;
 
+/// Z-order of the stinger's matte pad on the distribution compositor. Above
+/// the program and its transitions, below the incoming source during a
+/// track-matte take and below every DSK.
+pub const DIST_STINGER_MATTE_ZORDER: u32 = 90;
+
+/// Z-order the incoming source is lifted to during a track-matte take, just
+/// above the matte it reads.
+pub const DIST_STINGER_INCOMING_ZORDER: u32 = 91;
+
+/// Z-order of the stinger graphic: over the program, under the DSKs.
+pub const DIST_STINGER_FILL_ZORDER: u32 = 92;
+
+/// Index of the stinger graphic's sink pad on the distribution compositor;
+/// the matte's (GPU only) is the next one. Stinger pads come after the
+/// inputs, the DSKs and the border underlays (present with PiPs).
+pub fn dist_stinger_pad_base(num_inputs: usize, num_dsk_inputs: usize, num_pips: usize) -> usize {
+    num_inputs + num_dsk_inputs + if num_pips > 0 { num_inputs } else { 0 }
+}
+
 /// Z-order for PiP overlay pads on the distribution compositor when PGM is a PiP source.
 /// Must be above [`DIST_PGM_ZORDER`] (which the bg uses) and below DSK.
 pub const DIST_PIP_OVERLAY_ZORDER: u32 = 2;
@@ -240,8 +259,9 @@ pub const VU_METER_ORANGE_DB: f64 = -9.0;
 /// dBFS threshold above which the VU bar turns red.
 pub const VU_METER_RED_DB: f64 = -6.0;
 
-/// Level meter message interval in nanoseconds (100 ms).
-pub const VU_METER_INTERVAL_NS: u64 = 100_000_000;
+/// Level meter message interval in nanoseconds (250 ms), matching the
+/// overlay's 4 fps redraw cap.
+pub const VU_METER_INTERVAL_NS: u64 = 250_000_000;
 
 /// Quantize an RMS/peak value in dBFS to u8 (0 = silence, 255 = 0 dBFS).
 /// Used for lock-free atomic storage of per-input meter values.
@@ -599,7 +619,9 @@ impl ZoneBorder {
 /// [`compute_pip_overlay_rects`]) so the zone behaves like a "mini-PiP"
 /// nested inside the parent PiP region. The `capacity` puts a cap on how
 /// many sources can occupy the zone; pushing a new source into a full zone
-/// is expected to evict the oldest (client-side FIFO).
+/// is expected to evict the oldest (client-side FIFO). The `/pip` endpoint
+/// rejects a zone whose `sources` outgrow its `capacity` rather than
+/// truncating it, so stored state always matches what renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 pub struct Zone {
@@ -629,6 +651,9 @@ impl Zone {
 
     /// Effective source slice respecting `capacity` (truncate from the front,
     /// keeping the newest entries).
+    ///
+    /// A render-time net only: the `/pip` endpoint rejects an over-capacity
+    /// zone, so on state that came through it this returns all of `sources`.
     pub fn effective_sources(&self) -> &[usize] {
         match self.capacity {
             Some(cap) if cap < self.sources.len() => {

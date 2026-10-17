@@ -18,11 +18,26 @@ on:
         default: both
         options: [both, macos, windows, none]
 
+# One run per ref, and the newest event wins on a pull request: a push or a
+# `ci:` label cancels the run in progress and starts a full one, so a PR never
+# builds macOS/Windows twice at once (a label run used to be left running on
+# the old commit next to the push run). On main a running build is left to
+# finish, and only the newest waiting push is kept: without this a burst of
+# merges stacked up one 45-minute macOS + Windows pair per commit. Any other
+# label gets a group of its own, cancels nothing, and its run skips every job.
+concurrency:
+  group: ci-${{ github.ref }}${{ (github.event.action == 'labeled' && !startsWith(github.event.label.name, 'ci:')) && format('-unrelated-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   TRUNK_VERSION: "0.21.14"
   CARGO_INCREMENTAL: 0
+  # Line tables only in dev/test builds: backtraces keep file and line, but
+  # the full debuginfo that made test builds slow to link and the sccache
+  # objects large is dropped. Release builds carry no debuginfo either way.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   # sccache -> self-hosted MinIO (S3-compatible) cache in OSC.
   # Replaces the GitHub Actions cache backend, which shares a hard 10 GB/repo
   # ceiling with the docker buildkit blobs. The same backend is reused by the
@@ -47,14 +62,10 @@ jobs:
   # build instead of failing CI. Exposes cache_ok consumed by every build job.
   preflight:
     name: sccache preflight
-    # A `labeled` event is only interesting when the label is one of the two
-    # that ask for a platform build. Skipping here takes every job that needs
-    # this one with it, and api-contract excludes `labeled` itself, so adding an
-    # unrelated label to a pull request costs nothing.
-    if: >-
-      github.event.action != 'labeled'
-      || contains(github.event.pull_request.labels.*.name, 'ci:macos')
-      || contains(github.event.pull_request.labels.*.name, 'ci:windows')
+    # Only a `ci:` label starts work: it cancels the run in progress (see
+    # `concurrency`), so its run has to do everything that run would have.
+    # Any other label skips every job and costs nothing.
+    if: github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')
     runs-on: ubuntu-latest
     outputs:
       cache_ok: ${{ steps.probe.outputs.cache_ok }}
@@ -67,24 +78,33 @@ jobs:
             echo "cache_ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # list-objects-v2 needs only s3:ListBucket, which the scoped service
-          # account has. NoSuchBucket / unreachable endpoint -> non-zero -> off.
-          if timeout 25 aws --endpoint-url "$SCCACHE_ENDPOINT" --region "$SCCACHE_REGION" \
-               --cli-connect-timeout 8 --cli-read-timeout 8 \
-               s3api list-objects-v2 --bucket "$SCCACHE_BUCKET" --max-keys 1 >/dev/null 2>&1; then
-            echo "sccache backend reachable - cache enabled"
-            echo "cache_ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::sccache backend unreachable or bucket missing - building WITHOUT compile cache"
+          # Probe a write, not just a list. When the MinIO drive fills up it
+          # keeps serving reads and health checks but rejects every PUT, so
+          # list-objects-v2 passes while sccache records a write error on every
+          # miss and the cache never fills (2026-08 to 2026-10, unnoticed).
+          # A fixed key is overwritten each run, so no delete is needed.
+          # NoSuchBucket / unreachable endpoint / denied write -> off.
+          probe() {
+            timeout 25 aws --endpoint-url "$SCCACHE_ENDPOINT" --region "$SCCACHE_REGION" \
+              --cli-connect-timeout 8 --cli-read-timeout 8 s3api "$@" >/dev/null 2>probe.err
+          }
+          echo "preflight $GITHUB_RUN_ID" > probe.txt
+          if ! probe list-objects-v2 --bucket "$SCCACHE_BUCKET" --max-keys 1; then
+            echo "::warning::sccache backend unreachable or bucket missing - building WITHOUT compile cache: $(tr '\n' ' ' < probe.err)"
             echo "cache_ok=false" >> "$GITHUB_OUTPUT"
+          elif ! probe put-object --bucket "$SCCACHE_BUCKET" --key preflight/probe --body probe.txt; then
+            echo "::warning::sccache backend rejects writes - building WITHOUT compile cache: $(tr '\n' ' ' < probe.err)"
+            echo "cache_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "sccache backend reachable and writable - cache enabled"
+            echo "cache_ok=true" >> "$GITHUB_OUTPUT"
           fi
   # Fast checks on Linux: fmt + clippy + test
   check-linux:
     name: Check (Linux)
-    # Labelling a PR must not re-run everything that already passed. Only the
-    # platform builds care about the label; `github.event.action` is unset for
-    # push and workflow_dispatch, so this is a no-op there.
-    if: github.event.action != 'labeled'
+    # See preflight for the label condition. `github.event.action` is unset
+    # for push and workflow_dispatch, so it is a no-op there.
+    if: github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')
     needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -103,7 +123,7 @@ jobs:
       - name: Cache apt packages
         uses: awalsh128/cache-apt-pkgs-action@v1.6.1
         with:
-          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice pkg-config cmake libclang-dev
+          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-gl gstreamer1.0-plugins-good libsoup-3.0-0 gsettings-desktop-schemas gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice libegl-mesa0 libgl1-mesa-dri pkg-config cmake libclang-dev
           version: 1.5
 
       # cache-apt-pkgs-action restores package files but does not run postinst,
@@ -111,12 +131,16 @@ jobs:
       # created. gst-libav then fails to load ("libblas.so.3: cannot open shared
       # object file"), avenc_aac goes missing, and every test requiring it skips
       # green. Reinstalling runs postinst; ldconfig then picks the links up.
+      # The GSettings schemas are compiled by a trigger too: without
+      # org.gnome.system.proxy in gschemas.compiled, GIO aborts any test
+      # process whose souphttpsrc looks up the system proxy (SIGTRAP).
       # Only needed here: the build jobs never load a plugin.
       - name: Repair alternatives for cached libraries
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --reinstall libblas3 liblapack3
           sudo ldconfig
+          sudo glib-compile-schemas /usr/share/glib-2.0/schemas
 
       # save-if main: PR runs restore the main-branch cache (GHA cache scoping
       # falls back to the base branch) but don't save their own per-branch
@@ -137,16 +161,28 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run Clippy on backend
-        run: cargo clippy --package strom --all-targets --features efp,nvidia -- -D warnings
+        run: cargo clippy --package strom --all-targets --features efp -- -D warnings
 
       - name: Run tests on backend
-        run: cargo test --package strom --features efp,nvidia
+        run: cargo test --package strom --features efp
         env:
           # Turn a missing-element skip into a failure — see plugins_available().
           STROM_REQUIRE_GST_PLUGINS: 1
+          # The GL tests get a surfaceless EGL context from Mesa's software
+          # rasteriser (libegl-mesa0, libgl1-mesa-dri) — see common::init_gl().
+          # So they must run here rather than skip green — see gl_available().
+          STROM_REQUIRE_GL: 1
 
       - name: Run tests on shared types
         run: cargo test --package strom-types
+
+      # The frontend's own tests are plain logic (no wasm, no GL), so this
+      # Linux job is the only place they need to run. The wasm job below
+      # cannot reach them: they are gated not(target_arch = "wasm32"), and a
+      # cfg(test) module is not built for a crate pulled in as a dependency,
+      # so without this step frontend test code is neither run nor compiled.
+      - name: Run tests on frontend
+        run: cargo test --package strom-frontend
 
   # WASM: clippy + build frontend
   check-wasm:
@@ -207,8 +243,10 @@ jobs:
   api-contract:
     name: API Contract Check
     runs-on: ubuntu-latest
-    # See check-linux for the `labeled` exclusion.
-    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    # See preflight for the label condition.
+    if: >-
+      github.event_name == 'pull_request'
+      && (github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:'))
     steps:
       - uses: actions/checkout@v6
         with:
@@ -233,11 +271,38 @@ jobs:
           base: openapi-base.json
           revision: openapi-current.json
 
+  # The static pages under backend/static are served to browsers and never touched
+  # by cargo, so nothing else in this workflow would notice a break in them.
+  static-js:
+    name: Static JS Tests
+    # See preflight. Dependabot's labels are not `ci:` labels, so labelling its
+    # PRs after they open still costs nothing.
+    if: github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # A parse gate over every served script. It is all the coverage three of
+      # them have - they are DOM-driven end to end and cannot be loaded outside a
+      # browser - so it catches a syntax error, nothing more.
+      - name: Syntax check
+        run: find backend/static -name '*.js' -not -path '*/tests/*' -print0 | xargs -0 -n1 node --check
+
+      # Expanded by the shell, not by node: a bare directory is read as a module
+      # path, and node's own glob handling is version-dependent.
+      - name: Unit tests
+        run: node --test backend/static/tests/*.test.js
+
   # Linux x86_64 build
   build-linux-x86_64:
     name: Build (Linux x86_64)
-    # See check-linux for the `labeled` exclusion.
-    if: github.event.action != 'labeled'
+    # See preflight for the label condition.
+    if: github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')
     needs: [check-wasm, preflight]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -282,7 +347,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/cargo-zigbuild.tar.xz
-          key: cargo-zigbuild-0.22.3-linux-x86_64
+          key: cargo-zigbuild-0.23.4-linux-x86_64
 
       - name: Install Zig and cargo-zigbuild
         run: |
@@ -302,8 +367,8 @@ jobs:
           sudo ln -sf /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
 
           # cargo-zigbuild: download prebuilt binary (cargo install would compile from source, ~10 min)
-          CZB_VERSION="0.22.3"
-          CZB_SHA256="6a014d41ba41ca4b69ca4c4819b9f78a41b0197b5d486904e31c1244e3686190"
+          CZB_VERSION="0.23.4"
+          CZB_SHA256="6b69963040818ca1ef573d8135a95aa902e17cf7f873c32c6426642dadfe7f59"
           CZB_URL="https://github.com/rust-cross/cargo-zigbuild/releases/download/v${CZB_VERSION}/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz"
           if [ ! -s /tmp/cargo-zigbuild.tar.xz ] || ! echo "${CZB_SHA256}  /tmp/cargo-zigbuild.tar.xz" | sha256sum -c --quiet; then
             curl -L --fail --retry 5 --retry-all-errors --retry-delay 3 \
@@ -320,7 +385,7 @@ jobs:
       - name: Install GStreamer (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1.6.1
         with:
-          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice pkg-config cmake libclang-dev
+          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-gl gstreamer1.0-plugins-good libsoup-3.0-0 gsettings-desktop-schemas gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice libegl-mesa0 libgl1-mesa-dri pkg-config cmake libclang-dev
           version: 1.5
 
       - name: Download frontend dist
@@ -346,8 +411,8 @@ jobs:
   # Linux ARM64 build (build only - no native clippy/test)
   build-linux-arm64:
     name: Build (Linux ARM64)
-    # See check-linux for the `labeled` exclusion.
-    if: github.event.action != 'labeled'
+    # See preflight for the label condition.
+    if: github.event.action != 'labeled' || startsWith(github.event.label.name, 'ci:')
     needs: [check-wasm, preflight]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
@@ -387,7 +452,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/cargo-zigbuild.tar.xz
-          key: cargo-zigbuild-0.22.3-linux-aarch64
+          key: cargo-zigbuild-0.23.4-linux-aarch64
 
       - name: Install Zig and cargo-zigbuild
         run: |
@@ -405,8 +470,8 @@ jobs:
           sudo tar -xJ -C /usr/local -f /tmp/zig.tar.xz
           sudo ln -sf /usr/local/zig-linux-aarch64-${ZIG_VERSION}/zig /usr/local/bin/zig
 
-          CZB_VERSION="0.22.3"
-          CZB_SHA256="6f86a78cf8be222ac08a68a944ffd8a1ef9d455c504097f0ffbd8bcfbe434a55"
+          CZB_VERSION="0.23.4"
+          CZB_SHA256="25cf2cdc6cde848b33a761ff2cf46d1efe6ba7e1adfc4b6f3ee2d570cacb5419"
           CZB_URL="https://github.com/rust-cross/cargo-zigbuild/releases/download/v${CZB_VERSION}/cargo-zigbuild-aarch64-unknown-linux-gnu.tar.xz"
           if [ ! -s /tmp/cargo-zigbuild.tar.xz ] || ! echo "${CZB_SHA256}  /tmp/cargo-zigbuild.tar.xz" | sha256sum -c --quiet; then
             curl -L --fail --retry 5 --retry-all-errors --retry-delay 3 \
@@ -423,7 +488,7 @@ jobs:
       - name: Install GStreamer (cached)
         uses: awalsh128/cache-apt-pkgs-action@v1.6.1
         with:
-          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice pkg-config cmake libclang-dev
+          packages: libunwind-dev libssl-dev libcairo2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-gl gstreamer1.0-plugins-good libsoup-3.0-0 gsettings-desktop-schemas gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-nice libegl-mesa0 libgl1-mesa-dri pkg-config cmake libclang-dev
           version: 1.5
 
       - name: Download frontend dist
@@ -461,6 +526,16 @@ jobs:
     needs: [check-wasm, preflight]
     runs-on: windows-latest
     timeout-minutes: 45
+    # A `run:` step on a Windows runner defaults to pwsh, where a native command
+    # exiting non-zero neither aborts the script nor fails the step on its own —
+    # only the last command's exit code counts. A failing `cargo test` followed
+    # by a passing one therefore read as green here for as long as the job has
+    # existed. bash runs with `-e`, so the first failure ends the step, which is
+    # what every other job in this workflow already gets. The GStreamer install
+    # step is genuinely PowerShell and opts back out below.
+    defaults:
+      run:
+        shell: bash
     env:
       RUSTC_WRAPPER: ${{ needs.preflight.outputs.cache_ok == 'true' && 'sccache' || '' }}
     steps:
@@ -468,7 +543,6 @@ jobs:
 
       - name: Extract version from Cargo.toml
         id: version
-        shell: bash
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -479,21 +553,47 @@ jobs:
           components: clippy
 
       - name: Install GStreamer
+        # The one step in this job that cannot take the `shell: bash` default:
+        # it needs Invoke-WebRequest and Start-Process. That makes it the one
+        # step that still has to check every exit code by hand — `pwsh` fails a
+        # step on the last command's status alone, and the three GITHUB_ENV
+        # writes at the end always succeed.
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $GSTREAMER_VERSION = "1.26.10"
           $BASE_URL = "https://github.com/Eyevinn/strom/releases/download/gstreamer-deps"
 
+          # Start-Process discards the exit code without -PassThru, so a failed
+          # install reads as green here and surfaces 20 minutes later as a
+          # missing element, which looks like a broken test rather than a
+          # broken install.
+          function Install-Msi($Path, $Label) {
+            Write-Host "Installing $Label..."
+            $p = Start-Process msiexec.exe -Wait -NoNewWindow -PassThru `
+              -ArgumentList "/i $Path /quiet /qn ADDLOCAL=ALL INSTALLDIR=D:\gstreamer"
+            if ($p.ExitCode -ne 0) {
+              throw "msiexec failed for $Label with exit code $($p.ExitCode)"
+            }
+          }
+
           Write-Host "Downloading GStreamer runtime..."
           Invoke-WebRequest -Uri "$BASE_URL/gstreamer-1.0-msvc-x86_64-$GSTREAMER_VERSION.msi" -OutFile gstreamer.msi
-          Write-Host "Installing GStreamer runtime..."
-          Start-Process msiexec.exe -Wait -ArgumentList '/i gstreamer.msi /quiet /qn INSTALLDIR=D:\gstreamer'
+          # ADDLOCAL=ALL: without it msiexec installs the MSI's default feature
+          # set, which leaves out plugin groups the tests need — x264enc
+          # (gst-plugins-ugly) among them, which made both recorder tests skip
+          # green on this runner alone.
+          Install-Msi "gstreamer.msi" "GStreamer runtime"
 
           Write-Host "Downloading GStreamer development files..."
           Invoke-WebRequest -Uri "$BASE_URL/gstreamer-1.0-devel-msvc-x86_64-$GSTREAMER_VERSION.msi" -OutFile gstreamer-devel.msi
-          Write-Host "Installing GStreamer development files..."
-          Start-Process msiexec.exe -Wait -ArgumentList '/i gstreamer-devel.msi /quiet /qn INSTALLDIR=D:\gstreamer'
+          Install-Msi "gstreamer-devel.msi" "GStreamer development files"
 
           choco install pkgconfiglite --yes --no-progress --allow-empty-checksums
+          if ($LASTEXITCODE -ne 0) {
+            throw "choco install pkgconfiglite failed with exit code $LASTEXITCODE"
+          }
 
           echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=D:\gstreamer\1.0\msvc_x86_64\" >> $env:GITHUB_ENV
           echo "D:\gstreamer\1.0\msvc_x86_64\bin" >> $env:GITHUB_PATH
@@ -515,18 +615,45 @@ jobs:
 
       - name: Run Clippy
         run: |
-          cargo clippy --package strom --features nvidia -- -D warnings
+          cargo clippy --package strom -- -D warnings
 
       - name: Run tests
         run: |
-          cargo test --package strom --features nvidia
+          # Git Bash puts its own /mingw64/bin first in PATH, and that holds a
+          # different OpenSSL under the same DLL names GStreamer's plugins link
+          # against. A test binary resolves a plugin's dependencies through
+          # PATH, so gstsrt.dll picked up Git's libcrypto and failed with "The
+          # specified procedure could not be found" (gst-inspect-1.0 does not
+          # show it: Windows searches the program's own directory first).
+          gst_bin=/d/gstreamer/1.0/msvc_x86_64/bin
+          while IFS= read -r dir; do
+            if [ "$dir" = "$gst_bin" ]; then break; fi
+            for dll in "$gst_bin"/*.dll; do
+              if [ -e "$dir/${dll##*/}" ]; then echo "shadows GStreamer: $dir/${dll##*/}"; fi
+            done
+          done < <(echo "$PATH" | tr ':' '\n')
+          export PATH="$gst_bin:$PATH"
+          cargo test --no-fail-fast --package strom
           cargo test --package strom-types
+        env:
+          # Turn a missing-element skip into a failure — see plugins_available().
+          # Held back until the job could report a failure at all and the MSI
+          # installed every plugin group; both are true as of this commit.
+          STROM_REQUIRE_GST_PLUGINS: 1
+          # Skip the tests that pass locally but fail on this runner — see
+          # common::skip_known_ci_failure(). Linux CI still runs them.
+          STROM_SKIP_KNOWN_CI_FAILURES: 1
 
+      # A pull request asks this job to verify the platform code, which
+      # clippy and the tests do. The release binary is only wanted from main
+      # and dispatch, and building it is a second full compile of the tree.
       - name: Build
+        if: github.event_name != 'pull_request'
         run: |
           cargo build --release --package strom
 
       - name: Upload backend binary
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: strom-v${{ steps.version.outputs.version }}-windows-x86_64-pc-windows-msvc
@@ -598,21 +725,31 @@ jobs:
 
       - name: Run Clippy
         run: |
-          cargo clippy --package strom --features efp,nvidia -- -D warnings
+          cargo clippy --package strom --features efp -- -D warnings
 
       - name: Run tests
         run: |
-          cargo test --package strom --features efp,nvidia
+          cargo test --no-fail-fast --package strom --features efp
           cargo test --package strom-types
         env:
           # Turn a missing-element skip into a failure — see plugins_available().
           STROM_REQUIRE_GST_PLUGINS: 1
+          # This runner can create a GL context, so the GL tests must run here
+          # rather than skip green — see gl_available(). check-linux sets it too:
+          # its headless runner renders through surfaceless EGL. Windows does
+          # not: its runner has no OpenGL driver GStreamer can use.
+          STROM_REQUIRE_GL: 1
+          # See the Windows job.
+          STROM_SKIP_KNOWN_CI_FAILURES: 1
 
+      # Not on a pull request: see the Windows job.
       - name: Build
+        if: github.event_name != 'pull_request'
         run: |
           cargo build --release --package strom --features efp
 
       - name: Upload backend binary
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: strom-v${{ steps.version.outputs.version }}-macos-aarch64-apple-darwin

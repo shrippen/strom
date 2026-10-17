@@ -17,7 +17,8 @@
 //! - capsfilter: Sets output caps for proper codec negotiation
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
-use crate::gpu::{video_convert_mode, VideoConvertMode};
+use crate::gpu::{self, video_convert_mode, VideoConvertMode};
+use crate::gst::pipeline::properties::set_property_checked;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::collections::HashMap;
@@ -139,7 +140,7 @@ impl BlockBuilder for VideoEncBuilder {
             tune,
             rate_control,
             keyframe_interval,
-        );
+        )?;
 
         // Create parser for the codec (critical for proper MPEG-TS muxing and playback)
         let parser_name = get_parser_name(codec);
@@ -240,6 +241,7 @@ fn build_convert(
         gst::ElementFactory::make(factory)
             .name(name)
             .build()
+            .inspect(gpu::configure_video_convert)
             .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", factory, e)))
     };
 
@@ -509,10 +511,55 @@ fn get_software_encoder_list(codec: Codec) -> Vec<&'static str> {
     }
 }
 
+/// Apply one encoder property from its text form, checked against the spec.
+///
+/// The bare `set_property_from_str` this replaces panics rather than fails on a
+/// value the property's `GParamSpec` would have to clamp, and `bitrate`, `tune`
+/// and `keyframe_interval` come from the flow definition — so that panic was
+/// reachable straight from a request body (#769).
+fn set_encoder_property(
+    encoder: &gst::Element,
+    property_name: &str,
+    value: &str,
+) -> Result<(), BlockBuildError> {
+    set_property_checked(
+        encoder,
+        property_name,
+        &PropertyValue::String(value.to_string()),
+    )
+    .map_err(|reason| BlockBuildError::InvalidProperty(format!("{}: {}", property_name, reason)))
+}
+
+/// Clamp a value the block derived from `bitrate` to its target's range.
+///
+/// A cap such as `max-bitrate`, or a kbps-to-bits/s conversion, can fall
+/// outside the range of the property it is written to even when the client's
+/// `bitrate` was in range. Refusing the flow over a number the operator never
+/// supplied is wrong, so derived values are clamped here; the client's own
+/// values still go through `set_encoder_property` and are refused (#769).
+fn clamp_to_property_range(encoder: &gst::Element, property_name: &str, value: u64) -> u64 {
+    let Some(pspec) = encoder.find_property(property_name) else {
+        return value;
+    };
+    let (min, max) = if let Some(p) = pspec.downcast_ref::<gst::glib::ParamSpecUInt>() {
+        (u64::from(p.minimum()), u64::from(p.maximum()))
+    } else if let Some(p) = pspec.downcast_ref::<gst::glib::ParamSpecInt>() {
+        (p.minimum().max(0) as u64, p.maximum().max(0) as u64)
+    } else if let Some(p) = pspec.downcast_ref::<gst::glib::ParamSpecUInt64>() {
+        (p.minimum(), p.maximum())
+    } else if let Some(p) = pspec.downcast_ref::<gst::glib::ParamSpecInt64>() {
+        (p.minimum().max(0) as u64, p.maximum().max(0) as u64)
+    } else {
+        return value;
+    };
+    value.clamp(min, max.max(min))
+}
+
 /// Set encoder properties based on the encoder type.
 ///
-/// Uses `set_property_from_str` for all properties to avoid type mismatches.
-/// GStreamer parses the string value and converts to the correct type automatically.
+/// Values go in through their text form, which lets GStreamer's own deserializer
+/// handle the type conversion; `set_encoder_property` adds the range and
+/// writability check the raw setter signals by aborting the thread.
 fn set_encoder_properties(
     encoder: &gst::Element,
     encoder_name: &str,
@@ -521,29 +568,29 @@ fn set_encoder_properties(
     tune: &str,
     rate_control: RateControl,
     keyframe_interval: u32,
-) {
+) -> Result<(), BlockBuildError> {
     let bitrate_str = bitrate.to_string();
     let keyframe_str = keyframe_interval.to_string();
 
     // Bitrate mapping (different encoders use different property names and units)
     if encoder_name.starts_with("x264") || encoder_name.starts_with("x265") {
         // x264/x265: bitrate in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
         // x264/x265: speed-preset
         let preset_nick = map_quality_preset_x264(quality_preset);
-        encoder.set_property_from_str("speed-preset", preset_nick);
+        set_encoder_property(encoder, "speed-preset", preset_nick)?;
         // x264/x265: tune - optimize for specific use case
-        encoder.set_property_from_str("tune", tune);
+        set_encoder_property(encoder, "tune", tune)?;
         // VBV buffer capacity in ms. Set explicitly instead of relying on the
         // upstream default (600 ms) so single frames cannot spike far above
         // the target bitrate — large frame bursts overflow shallow buffers on
         // constrained viewer paths (observed as bursty packet loss on WebRTC).
         if encoder.has_property("vbv-buf-capacity") {
-            encoder.set_property_from_str("vbv-buf-capacity", "500");
+            set_encoder_property(encoder, "vbv-buf-capacity", "500")?;
         }
     } else if encoder_name.starts_with("nv") {
         // NVENC encoders: bitrate in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
 
         // NVENC: preset - different naming for nvautogpu* vs regular nv*
         // nvautogpu* uses p1-p7 (newer), regular nv* uses default/hp/hq (older)
@@ -552,21 +599,30 @@ fn set_encoder_properties(
         } else {
             map_quality_preset_nvenc_old(quality_preset)
         };
-        encoder.set_property_from_str("preset", preset_nick);
+        if encoder.has_property("preset") {
+            set_encoder_property(encoder, "preset", preset_nick)?;
+        }
 
-        // Rate control property name differs between encoder generations:
-        // nvautogpu* used "rate-control" before GStreamer 1.28, "rc-mode" since.
-        let rc_property = if encoder.find_property("rc-mode").is_some() {
-            "rc-mode"
-        } else {
-            "rate-control"
-        };
+        // Rate control is `rate-control` on some nv* encoders and `rc-mode` on
+        // others. Use whichever the element exposes: a name prefix covers only
+        // nvautogpu*, and the nvd3d11*/nvav1enc encoders we also select would
+        // otherwise fail the build on a property they lack (#769).
+        let rc_property = ["rate-control", "rc-mode"]
+            .into_iter()
+            .find(|name| encoder.has_property(name));
         let rc_nick = match rate_control {
             RateControl::CQP => "cqp",
             RateControl::VBR => "vbr",
             RateControl::CBR => "cbr",
         };
-        encoder.set_property_from_str(rc_property, rc_nick);
+        if let Some(rc_property) = rc_property {
+            set_encoder_property(encoder, rc_property, rc_nick)?;
+        } else {
+            warn!(
+                "{} has neither rate-control nor rc-mode; rate_control={} is not applied",
+                encoder_name, rc_nick
+            );
+        }
 
         // NVENC defaults leave VBR excursions unconstrained: max-bitrate is
         // unset and vbv-buffer-size=0 ("NVENC default"), so single frames can
@@ -577,47 +633,50 @@ fn set_encoder_properties(
         // - vbv-buffer-size (kbits): 0.5 s worth of target bitrate, bounding
         //   how large any single frame can get
         if encoder.has_property("max-bitrate") {
-            let max_bitrate = bitrate.saturating_mul(12) / 10;
-            encoder.set_property_from_str("max-bitrate", &max_bitrate.to_string());
+            let max_bitrate =
+                clamp_to_property_range(encoder, "max-bitrate", u64::from(bitrate) * 12 / 10);
+            set_encoder_property(encoder, "max-bitrate", &max_bitrate.to_string())?;
         }
         if encoder.has_property("vbv-buffer-size") {
-            encoder.set_property_from_str("vbv-buffer-size", &(bitrate / 2).to_string());
+            let vbv_size =
+                clamp_to_property_range(encoder, "vbv-buffer-size", u64::from(bitrate / 2));
+            set_encoder_property(encoder, "vbv-buffer-size", &vbv_size.to_string())?;
         }
 
         // NVENC: Disable adaptive I-frame insertion to respect gop-size
         if encoder.has_property("i-adapt") {
-            encoder.set_property_from_str("i-adapt", "false");
+            set_encoder_property(encoder, "i-adapt", "false")?;
         }
 
         // NVENC: Enable strict GOP mode for consistent keyframe intervals
         if encoder.has_property("strict-gop") {
-            encoder.set_property_from_str("strict-gop", "true");
+            set_encoder_property(encoder, "strict-gop", "true")?;
         }
 
         // NVENC: Disable B-frames for simpler GOP structure (helps with keyframe consistency)
         if encoder.has_property("b-frames") {
-            encoder.set_property_from_str("b-frames", "0");
+            set_encoder_property(encoder, "b-frames", "0")?;
         }
     } else if encoder_name.starts_with("qsv") {
         // Intel QSV: bitrate in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
         // QSV: target-usage for quality/speed tradeoff (1=best quality, 7=fastest)
         let target_usage = map_quality_preset_qsv(quality_preset);
-        encoder.set_property_from_str("target-usage", &target_usage.to_string());
+        set_encoder_property(encoder, "target-usage", &target_usage.to_string())?;
     } else if encoder_name.starts_with("va") {
         // VA-API: bitrate in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
     } else if encoder_name.starts_with("amf") {
         // AMD AMF: bitrate in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
         // AMF: usage for quality preset
         let usage = map_quality_preset_amf(quality_preset);
         if encoder.has_property("usage") {
-            encoder.set_property_from_str("usage", usage);
+            set_encoder_property(encoder, "usage", usage)?;
         }
     } else if encoder_name.starts_with("vtenc") {
         // Apple VideoToolbox (macOS): bitrate property is in kbps
-        encoder.set_property_from_str("bitrate", &bitrate_str);
+        set_encoder_property(encoder, "bitrate", &bitrate_str)?;
         // VideoToolbox: realtime mode disables frame buffering / lookahead.
         // That is a *latency* property, orthogonal to compression quality.
         // Strom is a live mixer/streamer (WebRTC/SRT), so drive it from the
@@ -626,7 +685,7 @@ fn set_encoder_properties(
         // latency in a live context.
         if encoder.has_property("realtime") {
             let realtime = tune == "zerolatency";
-            encoder.set_property_from_str("realtime", if realtime { "true" } else { "false" });
+            set_encoder_property(encoder, "realtime", if realtime { "true" } else { "false" })?;
         }
         // VideoToolbox rate control. Measured on Apple Silicon hardware
         // (GStreamer 1.28, 720p30, 5 Mbit/s target, noise content):
@@ -654,7 +713,7 @@ fn set_encoder_properties(
                 RateControl::CBR | RateControl::VBR => "cbr",
                 RateControl::CQP => "abr",
             };
-            encoder.set_property_from_str("rate-control", rc);
+            set_encoder_property(encoder, "rate-control", rc)?;
         }
         // data-rate-limits (the VT counterpart of a VBV cap, 1.2x target over
         // a 0.5 s window). vtenc skips it in CBR mode, and on Apple Silicon
@@ -663,7 +722,7 @@ fn set_encoder_properties(
         // VideoToolbox backends may honor it on the ABR (CQP) path.
         if bitrate > 0 && encoder.has_property("data-rate-limits") {
             let max_kbps = bitrate.saturating_mul(12) / 10;
-            encoder.set_property_from_str("data-rate-limits", &format!("{},0.5", max_kbps));
+            set_encoder_property(encoder, "data-rate-limits", &format!("{},0.5", max_kbps))?;
         }
         // VideoToolbox: cap the wall-clock gap between keyframes in addition
         // to the frame-based max-keyframe-interval set below. WebRTC clients
@@ -675,8 +734,11 @@ fn set_encoder_properties(
         // first (tighter); below it this duration holds the line.
         if keyframe_interval > 0 && encoder.has_property("max-keyframe-interval-duration") {
             let duration_ns = u64::from(keyframe_interval) * 1_000_000_000 / 30;
-            encoder
-                .set_property_from_str("max-keyframe-interval-duration", &duration_ns.to_string());
+            set_encoder_property(
+                encoder,
+                "max-keyframe-interval-duration",
+                &duration_ns.to_string(),
+            )?;
         }
         // VideoToolbox defaults to allow-frame-reordering=true, which emits
         // B-frames. B-frames cause non-monotonic PTS in decode order —
@@ -690,7 +752,7 @@ fn set_encoder_properties(
     } else if encoder_name.starts_with("v4l2") {
         // V4L2 encoders (Raspberry Pi, embedded Linux)
         // V4L2 encoders use extra-controls structure for bitrate (bits per second)
-        let bitrate_bps = bitrate * 1000;
+        let bitrate_bps = bitrate.saturating_mul(1000);
         if encoder.has_property("extra-controls") {
             let controls = gst::Structure::builder("extra-controls")
                 .field("video_bitrate", bitrate_bps)
@@ -703,26 +765,27 @@ fn set_encoder_properties(
         }
     } else if encoder_name == "svtav1enc" {
         // SVT-AV1: target-bitrate in kbps
-        encoder.set_property_from_str("target-bitrate", &bitrate_str);
+        set_encoder_property(encoder, "target-bitrate", &bitrate_str)?;
         // SVT-AV1: preset (0=slowest/best, 13=fastest)
         let preset = map_quality_preset_svtav1(quality_preset);
-        encoder.set_property_from_str("preset", &preset.to_string());
+        set_encoder_property(encoder, "preset", &preset.to_string())?;
     } else if encoder_name == "av1enc" {
         // libaom AV1: target-bitrate in kbps
-        encoder.set_property_from_str("target-bitrate", &bitrate_str);
+        set_encoder_property(encoder, "target-bitrate", &bitrate_str)?;
         // libaom: cpu-used (0=slowest, 8=fastest)
         let cpu_used = map_quality_preset_av1enc(quality_preset);
-        encoder.set_property_from_str("cpu-used", &cpu_used.to_string());
+        set_encoder_property(encoder, "cpu-used", &cpu_used.to_string())?;
     } else if encoder_name == "vp9enc" {
         // libvpx VP9: target-bitrate is in BITS/SEC, not kbps —
         // verified via `gst-inspect-1.0 vp9enc` on GStreamer 1.28:
         //   target-bitrate : Target bitrate (in bits/sec) ... Default: 256000
         // The block exposes bitrate in kbps so multiply by 1000.
-        let bitrate_bps = bitrate.saturating_mul(1000);
-        encoder.set_property_from_str("target-bitrate", &bitrate_bps.to_string());
+        let bitrate_bps =
+            clamp_to_property_range(encoder, "target-bitrate", u64::from(bitrate) * 1000);
+        set_encoder_property(encoder, "target-bitrate", &bitrate_bps.to_string())?;
         // VP9: cpu-used (0=slowest, 5=fastest for realtime)
         let cpu_used = map_quality_preset_vp9enc(quality_preset);
-        encoder.set_property_from_str("cpu-used", &cpu_used.to_string());
+        set_encoder_property(encoder, "cpu-used", &cpu_used.to_string())?;
 
         // libvpx VP9 needs explicit realtime knobs — defaults are tuned for
         // off-line "best quality" and burn entire CPUs on M1 / multi-core:
@@ -747,14 +810,14 @@ fn set_encoder_properties(
     // Keyframe interval (GOP size) - try different property names
     if keyframe_interval > 0 {
         if encoder.has_property("key-int-max") {
-            encoder.set_property_from_str("key-int-max", &keyframe_str);
+            set_encoder_property(encoder, "key-int-max", &keyframe_str)?;
         } else if encoder.has_property("gop-size") {
-            encoder.set_property_from_str("gop-size", &keyframe_str);
+            set_encoder_property(encoder, "gop-size", &keyframe_str)?;
         } else if encoder.has_property("keyint-max") {
-            encoder.set_property_from_str("keyint-max", &keyframe_str);
+            set_encoder_property(encoder, "keyint-max", &keyframe_str)?;
         } else if encoder.has_property("max-keyframe-interval") {
             // Apple VideoToolbox
-            encoder.set_property_from_str("max-keyframe-interval", &keyframe_str);
+            set_encoder_property(encoder, "max-keyframe-interval", &keyframe_str)?;
         }
     }
 
@@ -776,6 +839,8 @@ fn set_encoder_properties(
         "Set encoder properties: bitrate={} kbps, preset={}, tune={}, rate_control={:?}, gop={}",
         bitrate, quality_preset, tune, rate_control, keyframe_interval
     );
+
+    Ok(())
 }
 
 /// Map quality preset to x264/x265 speed-preset enum nick (string value for enum lookup).

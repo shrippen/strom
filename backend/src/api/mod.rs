@@ -1,6 +1,7 @@
 //! API handlers.
 
 pub mod blocks;
+pub mod devtools;
 pub mod discovery;
 pub mod elements;
 pub mod flows;
@@ -11,8 +12,10 @@ pub mod media;
 pub mod mediaplayer;
 pub mod network;
 pub mod osc;
+pub mod ports;
 pub mod probes;
 pub mod sdp_transform;
+pub mod stinger;
 pub mod system_clock;
 pub mod version;
 pub mod vision_mixer_page;

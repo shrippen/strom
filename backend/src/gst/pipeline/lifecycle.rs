@@ -1,5 +1,5 @@
 use super::{PipelineError, PipelineManager};
-use crate::gst::thread_priority;
+use crate::gst::{rtp_hdrext, thread_priority};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::sync::mpsc;
@@ -59,6 +59,11 @@ impl PipelineManager {
     pub fn start(&mut self) -> Result<PipelineState, PipelineError> {
         info!("Starting pipeline: {}", self.flow_name);
         info!("Pipeline has {} elements", self.elements.len());
+
+        // Disable RTP header extension aggregation before any state changes, so
+        // the handler is in place before decodebin can autoplug a depayloader.
+        // Works around gstreamer#5057, which aborts the whole process.
+        rtp_hdrext::install(&self.pipeline);
 
         // Set up thread priority handler FIRST (before any state changes)
         // This must be done before the pipeline starts so we catch all thread enter events
@@ -303,6 +308,9 @@ impl PipelineManager {
         // Past the deadline the thread is left behind with its pipeline, which
         // leaks — but a wedged pipeline leaks either way, and the caller gets an
         // answer instead of an HTTP handler that never returns.
+        // No underlay restart may be holding a source's state lock while the
+        // sinks go to PAUSED (see quiesce_underlay_restarts).
+        crate::gst::underlay::quiesce_underlay_restarts(self.pipeline.upcast_ref());
         let pipeline = self.pipeline.clone();
         match run_with_deadline(
             move || pipeline.set_state(gst::State::Null),
@@ -382,7 +390,11 @@ mod tests {
 
     #[test]
     fn run_with_deadline_reports_a_panic() {
-        let result = run_with_deadline(|| -> u32 { panic!("boom") }, Duration::from_secs(5));
+        // Generous on purpose: the channel only disconnects once the panic
+        // hook has run, and with RUST_BACKTRACE set (as in CI) that hook
+        // symbolicates a debug binary first, which took over 5 s under a
+        // loaded parallel test run. The call returns as soon as it unwinds.
+        let result = run_with_deadline(|| -> u32 { panic!("boom") }, Duration::from_secs(120));
         assert_eq!(result, Err(DeadlineError::Panicked));
     }
 }

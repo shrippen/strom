@@ -5,7 +5,7 @@ mod construction;
 pub(crate) mod effects;
 mod lifecycle;
 mod linking;
-mod properties;
+pub(crate) mod properties;
 mod srt;
 mod state;
 mod webrtc;
@@ -158,6 +158,11 @@ pub enum PipelineError {
 
     #[error("Endpoint conflict: {0}")]
     EndpointConflict(String),
+
+    /// The request was made against state that has changed since the client
+    /// read it (a stinger library edited by someone else).
+    #[error("{0}")]
+    Conflict(String),
 }
 
 /// Manages a single GStreamer pipeline for a flow.
@@ -260,6 +265,7 @@ impl Drop for PipelineManager {
         if self.null_state_wedged {
             return;
         }
+        crate::gst::underlay::quiesce_underlay_restarts(self.pipeline.upcast_ref());
         let pipeline = self.pipeline.clone();
         if let Err(lifecycle::DeadlineError::TimedOut) = lifecycle::run_with_deadline(
             move || pipeline.set_state(gst::State::Null),
@@ -334,25 +340,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_create_pipeline() {
-        gst::init().unwrap();
-        let flow = create_test_flow();
-        let events = EventBroadcaster::default();
-        let registry = BlockRegistry::new("test_blocks.json");
-        let manager = PipelineManager::new(
-            &flow,
-            events,
-            &registry,
-            default_test_ice_servers(),
-            "all".to_string(),
-            None,
-            std::path::PathBuf::from("./media"),
-            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-        );
-        assert!(manager.is_ok());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn test_start_stop_pipeline() {
         gst::init().unwrap();
         let flow = create_test_flow();
@@ -395,7 +382,7 @@ mod tests {
 
         let events = EventBroadcaster::default();
         let registry = BlockRegistry::new("test_blocks.json");
-        let manager = PipelineManager::new(
+        let result = PipelineManager::new(
             &flow,
             events,
             &registry,
@@ -405,7 +392,15 @@ mod tests {
             std::path::PathBuf::from("./media"),
             std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         );
-        assert!(manager.is_err());
+        match result {
+            Err(PipelineError::ElementCreation(msg)) => assert!(
+                msg.contains("src") && msg.contains("nonexistentelement"),
+                "error must name the element and its type: {}",
+                msg
+            ),
+            Err(other) => panic!("expected ElementCreation, got {:?}", other),
+            Ok(_) => panic!("a flow with an unknown element type was accepted"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

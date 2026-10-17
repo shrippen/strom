@@ -23,7 +23,8 @@ After cloning, install the Git hooks so formatting and linting run automatically
 
 ## Code quality standards
 
-All changes must pass these before being merged (the pre-commit hook and CI enforce them):
+All changes must pass these before being merged. CI enforces all three; the pre-commit hook runs
+formatting and clippy, but not the tests:
 
 ```bash
 cargo fmt --all                                       # formatting
@@ -43,6 +44,10 @@ CI runs the same checks on every pull request — format, clippy, tests, and a f
 3. Commit (hooks run automatically) and push to your fork.
 4. Open a pull request.
 
+### Block guidelines
+
+Blocks follow one contract: a block emits what it naturally produces, and each consuming block adapts its own input. Output blocks take encoded video and either raw or encoded audio. Read [BLOCK_GUIDELINES.md](BLOCK_GUIDELINES.md) before adding or changing a block.
+
 ### Pull request guidelines
 
 - Provide a clear description of *what* changed and *why*.
@@ -50,6 +55,14 @@ CI runs the same checks on every pull request — format, clippy, tests, and a f
 - Keep changes focused and atomic; add tests for new behaviour.
 - Update docs only where they are navigational — don't add code-describing docs (see [How this project is built](#how-this-project-is-built)).
 - Ensure all CI checks pass.
+
+### Draft pull requests
+
+A draft is fine for as long as someone is working on it. When it goes quiet, it gets asked about:
+
+- **After 2 weeks without activity**, the draft gets a comment asking whether it should stay open. Activity means new work: commits written in that time, or discussion on the PR. A rebase does not count, since it only moves the same commits forward.
+- **Any reply keeps it open.** If no one replies within another week, it is closed.
+- **Closing is not deleting.** The branch is kept, and the PR can be reopened at any time.
 
 ## Review
 

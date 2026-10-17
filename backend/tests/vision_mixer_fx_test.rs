@@ -3,9 +3,11 @@
 //! Builds a real vision mixer flow on the GPU (OpenGL) backend, starts it,
 //! and exercises the FX surface: FX slot presence, applying looks (input +
 //! master), shader wipe takes and master-FX takes. Runs on software GL
-//! (llvmpipe) — skips when the environment cannot actually create a GL
-//! context (probed like `shader_validation_test`; merely having the GL
-//! plugins installed is not enough, as headless CI runners show).
+//! (llvmpipe, through a surfaceless EGL context on a headless Linux host) —
+//! skips when the environment cannot actually create a GL context, unless
+//! `STROM_REQUIRE_GL` is set (see `common::gl_available`).
+
+pub mod common;
 
 use std::collections::HashMap;
 use strom::blocks::BlockRegistry;
@@ -16,45 +18,13 @@ use strom_types::Flow;
 use tempfile::NamedTempFile;
 
 const BLOCK_ID: &str = "vmfx";
+/// The vision mixer's overlay state is process-global and keyed by block ID,
+/// and the tests in this binary run concurrently, so each test needs its own.
+const LETTERBOX_BLOCK_ID: &str = "vmfx-letterbox";
 
-/// Probe whether this environment can actually render through GL: the GL
-/// plugins being installed is not enough — on headless CI runners the
-/// elements exist but no GL context can be created, and a GPU pipeline
-/// builds, starts and then silently never produces a frame. Same probe as
-/// `shader_validation_test`: a trivial shader-free GL run must reach EOS
-/// (no `glshader` in the probe — a shader compile bug must fail the test,
-/// not skip it).
-fn gl_environment_available() -> bool {
-    use gstreamer::prelude::*;
-    if gstreamer::ElementFactory::find("glvideomixerelement").is_none()
-        || gstreamer::ElementFactory::find("glshader").is_none()
-        || gstreamer::ElementFactory::find("gltestsrc").is_none()
-    {
-        return false;
-    }
-    let Ok(pipeline) = gstreamer::parse::launch(
-        "gltestsrc num-buffers=3 ! video/x-raw(memory:GLMemory),format=RGBA,width=64,height=64,framerate=30/1 ! fakesink sync=false",
-    ) else {
-        return false;
-    };
-    let Ok(pipeline) = pipeline.downcast::<gstreamer::Pipeline>() else {
-        return false;
-    };
-    if pipeline.set_state(gstreamer::State::Playing).is_err() {
-        return false;
-    }
-    let bus = pipeline.bus().expect("pipeline has a bus");
-    // 20 s budget: software GL context creation can be slow on loaded CI.
-    let ok = matches!(
-        bus.timed_pop_filtered(
-            gstreamer::ClockTime::from_seconds(20),
-            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-        ),
-        Some(msg) if matches!(msg.view(), gstreamer::MessageView::Eos(_))
-    );
-    let _ = pipeline.set_state(gstreamer::State::Null);
-    ok
-}
+/// The GL elements a GPU vision mixer needs. `common::gl_available` skips or
+/// fails on a missing one, and on a host that cannot create a GL context.
+const GL_ELEMENTS: &[&str] = &["glvideomixerelement", "glshader", "gltestsrc"];
 
 /// A flow with a single vision mixer block forced onto the GPU backend.
 /// Inputs are left unlinked — force-live compositors output regardless.
@@ -85,21 +55,18 @@ fn build_vm_flow() -> Flow {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vision_mixer_fx_engine_end_to_end() {
-    gstreamer::init().unwrap();
-
-    if !gl_environment_available() {
-        eprintln!("SKIP: GL environment unavailable (no context or GL elements missing)");
+    if !common::gl_available(GL_ELEMENTS) {
         return;
     }
 
     let temp_file = NamedTempFile::new().unwrap();
     let registry = BlockRegistry::new(temp_file.path());
-    let events = EventBroadcaster::new(10);
+    let events = EventBroadcaster::with_capacity(10);
     let media_path = std::env::temp_dir();
 
     let flow = build_vm_flow();
 
-    let mut manager = match PipelineManager::new(
+    let mut manager = PipelineManager::new(
         &flow,
         events,
         &registry,
@@ -108,19 +75,12 @@ async fn vision_mixer_fx_engine_end_to_end() {
         None,
         media_path,
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            // GL context creation can fail in truly headless environments.
-            eprintln!("SKIP: could not build GPU pipeline ({})", e);
-            return;
-        }
-    };
+    )
+    // GL was proven to render above, so a build or start failure here is the
+    // GPU mixer breaking, not the environment. It must fail, not skip.
+    .expect("GPU vision mixer pipeline builds");
 
-    if let Err(e) = manager.start() {
-        eprintln!("SKIP: could not start GPU pipeline ({})", e);
-        return;
-    }
+    manager.start().expect("GPU vision mixer pipeline starts");
 
     // Wait until the mixer actually produces output (its position query
     // answers). A fixed sleep is not enough on cold software-GL CI runners,
@@ -263,10 +223,7 @@ async fn vision_mixer_fx_engine_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wipe_between_letterboxed_sources_animates() {
     use gstreamer::prelude::*;
-    gstreamer::init().unwrap();
-
-    if !gl_environment_available() {
-        eprintln!("SKIP: GL environment unavailable (no context or GL elements missing)");
+    if !common::gl_available(GL_ELEMENTS) {
         return;
     }
     // As at server startup: the GL builder adapts to the detected driver
@@ -275,7 +232,7 @@ async fn wipe_between_letterboxed_sources_animates() {
 
     let mut flow = Flow::new("vm_letterbox_wipe");
     flow.blocks.push(strom_types::BlockInstance {
-        id: BLOCK_ID.to_string(),
+        id: LETTERBOX_BLOCK_ID.to_string(),
         block_definition_id: "builtin.vision_mixer".to_string(),
         name: None,
         properties: {
@@ -288,15 +245,19 @@ async fn wipe_between_letterboxed_sources_animates() {
                 "num_inputs".to_string(),
                 strom_types::PropertyValue::UInt(2),
             );
-            // 1280x720 canvas: the 1280-wide letterboxed sources land
-            // unscaled, mirroring production geometry at lower GL cost.
+            // 640x360 canvas: the 640-wide letterboxed sources land
+            // unscaled, mirroring production geometry at a GL cost a CI
+            // runner renders in real time. A runner that cannot keep up
+            // turns the wipe into a cut: the mixer runs to the clock, the
+            // rendering take slot falls behind it, and the mixer drops every
+            // masked frame as late and keeps the last unmasked one on screen.
             p.insert(
                 "pgm_resolution".to_string(),
-                strom_types::PropertyValue::String("1280x720".to_string()),
+                strom_types::PropertyValue::String("640x360".to_string()),
             );
             p.insert(
                 "multiview_resolution".to_string(),
-                strom_types::PropertyValue::String("640x360".to_string()),
+                strom_types::PropertyValue::String("320x180".to_string()),
             );
             // Download PGM to system memory so the appsink can map pixels.
             p.insert(
@@ -333,7 +294,7 @@ async fn wipe_between_letterboxed_sources_animates() {
         "capsfilter",
         vec![(
             "caps",
-            PV::String("video/x-raw,width=1280,height=534,framerate=30/1".into()),
+            PV::String("video/x-raw,width=640,height=266,framerate=30/1".into()),
         )],
     ));
     flow.elements.push(elem(
@@ -349,7 +310,7 @@ async fn wipe_between_letterboxed_sources_animates() {
         "capsfilter",
         vec![(
             "caps",
-            PV::String("video/x-raw,width=1280,height=546,framerate=30/1".into()),
+            PV::String("video/x-raw,width=640,height=274,framerate=30/1".into()),
         )],
     ));
     flow.elements.push(elem(
@@ -363,10 +324,10 @@ async fn wipe_between_letterboxed_sources_animates() {
     ));
     for (from, to) in [
         ("src0:src", "caps0:sink"),
-        ("caps0:src", "vmfx:video_in_0"),
+        ("caps0:src", "vmfx-letterbox:video_in_0"),
         ("src1:src", "caps1:sink"),
-        ("caps1:src", "vmfx:video_in_1"),
-        ("vmfx:pgm_out", "pgmsink:sink"),
+        ("caps1:src", "vmfx-letterbox:video_in_1"),
+        ("vmfx-letterbox:pgm_out", "pgmsink:sink"),
     ] {
         flow.links.push(strom_types::Link {
             from: from.to_string(),
@@ -374,11 +335,20 @@ async fn wipe_between_letterboxed_sources_animates() {
         });
     }
 
+    // The vision mixer re-fits a source's rect to its aspect once the source's
+    // caps arrive, from the GLib main context (as in the running server). This
+    // test is a tokio test, so nothing would iterate that context: run it.
+    let main_loop = gstreamer::glib::MainLoop::new(None, false);
+    let main_loop_thread = {
+        let ml = main_loop.clone();
+        std::thread::spawn(move || ml.run())
+    };
+
     let temp_file = NamedTempFile::new().unwrap();
     let registry = BlockRegistry::new(temp_file.path());
-    let events = EventBroadcaster::new(10);
+    let events = EventBroadcaster::with_capacity(10);
 
-    let mut manager = match PipelineManager::new(
+    let mut manager = PipelineManager::new(
         &flow,
         events,
         &registry,
@@ -387,17 +357,10 @@ async fn wipe_between_letterboxed_sources_animates() {
         None,
         std::env::temp_dir(),
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("SKIP: could not build GPU pipeline ({})", e);
-            return;
-        }
-    };
-    if let Err(e) = manager.start() {
-        eprintln!("SKIP: could not start GPU pipeline ({})", e);
-        return;
-    }
+    )
+    // GL was proven to render above: fail, do not skip.
+    .expect("GPU vision mixer pipeline builds");
+    manager.start().expect("GPU vision mixer pipeline starts");
 
     // Let caps probes settle so pads get their aspect-fitted rects.
     tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
@@ -424,43 +387,68 @@ async fn wipe_between_letterboxed_sources_animates() {
             "BGRA" | "BGRx" => (2, 1, 0),
             other => panic!("unexpected PGM format {}", other),
         };
+        // Sample every STRIDE-th pixel rather than all of them. These are flat
+        // colour fields, so the fractions are unchanged, but the scan runs in a
+        // sixteenth of the time — and this loop runs unoptimised under `cargo
+        // test`, between two pulls from an appsink set to `max-buffers=1
+        // drop=true`. A slow scan there is not merely slow: the wipe being
+        // measured lasts two seconds, and a scan that outlasts it makes the
+        // observer skip from the frame before the wipe to the frame after it and
+        // conclude the wipe never animated.
+        const STRIDE: usize = 4;
         let mut white = 0u64;
         let mut red = 0u64;
-        let total = (w * h) as u64;
-        for px in map.chunks_exact(4).take(w * h) {
+        let mut total = 0u64;
+        for px in map.as_chunks::<4>().0.iter().take(w * h).step_by(STRIDE) {
             let (r, g, b) = (px[ri], px[gi], px[bi]);
             if r > 200 && g > 200 && b > 200 {
                 white += 1;
             } else if r > 200 && g < 80 && b < 80 {
                 red += 1;
             }
+            total += 1;
         }
-        (white as f64 / total as f64, red as f64 / total as f64)
+        let total = total.max(1) as f64;
+        (white as f64 / total, red as f64 / total)
     };
 
     // Debug aid: verify the source branches are actually linked.
-    for name in ["vmfx:queue_0", "vmfx:queue_1"] {
+    for name in ["vmfx-letterbox:queue_0", "vmfx-letterbox:queue_1"] {
         let q = manager.pipeline().by_name(name).expect(name);
         let linked = q.static_pad("sink").map(|p| p.is_linked()).unwrap_or(false);
         eprintln!("{} sink linked: {}", name, linked);
     }
 
-    // First frame: a cold software-GL CI runner can take many seconds to
-    // produce it (GL context creation + llvmpipe shader JIT) — poll
-    // generously instead of a single short pull.
-    let first = {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(s) = appsink.try_pull_sample(gstreamer::ClockTime::from_mseconds(500)) {
-                break s;
+    // Opening picture: wait for the mixer to be composing PGM, not merely for a
+    // frame to exist. A cold software-GL CI runner takes many seconds to reach
+    // steady state (GL context creation + llvmpipe shader JIT), and the frames it
+    // emits on the way there are black — the compositor is running before the
+    // source pads have delivered anything. The fixed settle sleep above is not a
+    // guarantee, so poll for the picture itself rather than asserting on whichever
+    // frame happens to arrive first. The picture must also be letterboxed, not
+    // stretched over the whole canvas: the source's aspect-fitted rect is applied
+    // once its caps arrive, and a take started before that has its layout
+    // re-applied under it mid-wipe.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (w0, r0) = loop {
+        if let Some(s) = appsink.try_pull_sample(gstreamer::ClockTime::from_mseconds(500)) {
+            let f = fractions_of(&s);
+            if f.0 > 0.5 && f.0 < 0.9 {
+                break f;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PGM never settled on the letterboxed white source within 30s, last frame white={:.2} red={:.2}",
+                f.0,
+                f.1
+            );
+        } else {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no PGM frame within 30s of start"
             );
         }
     };
-    let (w0, r0) = fractions_of(&first);
     assert!(w0 > 0.5, "PGM should start mostly white, got {}", w0);
     assert!(r0 < 0.05, "no red expected before take, got {}", r0);
 
@@ -500,13 +488,13 @@ async fn wipe_between_letterboxed_sources_animates() {
 
     // --- classic orientation: 2.40:1 -> 2.34:1 (outgoing does not cover) ---
     manager
-        .trigger_transition(BLOCK_ID, 0, 1, "wipe_left", 2000)
+        .trigger_transition(LETTERBOX_BLOCK_ID, 0, 1, "wipe_left", 2000)
         .expect("wipe 0->1");
     // Mirror the API handler: persist the PGM/PVW swap after the take —
     // trigger_transition reads the authoritative bus state from overlay
     // state, so without this the next take would re-run the same pair.
     manager
-        .update_vision_mixer_after_take(BLOCK_ID, Some(1), Some(0), 2)
+        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(1), Some(0), 2)
         .expect("after take 0->1");
     let (animated, w_end, r_end) = observe_wipe(true);
     eprintln!(
@@ -526,10 +514,10 @@ async fn wipe_between_letterboxed_sources_animates() {
 
     // --- inverted orientation: 2.34:1 -> 2.40:1 (outgoing covers) ---
     manager
-        .trigger_transition(BLOCK_ID, 1, 0, "wipe_left", 2000)
+        .trigger_transition(LETTERBOX_BLOCK_ID, 1, 0, "wipe_left", 2000)
         .expect("wipe 1->0");
     manager
-        .update_vision_mixer_after_take(BLOCK_ID, Some(0), Some(1), 2)
+        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(0), Some(1), 2)
         .expect("after take 1->0");
     let (animated2, w_end2, r_end2) = observe_wipe(false);
     eprintln!(
@@ -537,7 +525,10 @@ async fn wipe_between_letterboxed_sources_animates() {
         animated2, w_end2, r_end2
     );
     // Debug: pad + fx state at the broken end state.
-    let mixer = manager.pipeline().by_name("vmfx:mixer").expect("mixer");
+    let mixer = manager
+        .pipeline()
+        .by_name("vmfx-letterbox:mixer")
+        .expect("mixer");
     for i in 0..2 {
         let pad = mixer.static_pad(&format!("sink_{}", i)).unwrap();
         eprintln!(
@@ -554,7 +545,7 @@ async fn wipe_between_letterboxed_sources_animates() {
     for i in 0..2 {
         let fx = manager
             .pipeline()
-            .by_name(&format!("vmfx:fx_take_{}", i))
+            .by_name(&format!("vmfx-letterbox:fx_take_{}", i))
             .unwrap();
         let u = fx.property::<Option<gstreamer::Structure>>("uniforms");
         eprintln!("fx_take_{} uniforms: {:?}", i, u.map(|s| s.to_string()));
@@ -576,4 +567,6 @@ async fn wipe_between_letterboxed_sources_animates() {
 
     manager.stop().expect("stop");
     drop(manager);
+    main_loop.quit();
+    main_loop_thread.join().expect("main loop thread");
 }

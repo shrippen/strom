@@ -120,7 +120,7 @@ async fn render_vision_mixer_page(
 
     // Get current state from live overlay state or fall back to defaults.
     // `None` means the bus is showing a PiP (see `pvw_pip` / `pgm_pip` below).
-    let overlay = overlay::get_overlay_state(block_id);
+    let overlay = overlay::get_overlay_state(flow_id, block_id);
     let initial_pgm: Option<usize> = overlay.as_ref().map(|s| s.pgm_input()).unwrap_or_else(|| {
         Some(vm_props::parse_initial_pgm(
             &vm_block.properties,
@@ -188,6 +188,11 @@ async fn render_vision_mixer_page(
         "initial_pgm": initial_pgm,
         "initial_pvw": initial_pvw,
         "num_dsk_inputs": num_dsk_inputs,
+        "stinger_enabled": vm_props::parse_bool(
+            &vm_block.properties,
+            strom_types::stinger::ENABLE_STINGER_PROPERTY,
+            false,
+        ),
         "ftb_active": ftb_active,
         "dsk_states": dsk_states,
         "overlay_alpha": overlay_alpha,

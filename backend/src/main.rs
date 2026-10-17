@@ -10,13 +10,40 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, reload, util::SubscriberInit
 
 use strom_types::flow::GStreamerClockType;
 
-use strom::{auth, config::Config, create_app_with_config, state::AppState};
+use strom::{
+    auth,
+    config::{Config, LogFormat},
+    create_app_with_config,
+    state::AppState,
+};
 
-/// Initialize logging with optional file output and configurable log level.
+// On a laptop with two GPUs (Intel or AMD integrated plus a discrete card) the
+// driver runs a program on the integrated GPU unless the program asks for the
+// discrete one. These two exports are how a program asks: the NVIDIA and AMD
+// drivers look them up in the executable at process start. Without them
+// GStreamer's OpenGL lands on the integrated GPU while NVENC/NVDEC run on the
+// NVIDIA card, so every GL frame crosses between the two. Machines with one GPU
+// ignore them. They must live in the executable itself, and `build.rs` passes
+// `/EXPORT:` for each, since a Rust binary exports nothing on its own.
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 1;
+
+#[cfg(windows)]
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+/// Initialize logging with optional file output, configurable log level, and stdout format.
 /// Returns the reload handle and the initial filter string for runtime changes.
+///
+/// `stdout_log_format` only affects stdout; the file layer always stays human-readable.
+/// The reload filter is global and gates all layers (see `.strom.toml.example`).
 fn init_logging(
     log_file: Option<&PathBuf>,
     log_level: Option<&String>,
+    stdout_log_format: LogFormat,
 ) -> anyhow::Result<(strom::state::LogReloadHandle, String)> {
     use time::UtcOffset;
     use tracing_subscriber::fmt::time::OffsetTime;
@@ -57,39 +84,79 @@ fn init_logging(
                 .unwrap_or(std::ffi::OsStr::new("strom.log")),
         );
 
-        // Create layers: stdout + file with local time
-        let stdout_layer = fmt::layer()
-            .with_target(false)
-            .with_timer(timer.clone())
-            .compact()
-            .with_writer(std::io::stdout);
+        // File layer always stays compact. Built in each arm because the stdout
+        // layer's type differs between compact and JSON.
+        match stdout_log_format {
+            LogFormat::Compact => {
+                let stdout_layer = fmt::layer()
+                    .with_target(false)
+                    .with_timer(timer.clone())
+                    .compact()
+                    .with_writer(std::io::stdout);
 
-        let file_layer = fmt::layer()
-            .with_target(true)
-            .with_timer(timer)
-            .with_ansi(false)
-            .with_writer(file_appender);
+                let file_layer = fmt::layer()
+                    .with_target(true)
+                    .with_timer(timer)
+                    .with_ansi(false)
+                    .with_writer(file_appender);
 
-        // Combine layers
-        tracing_subscriber::registry()
-            .with(reload_filter)
-            .with(stdout_layer)
-            .with(file_layer)
-            .init();
+                tracing_subscriber::registry()
+                    .with(reload_filter)
+                    .with(stdout_layer)
+                    .with(file_layer)
+                    .init();
+            }
+            LogFormat::Json => {
+                let stdout_layer = fmt::layer()
+                    .with_target(true)
+                    .with_timer(timer.clone())
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(std::io::stdout);
+
+                let file_layer = fmt::layer()
+                    .with_target(true)
+                    .with_timer(timer)
+                    .with_ansi(false)
+                    .with_writer(file_appender);
+
+                tracing_subscriber::registry()
+                    .with(reload_filter)
+                    .with(stdout_layer)
+                    .with(file_layer)
+                    .init();
+            }
+        }
 
         eprintln!("Logging to file: {}", log_path.display());
     } else {
-        // Stdout only with local time
-        let stdout_layer = fmt::layer()
-            .with_target(false)
-            .with_timer(timer)
-            .compact()
-            .with_writer(std::io::stdout);
+        match stdout_log_format {
+            LogFormat::Compact => {
+                let stdout_layer = fmt::layer()
+                    .with_target(false)
+                    .with_timer(timer)
+                    .compact()
+                    .with_writer(std::io::stdout);
 
-        tracing_subscriber::registry()
-            .with(reload_filter)
-            .with(stdout_layer)
-            .init();
+                tracing_subscriber::registry()
+                    .with(reload_filter)
+                    .with(stdout_layer)
+                    .init();
+            }
+            LogFormat::Json => {
+                let stdout_layer = fmt::layer()
+                    .with_target(true)
+                    .with_timer(timer)
+                    .json()
+                    .flatten_event(true)
+                    .with_writer(std::io::stdout);
+
+                tracing_subscriber::registry()
+                    .with(reload_filter)
+                    .with(stdout_layer)
+                    .init();
+            }
+        }
     }
 
     Ok((reload_handle, default_filter_str))
@@ -224,6 +291,10 @@ enum Commands {
         /// Password to hash (if not provided, will read from stdin)
         password: Option<String>,
     },
+    /// Run the CUDA-GL interop probe pipeline and exit (used by Strom itself)
+    #[cfg(not(target_os = "macos"))]
+    #[command(name = strom::gpu::INTEROP_PROBE_SUBCOMMAND, hide = true)]
+    GpuInteropProbe,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -260,6 +331,14 @@ fn main() -> anyhow::Result<()> {
         match command {
             Commands::HashPassword { password } => {
                 return handle_hash_password(password.as_deref());
+            }
+            #[cfg(not(target_os = "macos"))]
+            Commands::GpuInteropProbe => {
+                if let Err(e) = strom::gpu::run_interop_probe() {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
             }
         }
     }
@@ -308,8 +387,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Load configuration early to get log_file setting
-    let config = Config::from_figment(
+    // Load configuration early to get log_file setting.
+    // Mutable because the CEF debug port is resolved against the flags already
+    // in the environment further down, and the proxy has to follow the port
+    // that is really in force.
+    let mut config = Config::from_figment(
         args.host,
         args.port,
         args.data_dir.clone(),
@@ -326,12 +408,16 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     });
 
-    // Initialize logging with optional file output and log level
-    let (log_reload_handle, default_log_filter) =
-        init_logging(config.log_file.as_ref(), config.log_level.as_ref()).unwrap_or_else(|e| {
-            eprintln!("Failed to initialize logging: {}", e);
-            std::process::exit(1);
-        });
+    // Initialize logging with optional file output, log level, and stdout format
+    let (log_reload_handle, default_log_filter) = init_logging(
+        config.log_file.as_ref(),
+        config.log_level.as_ref(),
+        config.stdout_log_format,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to initialize logging: {}", e);
+        std::process::exit(1);
+    });
 
     let (blank_credentials, blank_settings): (Vec<String>, Vec<String>) = blank_env_vars
         .into_iter()
@@ -351,40 +437,15 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Give CEF (the `cefsrc` element behind HTML sources and DSK graphics) a
-    // per-instance cache directory. Native runs otherwise get Chromium's
-    // default, which warns
-    //
-    //   Please customize CefSettings.root_cache_path for your application. Use
-    //   of the default value may lead to unintended process singleton behavior.
-    //
-    // and leaves Chromium's process singleton shared: a second Strom instance
-    // on the same machine cannot start any cefsrc element, failing in
-    // gst_base_src_start() so the flow start returns 500 "Element failed to
-    // change its state". The resolved path is per data directory, so instances
-    // stay isolated while keeping a warm profile across restarts, which also
-    // cuts repeat flow-start latency. GST_CEF_CACHE_LOCATION always wins if it
-    // is already set — the strom-full Docker image sets it in its entrypoint.
-    //
-    // set_var is safe here: this is early in main(), before any thread is
-    // spawned and before GStreamer (and therefore CEF) is initialized.
-    match std::env::var_os("GST_CEF_CACHE_LOCATION") {
-        Some(existing) => info!(
-            "CEF cache directory: {} (from GST_CEF_CACHE_LOCATION)",
-            PathBuf::from(existing).display()
-        ),
-        None => {
-            if let Err(e) = std::fs::create_dir_all(&config.cef_cache_path) {
-                warn!(
-                    "Could not create CEF cache directory {}: {}",
-                    config.cef_cache_path.display(),
-                    e
-                );
-            }
-            std::env::set_var("GST_CEF_CACHE_LOCATION", &config.cef_cache_path);
-            info!("CEF cache directory: {}", config.cef_cache_path.display());
-        }
-    }
+    // CEF (the `cefsrc` element behind HTML sources and DSK graphics) reads
+    // its switches once, from the environment, so it is set up here: early,
+    // before any thread is spawned and before GStreamer is initialized.
+    config.cef_debug_port = strom::cef_flags::configure(strom::cef_flags::CefSetup {
+        cache_path: &config.cef_cache_path,
+        debug_port: config.cef_debug_port,
+        full_devtools: config.cef_full_devtools,
+        auth_configured: auth::AuthConfig::is_configured_in_env(),
+    });
 
     // Determine if GUI should be enabled
     #[cfg(not(feature = "no-gui"))]
@@ -466,7 +527,7 @@ fn run_with_gui(
     let shutdown_flag_gui = shutdown_flag.clone();
 
     // Create auth config and generate native GUI token if auth is enabled
-    let mut auth_config = auth::AuthConfig::from_env();
+    let mut auth_config = auth::AuthConfig::load(&config.data_dir, config.tls_cert.is_some())?;
     let native_gui_token = if auth_config.enabled {
         let token = auth_config.generate_native_gui_token();
         info!("Generated native GUI token for auto-authentication");
@@ -492,17 +553,21 @@ fn run_with_gui(
         gstrsinter::plugin_register_static().expect("Could not register inter plugins");
         gstrsrtp::plugin_register_static().expect("Could not register rtp plugins");
         gstrsaudiofx::plugin_register_static().expect("Could not register audiofx plugins");
+        gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
         gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
         #[cfg(feature = "efp")]
         gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
         // Detect GPU capabilities for video conversion mode selection
         // This tests CUDA-GL interop to determine if autovideoconvert works
+        #[cfg(not(target_os = "macos"))]
+        strom::gpu::run_interop_probe_in_this_executable();
         strom::gpu::detect_gpu_capabilities();
 
         // Report WebRTC ICE availability. WHIP/WHEP blocks refuse to build
         // without it, so say so at startup rather than at first flow start.
         strom::gst::ice_preflight::log_ice_availability();
+        strom::system_clock::log_clock_discipline();
 
         // Start GLib main loop in background thread for bus watch callbacks
         start_glib_main_loop();
@@ -522,6 +587,8 @@ fn run_with_gui(
                 config.ice_servers.clone(),
                 config.ice_transport_policy.clone(),
                 config.sap_multicast_addresses.clone(),
+                config.structured_events,
+                config.include_high_frequency_events,
             )
             .await
             .expect("Failed to initialize PostgreSQL storage")
@@ -534,8 +601,28 @@ fn run_with_gui(
                 config.ice_servers.clone(),
                 config.ice_transport_policy.clone(),
                 config.sap_multicast_addresses.clone(),
+                config.structured_events,
+                config.include_high_frequency_events,
             )
         };
+        state
+            .configure_port_pool(
+                config.pool_ports.clone(),
+                strom::ports::PortReservationStore::new(
+                    config
+                        .flows_path
+                        .parent()
+                        .unwrap_or(std::path::Path::new(".")),
+                ),
+                config.port_lease_ttl_seconds,
+                config.probe_before_handout,
+            )
+            .await
+            .expect("failed to configure port pool");
+        state
+            .media_downloads()
+            .configure(config.media_download_settings());
+        strom::media_download::spawn_temp_file_sweeper(state.media_path().clone());
         state
             .load_from_storage()
             .await
@@ -567,6 +654,7 @@ fn run_with_gui(
             auth_config,
             config.cors_allowed_origins.clone(),
             config.port,
+            devtools_config(&config),
         )
         .await;
 
@@ -655,48 +743,78 @@ fn run_headless_entry(
 
     #[cfg(target_os = "macos")]
     {
+        // `gst_macos_main` does not run this closure on the process main
+        // thread -- it takes that thread for the CFRunLoop and calls us on a
+        // thread it creates itself, which gets the raw pthread default stack
+        // (512 KB on macOS) rather than the main thread's 8 MB.
         gstreamer::macos_main(move || {
-            // `gst_macos_main` does not run this closure on the process main
-            // thread -- it takes that thread for the CFRunLoop and calls us on a
-            // thread it creates itself, which gets the raw pthread default stack
-            // (512 KB on macOS) rather than the main thread's 8 MB.
-            // `create_app_with_config` builds the OpenAPI spec, and utoipa's
-            // generated `openapi_spec()` is one deeply nested expression covering
-            // every `StromEvent` variant; it overflows that stack and kills the
-            // process with exit 132 and no panic message, before the HTTP server
-            // ever binds.
-            //
-            // Spawning a Rust thread is what fixes it, not the size below:
-            // `std::thread` defaults to a 2 MiB stack, and that is already
-            // enough today (measured -- it starts and binds normally without an
-            // explicit size). The 8 MB is headroom for the spec continuing to
-            // grow, so keep it, but do not remove the indirection: calling
-            // `run_headless` directly here dies with exit 132.
-            std::thread::Builder::new()
-                .name("strom-headless".into())
-                .stack_size(8 * 1024 * 1024)
-                .spawn(move || {
-                    run_headless(
-                        config,
-                        no_auto_restart,
-                        log_reload_handle,
-                        default_log_filter,
-                    )
-                })
-                .expect("failed to spawn headless thread")
-                .join()
-                .expect("headless thread panicked")
+            run_headless_on_own_thread(
+                config,
+                no_auto_restart,
+                log_reload_handle,
+                default_log_filter,
+            )
         })
     }
     #[cfg(not(target_os = "macos"))]
     {
-        run_headless(
+        // Windows gives the main thread a 1 MB stack, which a debug build
+        // overflows the same way.
+        run_headless_on_own_thread(
             config,
             no_auto_restart,
             log_reload_handle,
             default_log_filter,
         )
     }
+}
+
+/// Run [`run_headless`] on a thread with a known, large stack.
+///
+/// `create_app_with_config` builds the OpenAPI spec, and utoipa's generated
+/// `openapi_spec()` is one deeply nested expression covering every
+/// `StromEvent` variant. On a small stack it overflows and kills the process
+/// before the HTTP server ever binds: on macOS (the `gst_macos_main` thread,
+/// 512 KB) with exit 132 and no panic message, and on Windows (main thread,
+/// 1 MB) in a debug build with "thread 'main' has overflowed its stack".
+///
+/// Spawning a Rust thread is what fixes it, not the size below:
+/// `std::thread` defaults to a 2 MiB stack, and that is already enough today
+/// (measured on macOS -- it starts and binds normally without an explicit
+/// size). The 8 MB is headroom for the spec continuing to grow, so keep it,
+/// but do not remove the indirection.
+fn run_headless_on_own_thread(
+    config: Config,
+    no_auto_restart: bool,
+    log_reload_handle: strom::state::LogReloadHandle,
+    default_log_filter: String,
+) -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("strom-headless".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            run_headless(
+                config,
+                no_auto_restart,
+                log_reload_handle,
+                default_log_filter,
+            )
+        })
+        .expect("failed to spawn headless thread")
+        .join()
+        .expect("headless thread panicked")
+}
+
+/// The DevTools proxy's view of the configuration.
+///
+/// Whether the link it hands out says `ws://` or `wss://` follows this
+/// instance's own TLS, unless something in front of us says otherwise.
+fn devtools_config(config: &Config) -> strom::api::devtools::DevToolsState {
+    strom::api::devtools::DevToolsState::new(strom::api::devtools::DevToolsConfig {
+        debug_port: config.cef_debug_port,
+        tls: config.tls_cert.is_some() && config.tls_key.is_some(),
+        full_devtools: config.cef_full_devtools,
+    })
 }
 
 #[tokio::main]
@@ -719,17 +837,21 @@ async fn run_headless(
     gstrsinter::plugin_register_static().expect("Could not register inter plugins");
     gstrsrtp::plugin_register_static().expect("Could not register rtp plugins");
     gstrsaudiofx::plugin_register_static().expect("Could not register audiofx plugins");
+    gstisobmff::plugin_register_static().expect("Could not register isobmff plugins");
     gst_plugins_lsp::plugin_register_static().expect("Could not register lsp-dsp-rs plugins");
     #[cfg(feature = "efp")]
     gst_plugin_efp::plugin_register_static().expect("Could not register efp mux/demux plugins");
 
     // Detect GPU capabilities for video conversion mode selection
     // This tests CUDA-GL interop to determine if autovideoconvert works
+    #[cfg(not(target_os = "macos"))]
+    strom::gpu::run_interop_probe_in_this_executable();
     strom::gpu::detect_gpu_capabilities();
 
     // Report WebRTC ICE availability. WHIP/WHEP blocks refuse to build
     // without it, so say so at startup rather than at first flow start.
     strom::gst::ice_preflight::log_ice_availability();
+    strom::system_clock::log_clock_discipline();
 
     // Start GLib main loop in background thread for bus watch callbacks
     start_glib_main_loop();
@@ -747,6 +869,8 @@ async fn run_headless(
             config.ice_servers.clone(),
             config.ice_transport_policy.clone(),
             config.sap_multicast_addresses.clone(),
+            config.structured_events,
+            config.include_high_frequency_events,
         )
         .await?
     } else {
@@ -758,8 +882,27 @@ async fn run_headless(
             config.ice_servers.clone(),
             config.ice_transport_policy.clone(),
             config.sap_multicast_addresses.clone(),
+            config.structured_events,
+            config.include_high_frequency_events,
         )
     };
+    state
+        .configure_port_pool(
+            config.pool_ports.clone(),
+            strom::ports::PortReservationStore::new(
+                config
+                    .flows_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new(".")),
+            ),
+            config.port_lease_ttl_seconds,
+            config.probe_before_handout,
+        )
+        .await?;
+    state
+        .media_downloads()
+        .configure(config.media_download_settings());
+    strom::media_download::spawn_temp_file_sweeper(state.media_path().clone());
     state.load_from_storage().await?;
 
     // Store the log reload handle so log levels can be changed at runtime
@@ -785,9 +928,10 @@ async fn run_headless(
     // Create the HTTP app BEFORE auto-restart, then bind AFTER
     let app = create_app_with_config(
         state.clone(),
-        auth::AuthConfig::from_env(),
+        auth::AuthConfig::load(&config.data_dir, config.tls_cert.is_some())?,
         config.cors_allowed_origins.clone(),
         config.port,
+        devtools_config(&config),
     )
     .await;
 

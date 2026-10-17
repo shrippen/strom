@@ -211,6 +211,21 @@ impl PipelineManager {
             return Ok(());
         }
 
+        // HTML Input: cefsrc loads a new URL into a running browser, but does
+        // not flag the property as mutable in PLAYING.
+        if let Some(result) = crate::blocks::builtin::html_input::try_apply_live_url(
+            element,
+            element_id,
+            property_name,
+            value,
+        ) {
+            return result.map_err(|reason| PipelineError::InvalidProperty {
+                element: element_id.to_string(),
+                property: property_name.to_string(),
+                reason,
+            });
+        }
+
         // Live Audio Router: `routing_matrix` is one JSON string describing the
         // gain of every crosspoint, and each crosspoint is its own `volume`
         // element. One property write therefore fans out to many elements —
@@ -300,93 +315,13 @@ impl PipelineManager {
                     reason: "Property not found".to_string(),
                 })?;
 
-        let type_name = pspec.value_type().name();
-
-        // Get property value based on type
-        let value = match type_name.to_string().as_str() {
-            "gchararray" => {
-                let v = element.property::<Option<String>>(property_name);
-                v.map(PropertyValue::String)
-                    .unwrap_or(PropertyValue::String(String::new()))
+        read_property(element.upcast_ref(), &pspec).map_err(|reason| {
+            PipelineError::InvalidProperty {
+                element: element_id.to_string(),
+                property: property_name.to_string(),
+                reason,
             }
-            "gboolean" => {
-                let v = element.property::<bool>(property_name);
-                PropertyValue::Bool(v)
-            }
-            "gint" | "glong" => {
-                let v = element.property::<i32>(property_name);
-                PropertyValue::Int(v as i64)
-            }
-            "gint64" => {
-                let v = element.property::<i64>(property_name);
-                PropertyValue::Int(v)
-            }
-            "guint" | "gulong" => {
-                let v = element.property::<u32>(property_name);
-                PropertyValue::UInt(v as u64)
-            }
-            "guint64" => {
-                let v = element.property::<u64>(property_name);
-                PropertyValue::UInt(v)
-            }
-            "gfloat" => {
-                let v = element.property::<f32>(property_name);
-                PropertyValue::Float(v as f64)
-            }
-            "gdouble" => {
-                let v = element.property::<f64>(property_name);
-                PropertyValue::Float(v)
-            }
-            "GEnum" => {
-                // Get enum as string
-                // In GStreamer 0.24.x, enum properties have stricter types and can't always be read as i32
-                // We need to use the Value API and handle type conversion carefully
-                if let Some(param_spec) = pspec.downcast_ref::<glib::ParamSpecEnum>() {
-                    let enum_class = param_spec.enum_class();
-
-                    // Get the property as a Value, then try to extract the enum value
-                    let value = element.property_value(property_name);
-
-                    // Try to get as i32 (standard enum representation)
-                    match value.get::<i32>() {
-                        Ok(v) => {
-                            if let Some(enum_value) = enum_class.value(v) {
-                                PropertyValue::String(enum_value.name().to_string())
-                            } else {
-                                PropertyValue::Int(v as i64)
-                            }
-                        }
-                        Err(_) => {
-                            // Can't convert to i32, this enum type is not supported
-                            return Err(PipelineError::InvalidProperty {
-                                element: element_id.to_string(),
-                                property: property_name.to_string(),
-                                reason: format!(
-                                    "Cannot read enum property of type {} (not convertible to i32)",
-                                    type_name
-                                ),
-                            });
-                        }
-                    }
-                } else {
-                    // Fallback if we can't get the enum class
-                    return Err(PipelineError::InvalidProperty {
-                        element: element_id.to_string(),
-                        property: property_name.to_string(),
-                        reason: "Cannot read enum property spec".to_string(),
-                    });
-                }
-            }
-            _ => {
-                return Err(PipelineError::InvalidProperty {
-                    element: element_id.to_string(),
-                    property: property_name.to_string(),
-                    reason: format!("Unsupported property type: {}", type_name),
-                });
-            }
-        };
-
-        Ok(value)
+        })
     }
 
     /// Get all readable property values from a live element.
@@ -514,77 +449,11 @@ impl PipelineManager {
                     reason: "Property not found on pad".to_string(),
                 })?;
 
-        let type_name = pspec.value_type().name();
-
-        // Get property value based on type
-        let value = match type_name.to_string().as_str() {
-            "gchararray" => {
-                let v = pad.property::<Option<String>>(property_name);
-                v.map(PropertyValue::String)
-                    .unwrap_or(PropertyValue::String(String::new()))
-            }
-            "gboolean" => {
-                let v = pad.property::<bool>(property_name);
-                PropertyValue::Bool(v)
-            }
-            "gint" | "glong" => {
-                let v = pad.property::<i32>(property_name);
-                PropertyValue::Int(v as i64)
-            }
-            "gint64" => {
-                let v = pad.property::<i64>(property_name);
-                PropertyValue::Int(v)
-            }
-            "guint" | "gulong" => {
-                let v = pad.property::<u32>(property_name);
-                PropertyValue::UInt(v as u64)
-            }
-            "guint64" => {
-                let v = pad.property::<u64>(property_name);
-                PropertyValue::UInt(v)
-            }
-            "gfloat" => {
-                let v = pad.property::<f32>(property_name);
-                PropertyValue::Float(v as f64)
-            }
-            "gdouble" => {
-                let v = pad.property::<f64>(property_name);
-                PropertyValue::Float(v)
-            }
-            _ => {
-                // Check if it's an enum type
-                if pspec.value_type().is_a(glib::Type::ENUM) {
-                    // Get the enum value as an integer and convert to nick string
-                    let value = pad.property_value(property_name);
-                    if let Ok(enum_value) = value.get::<i32>() {
-                        // Get the enum class and find the nick for this value
-                        if let Some(enum_class) = glib::EnumClass::with_type(pspec.value_type()) {
-                            if let Some(enum_val) = enum_class.value(enum_value) {
-                                PropertyValue::String(enum_val.nick().to_string())
-                            } else {
-                                PropertyValue::Int(enum_value as i64)
-                            }
-                        } else {
-                            PropertyValue::Int(enum_value as i64)
-                        }
-                    } else {
-                        return Err(PipelineError::InvalidProperty {
-                            element: format!("{}:{}", element_id, pad_name),
-                            property: property_name.to_string(),
-                            reason: format!("Failed to read enum value for type: {}", type_name),
-                        });
-                    }
-                } else {
-                    return Err(PipelineError::InvalidProperty {
-                        element: format!("{}:{}", element_id, pad_name),
-                        property: property_name.to_string(),
-                        reason: format!("Unsupported property type: {}", type_name),
-                    });
-                }
-            }
-        };
-
-        Ok(value)
+        read_property(pad.upcast_ref(), &pspec).map_err(|reason| PipelineError::InvalidProperty {
+            element: format!("{}:{}", element_id, pad_name),
+            property: property_name.to_string(),
+            reason,
+        })
     }
 
     /// Get all readable property values from a pad.
@@ -1098,6 +967,47 @@ fn out_of_range<T: std::fmt::Display>(n: T, target_name: &str, min: T, max: T) -
     )
 }
 
+/// Read a property off an element or a pad as a [`PropertyValue`].
+///
+/// Enums come back as their nick (`snow`, `keep-aspect-ratio`): that is the
+/// form the write path accepts, so a value read here can be written back.
+/// Types not handled here (flags, caps, boxed, objects) are reported as
+/// unsupported, and the listing callers leave them out of their maps.
+fn read_property(obj: &glib::Object, pspec: &glib::ParamSpec) -> Result<PropertyValue, String> {
+    let name = pspec.name();
+    let value_type = pspec.value_type();
+
+    let value = match value_type.name() {
+        "gchararray" => {
+            let v = obj.property::<Option<String>>(name);
+            // A cefsrc whose page is being born holds a marker, not its URL,
+            // and a steered one keeps its first URL. Only `url` is mapped.
+            v.map(|v| crate::cef_pages::shown_string_property(obj, name, v))
+                .map(PropertyValue::String)
+                .unwrap_or(PropertyValue::String(String::new()))
+        }
+        "gboolean" => PropertyValue::Bool(obj.property::<bool>(name)),
+        "gint" | "glong" => PropertyValue::Int(obj.property::<i32>(name) as i64),
+        "gint64" => PropertyValue::Int(obj.property::<i64>(name)),
+        "guint" | "gulong" => PropertyValue::UInt(obj.property::<u32>(name) as u64),
+        "guint64" => PropertyValue::UInt(obj.property::<u64>(name)),
+        "gfloat" => PropertyValue::Float(obj.property::<f32>(name) as f64),
+        "gdouble" => PropertyValue::Float(obj.property::<f64>(name)),
+        // Each enum reports its own type name (`GstVideoTestSrcPattern`), so
+        // it is matched by ancestry, and read through the GValue: glib will
+        // not hand an enum GValue out as a `gint`.
+        _ if value_type.is_a(glib::Type::ENUM) => {
+            let value = obj.property_value(name);
+            let (_, member) = glib::EnumValue::from_value(&value)
+                .ok_or_else(|| format!("Cannot read enum value of type {}", value_type.name()))?;
+            PropertyValue::String(member.nick().to_string())
+        }
+        other => return Err(format!("Unsupported property type: {}", other)),
+    };
+
+    Ok(value)
+}
+
 /// The text form GStreamer's deserializer takes.
 fn text_form(prop_value: &PropertyValue) -> String {
     match prop_value {
@@ -1126,6 +1036,29 @@ fn set_checked_value<O: IsA<glib::Object>>(
         obj.set_property_from_value(prop_name, value);
     }))
     .map_err(|_| "GLib rejected the value (see the log for details)".to_string())
+}
+
+/// Apply a client-supplied property the way the generic path does.
+///
+/// Block builders apply their own properties, with the raw setters the generic
+/// path no longer uses: `set_property_from_str` is `find_property().unwrap()`
+/// plus a setter that aborts the thread whenever `g_param_value_validate` has
+/// to clamp. A block that forwards a request body into it is one call away
+/// from the panic class the generic path closed, so blocks go through here
+/// instead — the same conversion, returning the reason rather than unwinding.
+///
+/// The check reads the element's own `GParamSpec`, so there is no second copy
+/// of the range to drift from the element's.
+pub(crate) fn set_property_checked<O: IsA<glib::Object>>(
+    obj: &O,
+    prop_name: &str,
+    prop_value: &PropertyValue,
+) -> Result<(), String> {
+    let pspec = obj
+        .find_property(prop_name)
+        .ok_or_else(|| "Property not found".to_string())?;
+    let value = checked_property_value(&pspec, prop_value)?;
+    set_checked_value(obj, prop_name, &value)
 }
 
 /// The integer a client meant, whatever numeric shape it arrived in.
@@ -1415,4 +1348,3 @@ mod tests {
         assert_eq!(value.get::<f64>().expect("not a gdouble"), 1.0);
     }
 }
-

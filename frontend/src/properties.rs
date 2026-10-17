@@ -22,10 +22,33 @@ pub struct LivePropertyUpdate {
     /// Exposed property name (e.g. `ch1_pfl`, `fader_db`).
     pub property_name: String,
     pub value: PropertyValue,
+    /// Send only once the value has stopped changing for
+    /// [`LIVE_TEXT_SETTLE_MS`]. For free text: a URL typed into a live field
+    /// would otherwise go out a character at a time, and an HTML source would
+    /// load every prefix of it.
+    pub settle: bool,
 }
 
 /// Minimum interval between live property API calls for the same element+property.
 pub const LIVE_PROPERTY_DEBOUNCE_MS: u64 = 80;
+
+/// How long a settling value (free text) has to stay unchanged before it is
+/// sent.
+pub const LIVE_TEXT_SETTLE_MS: u64 = 700;
+
+/// Block definition IDs whose running pipeline can report RTP jitterbuffer
+/// statistics via `GET /api/flows/{id}/rtp-stats`.
+pub const RTP_STATS_BLOCK_DEFINITION_IDS: &[&str] = &["builtin.aes67_input", "builtin.whip_input"];
+
+/// Returns true if the given block definition ID can report RTP statistics.
+pub fn is_rtp_stats_block_def(definition_id: &str) -> bool {
+    RTP_STATS_BLOCK_DEFINITION_IDS.contains(&definition_id)
+}
+
+/// Which debounce entry an update belongs to: flow, block and property. The
+/// flow is part of it because block ids repeat across flows - copied flows
+/// keep theirs - and two blocks must never share a pending value.
+pub type LivePropertyKey = (FlowId, String, String);
 
 /// Debounce state for a single element+property combination.
 /// Tracks when the last API call was sent and stores any pending update
@@ -33,6 +56,8 @@ pub const LIVE_PROPERTY_DEBOUNCE_MS: u64 = 80;
 /// always delivered).
 pub struct LivePropertyDebounce {
     pub last_sent: instant::Instant,
+    /// When the pending value last changed.
+    pub last_input: instant::Instant,
     pub pending: Option<LivePropertyUpdate>,
 }
 
@@ -46,20 +71,25 @@ pub struct LivePropertyDebounce {
 /// now expired are flushed — this ensures the final slider value is always
 /// delivered even if no new `changed` event arrives.
 pub fn drain_live_updates(
-    debounce_map: &mut std::collections::HashMap<(String, String), LivePropertyDebounce>,
+    debounce_map: &mut std::collections::HashMap<LivePropertyKey, LivePropertyDebounce>,
     incoming: Vec<LivePropertyUpdate>,
 ) -> Vec<LivePropertyUpdate> {
     let now = instant::Instant::now();
     let interval = std::time::Duration::from_millis(LIVE_PROPERTY_DEBOUNCE_MS);
+    let settle = std::time::Duration::from_millis(LIVE_TEXT_SETTLE_MS);
     let mut to_send: Vec<LivePropertyUpdate> = Vec::new();
 
     // Keys that received a fresh incoming update this frame
-    let mut touched_keys: std::collections::HashSet<(String, String)> =
+    let mut touched_keys: std::collections::HashSet<LivePropertyKey> =
         std::collections::HashSet::new();
 
     // Process incoming updates
     for update in incoming {
-        let key = (update.block_id.clone(), update.property_name.clone());
+        let key = (
+            update.flow_id,
+            update.block_id.clone(),
+            update.property_name.clone(),
+        );
         touched_keys.insert(key.clone());
 
         let entry = debounce_map
@@ -67,10 +97,15 @@ pub fn drain_live_updates(
             .or_insert_with(|| LivePropertyDebounce {
                 // Set last_sent far enough in the past so the first update always goes through
                 last_sent: now - interval,
+                last_input: now,
                 pending: None,
             });
+        entry.last_input = now;
 
-        if now.duration_since(entry.last_sent) >= interval {
+        if update.settle {
+            // Never on the leading edge: wait for the typing to stop.
+            entry.pending = Some(update);
+        } else if now.duration_since(entry.last_sent) >= interval {
             // Enough time has passed — send immediately
             entry.last_sent = now;
             entry.pending = None;
@@ -83,10 +118,14 @@ pub fn drain_live_updates(
 
     // Flush any previously-pending updates whose interval has expired
     // (but skip keys we already handled above to avoid double-sends)
-    let expired_keys: Vec<(String, String)> = debounce_map
+    let expired_keys: Vec<LivePropertyKey> = debounce_map
         .iter()
         .filter(|(k, v)| v.pending.is_some() && !touched_keys.contains(*k))
         .filter(|(_, v)| now.duration_since(v.last_sent) >= interval)
+        .filter(|(_, v)| {
+            !v.pending.as_ref().is_some_and(|p| p.settle)
+                || now.duration_since(v.last_input) >= settle
+        })
         .map(|(k, _)| k.clone())
         .collect();
 
@@ -124,6 +163,10 @@ pub struct BlockInspectorResult {
     pub whip_ingest_url: Option<String>,
     /// Copy WHIP ingest URL to clipboard - contains endpoint_id
     pub copy_whip_url_requested: Option<String>,
+    /// Remote control link requested for an HTML source, to show as a QR code
+    pub devtools_qr_requested: Option<(FlowId, String)>,
+    /// Remote control link requested for an HTML source, to open in a tab
+    pub devtools_open_requested: Option<(FlowId, String)>,
     /// Show QR code for WHEP player URL - contains endpoint_id
     pub show_qr_whep: Option<String>,
     /// Show QR code for WHIP ingest URL - contains endpoint_id
@@ -481,6 +524,7 @@ impl PropertyInspector {
         audio_devices: &[strom_types::discovery::DeviceResponse],
         local_devices_loading: bool,
         qr_inline: &mut Option<(String, String)>,
+        devtools_link_warning: Option<&(String, String)>,
         qr_cache: &mut crate::qr::QrCache,
         recorder_filename: Option<&str>,
         recorder_start_time: Option<instant::Instant>,
@@ -645,6 +689,87 @@ impl PropertyInspector {
                                 Some((srt_uri.clone(), network_caching_ms));
                         }
                     });
+                }
+            }
+
+            // Remote control for HTML sources. The link is minted by the
+            // server on demand rather than derived here: only the server knows
+            // which browser this block is rendering, and the link is
+            // short-lived, so there is nothing to precompute.
+            if definition.id == "builtin.html_input" {
+                let allowed = matches!(
+                    block.properties.get("remote_control"),
+                    Some(PropertyValue::Bool(true))
+                );
+
+                ui.add_space(4.0);
+                if let Some(flow_id) = flow_id {
+                    ui.add_enabled_ui(allowed, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(egui_phosphor::regular::QR_CODE)
+                                .on_hover_text("Show a QR code to open this page from a phone")
+                                .clicked()
+                            {
+                                result.devtools_qr_requested =
+                                    Some((flow_id, block_id.clone()));
+                            }
+                            if ui
+                                .button(format!(
+                                    "{} Remote control",
+                                    egui_phosphor::regular::ARROW_SQUARE_OUT
+                                ))
+                                .on_hover_text(
+                                    "Open this page in a browser tab and click in it - the \
+                                     page that is on air, so a login lands where it is needed",
+                                )
+                                .clicked()
+                            {
+                                result.devtools_open_requested =
+                                    Some((flow_id, block_id.clone()));
+                            }
+                        });
+                    });
+                    if !allowed {
+                        ui.label(
+                            egui::RichText::new(
+                                "Turn on Remote Control above to hand out a link.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                } else {
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.button(format!(
+                            "{} Remote control",
+                            egui_phosphor::regular::ARROW_SQUARE_OUT
+                        ))
+                        .on_hover_text("Start the flow to control the page");
+                    });
+                }
+
+                // The minted link arrives a frame or two later and lands here.
+                if let Some((_, ref url)) =
+                    qr_inline.as_ref().filter(|(bid, _)| bid == &block_id)
+                {
+                    ui.add_space(4.0);
+                    if let Some(texture) = qr_cache.get_or_create(ui.ctx(), url) {
+                        ui.image(egui::load::SizedTexture::new(
+                            texture.id(),
+                            egui::vec2(200.0, 200.0),
+                        ));
+                    }
+                    ui.label(egui::RichText::new(url.as_str()).monospace().small());
+                }
+                // What the link hands over, in the server's words: it differs
+                // between filtered and full DevTools mode, and with whether
+                // sources share a browser context.
+                if let Some((_, warning)) =
+                    devtools_link_warning.filter(|(bid, _)| bid == &block_id)
+                {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(warning.as_str()).weak().small());
                 }
             }
 
@@ -846,6 +971,13 @@ impl PropertyInspector {
                                         continue;
                                     }
                                 }
+                                // Local Input lists its video settings first, then
+                                // its audio settings; a separator divides the two.
+                                if definition.id == "builtin.local_input"
+                                    && exposed_prop.name == "audio_device"
+                                {
+                                    ui.separator();
+                                }
                                 let changed = Self::show_exposed_property(
                                     ui,
                                     block,
@@ -878,6 +1010,10 @@ impl PropertyInspector {
                                                     block_id: block.id.clone(),
                                                     property_name: exposed_prop.name.clone(),
                                                     value,
+                                                    settle: matches!(
+                                                        exposed_prop.property_type,
+                                                        strom_types::block::PropertyType::String
+                                                    ),
                                                 },
                                             );
                                         }
@@ -1016,7 +1152,9 @@ impl PropertyInspector {
                     }
 
                     // Show recording status, duration counter, and split button for recorder blocks
-                    if definition.id == "builtin.recorder" {
+                    if definition.id == "builtin.recorder"
+                        || definition.id == "builtin.liverecorder"
+                    {
                         ui.separator();
                         if let Some(start) = recorder_start_time {
                             let elapsed = start.elapsed();
@@ -1215,16 +1353,15 @@ impl PropertyInspector {
                         }
                     }
 
-                    // Show RTP statistics for AES67 input blocks
-                    if definition.id == "builtin.aes67_input" {
+                    // Show statistics for any block that reports them, plus a
+                    // hint for block types that can report them but have none yet
+                    let block_stats = rtp_stats.and_then(|s| {
+                        s.blocks.iter().find(|bs| bs.block_instance_id == block.id)
+                    });
+                    if block_stats.is_some() || is_rtp_stats_block_def(&definition.id) {
                         ui.separator();
-                        ui.heading("📊 RTP Statistics");
+                        ui.heading("📊 Statistics");
                         ui.add_space(4.0);
-
-                        // Find RTP stats for this block
-                        let block_stats = rtp_stats.and_then(|s| {
-                            s.blocks.iter().find(|bs| bs.block_instance_id == block.id)
-                        });
 
                         if let Some(block_stats) = block_stats {
                             // Group stats by jitterbuffer/SSRC
@@ -1268,7 +1405,7 @@ impl PropertyInspector {
                                         for stat in &block_stats.stats {
                                             let label = ui.label(&stat.metadata.display_name);
                                             label.on_hover_text(&stat.metadata.description);
-                                            let formatted = stat.value.format();
+                                            let formatted = stat.format_value();
                                             ui.monospace(&formatted);
                                             ui.end_row();
                                         }
@@ -1295,7 +1432,7 @@ impl PropertyInspector {
                                                             .unwrap_or(&stat.metadata.display_name);
                                                         let label = ui.label(display_name);
                                                         label.on_hover_text(&stat.metadata.description);
-                                                        let formatted = stat.value.format();
+                                                        let formatted = stat.format_value();
                                                         ui.monospace(&formatted);
                                                         ui.end_row();
                                                     }
@@ -1303,13 +1440,17 @@ impl PropertyInspector {
                                         });
                                 }
                             }
+                        } else if rtp_stats.is_some() {
+                            // Flow is running but this block has nothing to report yet
+                            // (e.g. no stream received so far)
+                            ui.small("Statistics appear once the block receives a stream.");
                         } else {
                             ui.colored_label(
                                 Color32::from_rgb(200, 200, 100),
                                 "⚠ Statistics are only available when the flow is running",
                             );
                             ui.add_space(4.0);
-                            ui.small("Start the flow to see RTP jitterbuffer statistics.");
+                            ui.small("Start the flow to see this block's statistics.");
                         }
                     }
 
@@ -1424,6 +1565,7 @@ impl PropertyInspector {
                     | "force_live"
                     | "latency"
                     | "min_upstream_latency"
+                    | "sample_rate"
                     | "monitor_fader"
             ) {
                 config_idx.push(i);
@@ -1871,6 +2013,10 @@ impl PropertyInspector {
                             block_id: block.id.clone(),
                             property_name: exposed_prop.name.clone(),
                             value,
+                            settle: matches!(
+                                exposed_prop.property_type,
+                                strom_types::block::PropertyType::String
+                            ),
                         });
                     }
                 }
@@ -1939,6 +2085,7 @@ impl PropertyInspector {
                 block_id: block.id.clone(),
                 property_name: prop.name.clone(),
                 value,
+                settle: matches!(prop.property_type, strom_types::block::PropertyType::String),
             });
         }
 
@@ -2945,5 +3092,80 @@ impl PropertyInspector {
                 (PropertyValue::Bool(b), _) => ui.checkbox(b, "").changed(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn update(value: &str, settle: bool) -> LivePropertyUpdate {
+        LivePropertyUpdate {
+            flow_id: FlowId::nil(),
+            block_id: "html1".to_string(),
+            property_name: "url".to_string(),
+            value: PropertyValue::String(value.to_string()),
+            settle,
+        }
+    }
+
+    #[test]
+    fn typed_text_goes_out_once_the_typing_stops() {
+        let mut map = HashMap::new();
+        // Every keystroke of an address, one frame each.
+        for prefix in ["h", "ht", "htt", "http", "https://example.com"] {
+            assert!(
+                drain_live_updates(&mut map, vec![update(prefix, true)]).is_empty(),
+                "{} was sent while still being typed",
+                prefix
+            );
+        }
+        // Nothing new arrives, but the settle time has not passed yet.
+        assert!(drain_live_updates(&mut map, vec![]).is_empty());
+
+        // Once it has, only the finished value is sent.
+        let key = (FlowId::nil(), "html1".to_string(), "url".to_string());
+        let past = instant::Instant::now() - Duration::from_millis(LIVE_TEXT_SETTLE_MS + 50);
+        let entry = map.get_mut(&key).unwrap();
+        entry.last_input = past;
+        entry.last_sent = past;
+        let sent = drain_live_updates(&mut map, vec![]);
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(&sent[0].value, PropertyValue::String(s) if s == "https://example.com"));
+    }
+
+    #[test]
+    fn the_same_block_id_in_two_flows_keeps_two_pending_values() {
+        // Copied flows keep their block ids, so an address typed in one flow
+        // must not be replaced by one typed in the other.
+        let mut map = HashMap::new();
+        let mut other = update("https://b.example", true);
+        other.flow_id = FlowId::from_u128(1);
+        drain_live_updates(&mut map, vec![update("https://a.example", true), other]);
+        let past = instant::Instant::now() - Duration::from_millis(LIVE_TEXT_SETTLE_MS + 50);
+        for entry in map.values_mut() {
+            entry.last_input = past;
+            entry.last_sent = past;
+        }
+        let mut sent: Vec<String> = drain_live_updates(&mut map, vec![])
+            .into_iter()
+            .map(|u| match u.value {
+                PropertyValue::String(s) => s,
+                _ => String::new(),
+            })
+            .collect();
+        sent.sort();
+        assert_eq!(sent, ["https://a.example", "https://b.example"]);
+    }
+
+    #[test]
+    fn a_slider_still_goes_out_on_the_first_change() {
+        let mut map = HashMap::new();
+        assert_eq!(
+            drain_live_updates(&mut map, vec![update("x", false)]).len(),
+            1
+        );
     }
 }
