@@ -52,6 +52,10 @@ pub struct SetPlaylistRequest {
     /// List of file URIs (e.g., "file:///path/to/video.mp4")
     #[cfg_attr(feature = "validation", garde(length(min = 1)))]
     pub files: Vec<String>,
+    /// Loop back to the first file at the end; unchanged when absent.
+    #[serde(default)]
+    #[cfg_attr(feature = "validation", garde(skip))]
+    pub loop_playlist: Option<bool>,
 }
 
 /// Request to seek to a position.

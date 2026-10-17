@@ -101,6 +101,11 @@ pub async fn set_playlist(
     block
         .properties
         .insert("playlist".to_string(), PropertyValue::String(playlist_json));
+    if let Some(looped) = req.loop_playlist {
+        block
+            .properties
+            .insert("loop_playlist".to_string(), PropertyValue::Bool(looped));
+    }
 
     // Save the updated flow
     if let Err(e) = state.upsert_flow(flow).await {
@@ -120,11 +125,18 @@ pub async fn set_playlist(
     };
 
     if let Some(player) = MEDIA_PLAYER_REGISTRY.get(&key) {
+        if let Some(looped) = req.loop_playlist {
+            player
+                .loop_playlist
+                .store(looped, std::sync::atomic::Ordering::SeqCst);
+        }
         let was_stopped = player.state() == strom_types::mediaplayer::PlayerState::Stopped;
+        let same_files = player.playlist_files() == req.files;
         player.set_playlist(req.files);
 
-        // Only auto-start from the beginning if the player was stopped
-        if was_stopped && player.playlist_len() > 0 {
+        // Only auto-start from the beginning if the player was stopped and
+        // got other files: a loop change alone leaves a held end as it is.
+        if was_stopped && !same_files && player.playlist_len() > 0 {
             let _ = player.goto(0);
         }
     }
