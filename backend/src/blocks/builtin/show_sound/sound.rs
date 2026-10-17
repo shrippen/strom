@@ -42,6 +42,8 @@ pub struct Sound {
     gate: Mutex<Option<gst::PadProbeId>>,
     /// Running time the file's start plays at, once released.
     started_at: Mutex<Option<gst::ClockTime>>,
+    /// Zone branches whose end has not reached their mixer yet.
+    open_zones: std::sync::atomic::AtomicUsize,
 }
 
 /// A volume element's level and its control source.
@@ -132,6 +134,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
         }),
         gate: Mutex::new(None),
         started_at: Mutex::new(None),
+        open_zones: std::sync::atomic::AtomicUsize::new(0),
     });
     let chain = [&decoder, &convert, &resample, &caps, &volume, &tee];
     for element in chain {
@@ -174,22 +177,17 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
     );
     *sound.gate.lock().unwrap_or_else(|p| p.into_inner()) = gate;
 
-    // Its end: take the branch down.
+    // The decoder is far ahead of the zones: a sound is over when its end
+    // reaches the zone mixers (`feed_zones`), here only if it feeds none.
     let ending = (Arc::downgrade(block), Arc::downgrade(&sound));
     gate_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-        let Some(gst::PadProbeData::Event(event)) = &info.data else {
-            return gst::PadProbeReturn::Ok;
-        };
-        if event.type_() != gst::EventType::Eos {
+        if !is_eos(info) {
             return gst::PadProbeReturn::Ok;
         }
         if let (Some(block), Some(sound)) = (ending.0.upgrade(), ending.1.upgrade()) {
-            sound.set_state(SoundState::Ended, None);
-            std::thread::spawn(move || {
-                if take(&block, &sound.id).is_some_and(|s| Arc::ptr_eq(&s, &sound)) {
-                    teardown(&block, &sound);
-                }
-            });
+            if sound.open_zones.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                end(block, sound);
+            }
         }
         gst::PadProbeReturn::Ok
     });
@@ -304,6 +302,21 @@ pub(crate) fn matrices(
     out
 }
 
+fn is_eos(info: &gst::PadProbeInfo) -> bool {
+    matches!(&info.data, Some(gst::PadProbeData::Event(e)) if e.type_() == gst::EventType::Eos)
+}
+
+/// The sound is over: take its branch down.
+fn end(block: Arc<ShowSound>, sound: Arc<Sound>) {
+    sound.set_state(SoundState::Ended, None);
+    // Not from a streaming thread: teardown sets the branch to NULL.
+    std::thread::spawn(move || {
+        if take(&block, &sound.id).is_some_and(|s| Arc::ptr_eq(&s, &sound)) {
+            teardown(&block, &sound);
+        }
+    });
+}
+
 /// From the tee to every zone the sound is routed to.
 fn feed_zones(
     block: &Arc<ShowSound>,
@@ -314,7 +327,11 @@ fn feed_zones(
 ) -> Result<(), String> {
     let bin = block.pipeline().ok_or("the flow is not running")?;
     let zone_channels: Vec<u32> = block.zones.iter().map(|z| z.channels).collect();
-    for (zone, matrix) in matrices(routes, file_channels, &zone_channels) {
+    let matrices = matrices(routes, file_channels, &zone_channels);
+    sound
+        .open_zones
+        .store(matrices.len(), std::sync::atomic::Ordering::SeqCst);
+    for (zone, matrix) in matrices {
         let mixer = block.mixers[zone].upgrade().ok_or("the zone is gone")?;
         let base = format!("{}_z{}", tee.name(), zone);
         let make = |factory: &str, part: &str| {
@@ -340,10 +357,26 @@ fn feed_zones(
         let mixer_pad = mixer
             .request_pad_simple("sink_%u")
             .ok_or("the zone mixer gave no pad")?;
-        caps.static_pad("src")
-            .ok_or("caps has no src pad")?
-            .link(&mixer_pad)
-            .map_err(|e| format!("{:?}", e))?;
+        let caps_src = caps.static_pad("src").ok_or("caps has no src pad")?;
+        caps_src.link(&mixer_pad).map_err(|e| format!("{:?}", e))?;
+        // The mixer takes the branch's buffers as it plays them, so its end
+        // arrives here once the sound is heard. The EOS stays out of the
+        // mixer: a mixer whose pads are all at their end ends the zone.
+        let ending = (Arc::downgrade(block), Arc::downgrade(sound));
+        caps_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if !is_eos(info) {
+                return gst::PadProbeReturn::Ok;
+            }
+            if let (Some(block), Some(sound)) = (ending.0.upgrade(), ending.1.upgrade()) {
+                let before = sound
+                    .open_zones
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if before == 1 {
+                    end(block, sound);
+                }
+            }
+            gst::PadProbeReturn::Drop
+        });
         sound
             .mixer_pads
             .lock()
