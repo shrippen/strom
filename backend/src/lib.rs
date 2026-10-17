@@ -392,30 +392,50 @@ pub async fn create_app_with_config(
             "/flows/{flow_id}/blocks/{block_id}/player/goto",
             post(api::mediaplayer::goto_file),
         )
-        // Show Sound: sound cues in zones
+        // Show Playback: sound cues in zones
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound",
-            get(api::show_sound::get_show_sound),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback",
+            get(api::show_playback::get_show_playback),
         )
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds",
-            post(api::show_sound::add_sound),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds",
+            post(api::show_playback::add_sound),
         )
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/play",
-            post(api::show_sound::play_sound),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/play",
+            post(api::show_playback::play_sound),
         )
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/fade",
-            post(api::show_sound::fade_sound),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/fade",
+            post(api::show_playback::fade_sound),
         )
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/stop",
-            post(api::show_sound::stop_sound),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/stop",
+            post(api::show_playback::stop_sound),
         )
         .route(
-            "/flows/{flow_id}/blocks/{block_id}/show_sound/zones/{zone}",
-            post(api::show_sound::set_zone_level),
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/zones/{zone}",
+            post(api::show_playback::set_zone_level),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures",
+            post(api::show_playback::add_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/play",
+            post(api::show_playback::play_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/fade",
+            post(api::show_playback::fade_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/stop",
+            post(api::show_playback::stop_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/stages/{stage}",
+            post(api::show_playback::set_stage_level),
         )
         // Remote control of the Chromium browsers behind HTML sources.
         // Minting a link is authenticated; opening one is not, because the

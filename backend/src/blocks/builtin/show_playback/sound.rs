@@ -1,11 +1,11 @@
-//! One sound of a Show Sound block: its branch in the running pipeline, from
+//! One sound of a Show Playback block: its branch in the running pipeline, from
 //! the file to the zones it is routed to, and what can be done with it.
 //!
 //! Every closure on the branch's pads holds the [`Sound`] and the
-//! [`ShowSound`], which hold weak element references only, so no pad keeps
+//! [`ShowPlayback`], which hold weak element references only, so no pad keeps
 //! the pipeline alive.
 
-use super::{zone_caps, ShowSound, ZONE_RATE};
+use super::{zone_caps, ShowPlayback, ZONE_RATE};
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
@@ -13,8 +13,8 @@ use gstreamer_controller::prelude::*;
 use gstreamer_controller::{DirectControlBinding, InterpolationControlSource, InterpolationMode};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use strom_types::show_sound::{
-    gain_of_db, s_curve, AddSoundRequest, FadeEnd, ShowSoundState, SoundFadeRequest, SoundInfo,
+use strom_types::show_playback::{
+    gain_of_db, s_curve, AddSoundRequest, FadeEnd, ShowPlaybackState, SoundFadeRequest, SoundInfo,
     SoundRoute, SoundStart, SoundState, ZoneLevelRequest, FADE_MAX_MS, MAX_SOUNDS,
 };
 use tracing::{debug, info, warn};
@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 const FADE_KEYFRAMES: u32 = 32;
 
 /// Shortest ramp for a level change, so a jump does not click.
-const MIN_RAMP_MS: u64 = 20;
+pub(super) const MIN_RAMP_MS: u64 = 20;
 
 /// One sound and its branch.
 pub struct Sound {
@@ -70,7 +70,7 @@ impl Sound {
 }
 
 /// Add `request`'s sound to `block`, replacing one of the same id.
-pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), String> {
+pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), String> {
     for route in &request.routes {
         let zone = block
             .zones
@@ -156,7 +156,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
             };
             if sound.state().0 == SoundState::Loading {
                 sound.set_state(SoundState::Ready, None);
-                debug!("Show Sound {}: {} is ready", block.block_id, sound.id);
+                debug!("Show Playback {}: {} is ready", block.block_id, sound.id);
                 if sound
                     .play_on_ready
                     .load(std::sync::atomic::Ordering::SeqCst)
@@ -165,7 +165,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
                     std::thread::spawn(move || {
                         if let Err(e) = release(&block, &sound) {
                             warn!(
-                                "Show Sound {}: {} did not start: {}",
+                                "Show Playback {}: {} did not start: {}",
                                 block.block_id, sound.id, e
                             );
                         }
@@ -229,7 +229,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
         let channels = structure.get::<i32>("channels").unwrap_or(2).max(1) as u32;
         if let Err(e) = feed_zones(&block, &sound, &tee, channels, &routes) {
             warn!(
-                "Show Sound {}: {} cannot reach its zones: {}",
+                "Show Playback {}: {} cannot reach its zones: {}",
                 block.block_id, sound.id, e
             );
             sound.set_state(SoundState::Failed, Some(e));
@@ -251,7 +251,7 @@ pub fn add(block: &Arc<ShowSound>, request: &AddSoundRequest) -> Result<(), Stri
             .map_err(|e| e.to_string())?;
     }
     info!(
-        "Show Sound {}: added {} ({})",
+        "Show Playback {}: added {} ({})",
         block.block_id, request.id, uri
     );
     Ok(())
@@ -307,7 +307,7 @@ fn is_eos(info: &gst::PadProbeInfo) -> bool {
 }
 
 /// The sound is over: take its branch down.
-fn end(block: Arc<ShowSound>, sound: Arc<Sound>) {
+fn end(block: Arc<ShowPlayback>, sound: Arc<Sound>) {
     sound.set_state(SoundState::Ended, None);
     // Not from a streaming thread: teardown sets the branch to NULL.
     std::thread::spawn(move || {
@@ -319,7 +319,7 @@ fn end(block: Arc<ShowSound>, sound: Arc<Sound>) {
 
 /// From the tee to every zone the sound is routed to.
 fn feed_zones(
-    block: &Arc<ShowSound>,
+    block: &Arc<ShowPlayback>,
     sound: &Arc<Sound>,
     tee: &gst::Element,
     file_channels: u32,
@@ -375,7 +375,10 @@ fn feed_zones(
                     end(block, sound);
                 }
             }
-            gst::PadProbeReturn::Drop
+            // Handled, not Drop: dropping a sticky event in a push probe
+            // makes GStreamer 1.24 unref a NULL event.
+            info.data = None;
+            gst::PadProbeReturn::Handled
         });
         sound
             .mixer_pads
@@ -394,7 +397,7 @@ fn feed_zones(
 
 /// Play sound `id`: a preloaded one at once, one still loading as soon as
 /// it is ready.
-pub fn play(block: &Arc<ShowSound>, id: &str) -> Result<(), String> {
+pub fn play(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
     let sound = find(block, id)?;
     match sound.state().0 {
         SoundState::Ready => release(block, &sound),
@@ -415,7 +418,7 @@ pub fn play(block: &Arc<ShowSound>, id: &str) -> Result<(), String> {
 }
 
 /// Let a ready sound go: its start plays at the zones' running time now.
-fn release(block: &ShowSound, sound: &Sound) -> Result<(), String> {
+fn release(block: &ShowPlayback, sound: &Sound) -> Result<(), String> {
     let now = block.running_time().ok_or("the zones are not running")?;
     let volume = sound.volume.upgrade().ok_or("the sound is gone")?;
     let pad = volume.static_pad("src").ok_or("volume has no src pad")?;
@@ -425,12 +428,12 @@ fn release(block: &ShowSound, sound: &Sound) -> Result<(), String> {
     if let Some(gate) = sound.gate.lock().unwrap_or_else(|p| p.into_inner()).take() {
         pad.remove_probe(gate);
     }
-    info!("Show Sound {}: {} plays", block.block_id, sound.id);
+    info!("Show Playback {}: {} plays", block.block_id, sound.id);
     Ok(())
 }
 
 /// Fade sound `id` to a level; with [`FadeEnd::Stop`] it stops at the end.
-pub fn fade(block: &Arc<ShowSound>, id: &str, request: &SoundFadeRequest) -> Result<(), String> {
+pub fn fade(block: &Arc<ShowPlayback>, id: &str, request: &SoundFadeRequest) -> Result<(), String> {
     let sound = find(block, id)?;
     let duration = request.duration_ms.min(FADE_MAX_MS);
     fade_sound(block, &sound, gain_of_db(request.gain_db), duration)?;
@@ -441,7 +444,7 @@ pub fn fade(block: &Arc<ShowSound>, id: &str, request: &SoundFadeRequest) -> Res
 }
 
 /// Stop sound `id`, faded out over `fade_ms`.
-pub fn stop(block: &Arc<ShowSound>, id: &str, fade_ms: u64) -> Result<(), String> {
+pub fn stop(block: &Arc<ShowPlayback>, id: &str, fade_ms: u64) -> Result<(), String> {
     let sound = find(block, id)?;
     let fade_ms = fade_ms.min(FADE_MAX_MS);
     if sound.state().0 == SoundState::Playing && fade_ms > 0 {
@@ -458,7 +461,7 @@ pub fn stop(block: &Arc<ShowSound>, id: &str, fade_ms: u64) -> Result<(), String
 
 /// Set zone `index`'s level and mute.
 pub fn set_zone(
-    block: &Arc<ShowSound>,
+    block: &Arc<ShowPlayback>,
     index: usize,
     request: &ZoneLevelRequest,
 ) -> Result<(), String> {
@@ -480,8 +483,8 @@ pub fn set_zone(
     ramp(&volume, current, target, now, duration)
 }
 
-/// The block's zones and sounds; ended sounds are reported once.
-pub fn state(block: &ShowSound) -> ShowSoundState {
+/// The block's zones, stages, sounds and pictures.
+pub fn state(block: &ShowPlayback) -> ShowPlaybackState {
     let sounds = block.sounds.lock().unwrap_or_else(|p| p.into_inner());
     let mut list: Vec<SoundInfo> = sounds
         .values()
@@ -495,13 +498,15 @@ pub fn state(block: &ShowSound) -> ShowSoundState {
         })
         .collect();
     list.sort_by(|a, b| a.id.cmp(&b.id));
-    ShowSoundState {
+    ShowPlaybackState {
         zones: block.zones.clone(),
         sounds: list,
+        stages: block.stages.clone(),
+        pictures: super::picture::infos(block),
     }
 }
 
-fn find(block: &ShowSound, id: &str) -> Result<Arc<Sound>, String> {
+fn find(block: &ShowPlayback, id: &str) -> Result<Arc<Sound>, String> {
     block
         .sounds
         .lock()
@@ -511,7 +516,7 @@ fn find(block: &ShowSound, id: &str) -> Result<Arc<Sound>, String> {
         .ok_or_else(|| format!("no sound {}", id))
 }
 
-fn take(block: &ShowSound, id: &str) -> Option<Arc<Sound>> {
+fn take(block: &ShowPlayback, id: &str) -> Option<Arc<Sound>> {
     block
         .sounds
         .lock()
@@ -537,7 +542,7 @@ fn attach_level(volume: &gst::Element, sound: &Sound) -> Result<(), String> {
 
 /// Fade a sound's level from where it is to `target` over `duration_ms`.
 fn fade_sound(
-    block: &ShowSound,
+    block: &ShowPlayback,
     sound: &Sound,
     target: f64,
     duration_ms: u64,
@@ -595,7 +600,7 @@ fn ramp(
 
 /// Replace `source`'s keyframes with an S-curve from `from` at `start` to
 /// `to` after `duration_ms`, holding `to` after that.
-fn program(
+pub(super) fn program(
     source: &InterpolationControlSource,
     from: f64,
     to: f64,
@@ -612,7 +617,7 @@ fn program(
 }
 
 /// Stop `sound` once `delay_ms` has passed.
-fn stop_after(block: &Arc<ShowSound>, sound: &Arc<Sound>, delay_ms: u64) {
+fn stop_after(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, delay_ms: u64) {
     let (block, sound) = (Arc::downgrade(block), Arc::downgrade(sound));
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms + MIN_RAMP_MS));
@@ -627,7 +632,7 @@ fn stop_after(block: &Arc<ShowSound>, sound: &Arc<Sound>, delay_ms: u64) {
 }
 
 /// Take the branch out of the pipeline and give the mixer pads back.
-fn teardown(block: &ShowSound, sound: &Sound) {
+fn teardown(block: &ShowPlayback, sound: &Sound) {
     for (mixer, pad) in sound
         .mixer_pads
         .lock()
@@ -656,7 +661,7 @@ fn teardown(block: &ShowSound, sound: &Sound) {
             let _ = bin.remove(element);
         }
     }
-    debug!("Show Sound {}: {} taken down", block.block_id, sound.id);
+    debug!("Show Playback {}: {} taken down", block.block_id, sound.id);
 }
 
 #[cfg(test)]

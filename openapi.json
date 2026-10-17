@@ -2225,13 +2225,13 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback": {
       "get": {
         "tags": [
-          "show_sound"
+          "show_playback"
         ],
-        "summary": "The block's zones and sounds.",
-        "operationId": "get_show_sound",
+        "summary": "The block's zones, stages, sounds and pictures.",
+        "operationId": "get_show_playback",
         "parameters": [
           {
             "name": "flow_id",
@@ -2254,17 +2254,17 @@
         ],
         "responses": {
           "200": {
-            "description": "Zones and sounds",
+            "description": "Zones, stages, sounds and pictures",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ShowSoundState"
+                  "$ref": "#/components/schemas/ShowPlaybackState"
                 }
               }
             }
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -2276,10 +2276,283 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures": {
       "post": {
         "tags": [
-          "show_sound"
+          "show_playback"
+        ],
+        "summary": "Show a picture on a stage, preloaded or at once; one of the same id is replaced.",
+        "operationId": "add_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddPictureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Picture added"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such stage, or too many pictures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/fade": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Fade a picture's opacity along an S-curve, optionally stopping it at the end.",
+        "operationId": "fade_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PictureFadeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Fading"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/play": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Show a preloaded picture.",
+        "operationId": "play_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Showing"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/stop": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Take a picture off its stage, faded out.",
+        "operationId": "stop_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundStopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stopping"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds": {
+      "post": {
+        "tags": [
+          "show_playback"
         ],
         "summary": "Add a sound: preloaded to start at once on `play`, or played as soon as\nit is decoded. A sound of the same id is replaced.",
         "operationId": "add_sound",
@@ -2318,7 +2591,7 @@
             "description": "Sound added"
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -2340,10 +2613,10 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/fade": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/fade": {
       "post": {
         "tags": [
-          "show_sound"
+          "show_playback"
         ],
         "summary": "Fade a sound's level along an S-curve, optionally stopping it at the end.",
         "operationId": "fade_sound",
@@ -2391,7 +2664,7 @@
             "description": "Fading"
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -2413,10 +2686,10 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/play": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/play": {
       "post": {
         "tags": [
-          "show_sound"
+          "show_playback"
         ],
         "summary": "Play a sound.",
         "operationId": "play_sound",
@@ -2454,7 +2727,7 @@
             "description": "Playing, or plays once decoded"
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -2476,10 +2749,10 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/stop": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/stop": {
       "post": {
         "tags": [
-          "show_sound"
+          "show_playback"
         ],
         "summary": "Stop a sound, faded out over `fade_ms`.",
         "operationId": "stop_sound",
@@ -2527,7 +2800,7 @@
             "description": "Stopping"
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -2549,10 +2822,84 @@
         }
       }
     },
-    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/zones/{zone}": {
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/stages/{stage}": {
       "post": {
         "tags": [
-          "show_sound"
+          "show_playback"
+        ],
+        "summary": "Set a stage's brightness (its dimmer), faded.",
+        "operationId": "set_stage_level",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "Stage index, from 0",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageLevelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Brightness set"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such stage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/zones/{zone}": {
+      "post": {
+        "tags": [
+          "show_playback"
         ],
         "summary": "Set a zone's level and mute, faded.",
         "operationId": "set_zone_level",
@@ -2601,7 +2948,7 @@
             "description": "Level set"
           },
           "404": {
-            "description": "No running Show Sound block",
+            "description": "No running Show Playback block",
             "content": {
               "application/json": {
                 "schema": {
@@ -6584,6 +6931,49 @@
           }
         }
       },
+      "AddPictureRequest": {
+        "type": "object",
+        "description": "Show a picture (video or still image) on a stage.",
+        "required": [
+          "id",
+          "uri"
+        ],
+        "properties": {
+          "end": {
+            "$ref": "#/components/schemas/PictureEnd"
+          },
+          "fit": {
+            "$ref": "#/components/schemas/PictureFit"
+          },
+          "id": {
+            "type": "string",
+            "description": "Name of the picture in this block; a picture of the same id is\nreplaced."
+          },
+          "layer": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 to [`MAX_LAYER`]; on the same layer the later picture is in front.",
+            "minimum": 0
+          },
+          "opacity": {
+            "type": "number",
+            "format": "double",
+            "description": "0 (clear) to 1."
+          },
+          "stage": {
+            "type": "integer",
+            "description": "Stage, by its index in the block's `stages`.",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/SoundStart"
+          },
+          "uri": {
+            "type": "string",
+            "description": "`file://` URI (or a path in the media folder) of the file."
+          }
+        }
+      },
       "AddSoundRequest": {
         "type": "object",
         "description": "Add a sound to the block.",
@@ -9639,6 +10029,45 @@
           }
         }
       },
+      "PictureEnd": {
+        "type": "string",
+        "description": "What a video does at its end.",
+        "enum": [
+          "hold",
+          "stop"
+        ]
+      },
+      "PictureFadeRequest": {
+        "type": "object",
+        "description": "Fade a picture's opacity (S-curve).",
+        "required": [
+          "opacity",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/FadeEnd"
+          },
+          "opacity": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "PictureFit": {
+        "type": "string",
+        "description": "How a picture fills its stage.",
+        "enum": [
+          "fit",
+          "fill",
+          "stretch"
+        ]
+      },
       "PipState": {
         "type": "object",
         "description": "One PiP composition's runtime state (background + zones).",
@@ -10710,18 +11139,31 @@
           }
         }
       },
-      "ShowSoundState": {
+      "ShowPlaybackState": {
         "type": "object",
-        "description": "The block's sounds.",
+        "description": "The block's sounds and pictures.",
         "required": [
           "zones",
           "sounds"
         ],
         "properties": {
+          "pictures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundInfo"
+            },
+            "description": "The pictures on the stages."
+          },
           "sounds": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SoundInfo"
+            }
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShowStage"
             }
           },
           "zones": {
@@ -10729,6 +11171,30 @@
             "items": {
               "$ref": "#/components/schemas/ShowZone"
             }
+          }
+        }
+      },
+      "ShowStage": {
+        "type": "object",
+        "description": "One stage: a picture surface of its own, one block output.",
+        "required": [
+          "name",
+          "width",
+          "height"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           }
         }
       },
@@ -10831,7 +11297,7 @@
       },
       "SoundStart": {
         "type": "string",
-        "description": "When a sound added to the block starts.",
+        "description": "When a sound or picture added to the block starts.",
         "enum": [
           "preload",
           "play"
@@ -10839,7 +11305,7 @@
       },
       "SoundState": {
         "type": "string",
-        "description": "Where a sound is.",
+        "description": "Where a sound or picture is.",
         "enum": [
           "loading",
           "ready",
@@ -11194,6 +11660,24 @@
           },
           "stats": {
             "$ref": "#/components/schemas/SrtStats"
+          }
+        }
+      },
+      "StageLevelRequest": {
+        "type": "object",
+        "description": "Set a stage's brightness (dimmer, 0 = black), faded over `duration_ms`.",
+        "required": [
+          "brightness"
+        ],
+        "properties": {
+          "brightness": {
+            "type": "number",
+            "format": "double"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -15461,8 +15945,8 @@
       "description": "Media player control endpoints"
     },
     {
-      "name": "show_sound",
-      "description": "Sound cues in the zones of a Show Sound block"
+      "name": "show_playback",
+      "description": "Sounds in the zones and pictures on the stages of a Show Playback block"
     },
     {
       "name": "probes",

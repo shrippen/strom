@@ -1,4 +1,4 @@
-//! Show Sound block: sounds preloaded, played, faded and stopped in a running
+//! Show Playback block: sounds preloaded, played, faded and stopped in a running
 //! pipeline built by the real builder, and heard at the zone outputs.
 
 use gstreamer as gst;
@@ -7,10 +7,10 @@ use gstreamer_app as gst_app;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use strom::blocks::builtin::show_sound::{self, sound, ShowSoundBuilder, ShowSoundKey};
+use strom::blocks::builtin::show_playback::{self, sound, ShowPlaybackBuilder, ShowPlaybackKey};
 use strom::blocks::{BlockBuildContext, BlockBuilder};
 use strom_types::element::ElementPadRef;
-use strom_types::show_sound::{
+use strom_types::show_playback::{
     AddSoundRequest, SoundRoute, SoundStart, SoundState, ZoneLevelRequest,
 };
 use strom_types::PropertyValue;
@@ -26,7 +26,7 @@ struct Ear {
 
 struct Rig {
     pipeline: gst::Pipeline,
-    key: ShowSoundKey,
+    key: ShowPlaybackKey,
     ears: Vec<Arc<Mutex<Ear>>>,
     _dir: tempfile::TempDir,
     tone: String,
@@ -82,7 +82,7 @@ fn rig() -> Rig {
         ),
     ]
     .into();
-    let built = ShowSoundBuilder
+    let built = ShowPlaybackBuilder
         .build(
             "snd",
             &props,
@@ -144,7 +144,7 @@ fn rig() -> Rig {
     let _ = pipeline.state(gst::ClockTime::from_seconds(5));
     Rig {
         pipeline,
-        key: ShowSoundKey {
+        key: ShowPlaybackKey {
             flow_id,
             block_id: "snd".into(),
         },
@@ -163,7 +163,7 @@ fn wait_for(what: &str, done: impl Fn() -> bool) {
 }
 
 fn state_of(rig: &Rig, id: &str) -> Option<SoundState> {
-    let block = show_sound::running(&rig.key)?;
+    let block = show_playback::running(&rig.key)?;
     sound::state(&block)
         .sounds
         .into_iter()
@@ -200,7 +200,7 @@ fn hall_tone(rig: &Rig, id: &str) -> AddSoundRequest {
 #[test]
 fn a_preloaded_sound_is_heard_at_once_in_its_zone_only() {
     let rig = rig();
-    let block = show_sound::running(&rig.key).expect("the block runs");
+    let block = show_playback::running(&rig.key).expect("the block runs");
     sound::add(&block, &hall_tone(&rig, "door")).unwrap();
     wait_for("the sound is ready", || {
         state_of(&rig, "door") == Some(SoundState::Ready)
@@ -234,7 +234,7 @@ fn a_preloaded_sound_is_heard_at_once_in_its_zone_only() {
 #[test]
 fn a_stopped_sound_fades_out_and_leaves_the_pipeline() {
     let rig = rig();
-    let block = show_sound::running(&rig.key).unwrap();
+    let block = show_playback::running(&rig.key).unwrap();
     let before = rig.pipeline.children().len();
     let mut request = hall_tone(&rig, "music");
     request.start = SoundStart::Play;
@@ -261,7 +261,7 @@ fn a_stopped_sound_fades_out_and_leaves_the_pipeline() {
 #[test]
 fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
     let rig = rig();
-    let block = show_sound::running(&rig.key).unwrap();
+    let block = show_playback::running(&rig.key).unwrap();
     let mut request = hall_tone(&rig, "tone");
     request.start = SoundStart::Play;
     sound::add(&block, &request).unwrap();
@@ -300,7 +300,7 @@ fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
 #[test]
 fn a_muted_zone_is_silent() {
     let rig = rig();
-    let block = show_sound::running(&rig.key).unwrap();
+    let block = show_playback::running(&rig.key).unwrap();
     let mut request = hall_tone(&rig, "rain");
     request.start = SoundStart::Play;
     sound::add(&block, &request).unwrap();
@@ -328,7 +328,7 @@ fn a_muted_zone_is_silent() {
 #[test]
 fn a_route_to_a_missing_zone_is_refused() {
     let rig = rig();
-    let block = show_sound::running(&rig.key).unwrap();
+    let block = show_playback::running(&rig.key).unwrap();
     let mut request = hall_tone(&rig, "x");
     request.routes[0].zone = 7;
     assert!(sound::add(&block, &request).is_err());
