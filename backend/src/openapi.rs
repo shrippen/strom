@@ -230,6 +230,7 @@ use utoipa::OpenApi;
             strom_types::show_playback::ShowZone,
             strom_types::show_playback::SoundRoute,
             strom_types::show_playback::SoundStart,
+            strom_types::show_playback::SoundRepeat,
             strom_types::show_playback::AddSoundRequest,
             strom_types::show_playback::FadeEnd,
             strom_types::show_playback::SoundFadeRequest,

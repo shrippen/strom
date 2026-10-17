@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use strom_types::show_playback::{
     gain_of_db, s_curve, AddSoundRequest, FadeEnd, ShowPlaybackState, SoundFadeRequest, SoundInfo,
-    SoundRoute, SoundStart, SoundState, ZoneLevelRequest, FADE_MAX_MS, MAX_SOUNDS,
+    SoundRepeat, SoundRoute, SoundStart, SoundState, ZoneLevelRequest, FADE_MAX_MS, MAX_SOUNDS,
 };
 use tracing::{debug, info, warn};
 
@@ -34,11 +34,16 @@ pub struct Sound {
     state: Mutex<(SoundState, Option<String>)>,
     /// Every element of the branch, to take it down again.
     elements: Mutex<Vec<glib::WeakRef<gst::Element>>>,
-    /// The zone mixer pads it feeds, with their mixer.
-    mixer_pads: Mutex<Vec<(glib::WeakRef<gst::Element>, glib::WeakRef<gst::Pad>)>>,
-    /// The cue level; its src pad holds a preloaded sound.
+    /// The zone mixer pads it feeds, with their mixer and the control
+    /// source of the pad's volume (the cue level).
+    mixer_pads: Mutex<Vec<MixerPad>>,
+    /// Its src pad holds a preloaded sound; seeks go up from its sink.
     volume: glib::WeakRef<gst::Element>,
     level: Mutex<Level>,
+    /// Plays still to come after this one; `u32::MAX`: forever.
+    plays_left: std::sync::atomic::AtomicU32,
+    /// The first buffer is being thrown away for the first segment seek.
+    seeking: std::sync::atomic::AtomicBool,
     gate: Mutex<Option<gst::PadProbeId>>,
     /// Running time the file's start plays at, once released.
     started_at: Mutex<Option<gst::ClockTime>>,
@@ -46,10 +51,27 @@ pub struct Sound {
     open_zones: std::sync::atomic::AtomicUsize,
 }
 
-/// A volume element's level and its control source.
+/// The cue level: where it goes, and the ramp that takes it there, for
+/// mixer pads that come later.
 struct Level {
     gain: f64,
-    source: Option<InterpolationControlSource>,
+    ramp: Option<Ramp>,
+}
+
+/// A level ramp in the zones' running time.
+#[derive(Clone, Copy)]
+struct Ramp {
+    from: f64,
+    to: f64,
+    start: gst::ClockTime,
+    duration_ms: u64,
+}
+
+/// A zone mixer pad a sound feeds.
+struct MixerPad {
+    mixer: glib::WeakRef<gst::Element>,
+    pad: glib::WeakRef<gst::Pad>,
+    level: InterpolationControlSource,
 }
 
 impl Sound {
@@ -130,8 +152,14 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
         volume: volume.downgrade(),
         level: Mutex::new(Level {
             gain: gain_of_db(request.gain_db),
-            source: None,
+            ramp: None,
         }),
+        plays_left: std::sync::atomic::AtomicU32::new(match request.repeat {
+            SoundRepeat::Once => 0,
+            SoundRepeat::Times(n) => n.saturating_sub(1),
+            SoundRepeat::Forever => u32::MAX,
+        }),
+        seeking: std::sync::atomic::AtomicBool::new(false),
         gate: Mutex::new(None),
         started_at: Mutex::new(None),
         open_zones: std::sync::atomic::AtomicUsize::new(0),
@@ -143,7 +171,11 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
     bin.add_many(chain).map_err(|e| e.to_string())?;
     gst::Element::link_many([&convert, &resample, &caps, &volume, &tee])
         .map_err(|e| e.to_string())?;
-    attach_level(&volume, &sound)?;
+    // A repeated sound plays from segment seeks: its end is then a seam
+    // (SEGMENT_DONE) the next play follows without a gap, not an EOS.
+    let first_seek = std::sync::atomic::AtomicBool::new(
+        sound.plays_left.load(std::sync::atomic::Ordering::SeqCst) > 0,
+    );
 
     // The first buffer waits here until `play`.
     let gate_pad = volume.static_pad("src").ok_or("volume has no src pad")?;
@@ -154,23 +186,17 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
             let (Some(block), Some(sound)) = (gated.0.upgrade(), gated.1.upgrade()) else {
                 return gst::PadProbeReturn::Remove;
             };
+            if first_seek.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // The first buffer stays here, blocking the decoder, until
+                // the seek's flush lets it go; nothing passed the gate yet.
+                sound
+                    .seeking
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                seek_from_start(&block, &sound, true);
+                return gst::PadProbeReturn::Ok;
+            }
             if sound.state().0 == SoundState::Loading {
-                sound.set_state(SoundState::Ready, None);
-                debug!("Show Playback {}: {} is ready", block.block_id, sound.id);
-                if sound
-                    .play_on_ready
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    // Not from inside the probe: removing it waits for it.
-                    std::thread::spawn(move || {
-                        if let Err(e) = release(&block, &sound) {
-                            warn!(
-                                "Show Playback {}: {} did not start: {}",
-                                block.block_id, sound.id, e
-                            );
-                        }
-                    });
-                }
+                become_ready(block, sound);
             }
             gst::PadProbeReturn::Ok
         },
@@ -179,18 +205,49 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
 
     // The decoder is far ahead of the zones: a sound is over when its end
     // reaches the zone mixers (`feed_zones`), here only if it feeds none.
+    // At a seam the next play is asked for; the first seek's flush stays
+    // here (nothing downstream has data yet).
     let ending = (Arc::downgrade(block), Arc::downgrade(&sound));
-    gate_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-        if !is_eos(info) {
-            return gst::PadProbeReturn::Ok;
-        }
-        if let (Some(block), Some(sound)) = (ending.0.upgrade(), ending.1.upgrade()) {
-            if sound.open_zones.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                end(block, sound);
+    gate_pad.add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH,
+        move |_pad, info| {
+            let Some(gst::PadProbeData::Event(event)) = &info.data else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let (Some(block), Some(sound)) = (ending.0.upgrade(), ending.1.upgrade()) else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let seeking = sound.seeking.load(std::sync::atomic::Ordering::SeqCst);
+            match event.type_() {
+                gst::EventType::FlushStart if seeking => {}
+                gst::EventType::FlushStop if seeking => {
+                    sound
+                        .seeking
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                gst::EventType::SegmentDone => {
+                    let left = sound.plays_left.load(std::sync::atomic::Ordering::SeqCst);
+                    if left != u32::MAX {
+                        sound
+                            .plays_left
+                            .store(left.saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+                    }
+                    seek_from_start(&block, &sound, false);
+                }
+                gst::EventType::Eos => {
+                    if sound.open_zones.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                        end(block, sound);
+                    }
+                    return gst::PadProbeReturn::Ok;
+                }
+                _ => return gst::PadProbeReturn::Ok,
             }
-        }
-        gst::PadProbeReturn::Ok
-    });
+            // Handled, not Drop: dropping an event in a push probe makes
+            // GStreamer 1.24 unref a NULL event.
+            info.data = None;
+            gst::PadProbeReturn::Handled
+        },
+    );
 
     // The file's channels are known once the decoder has a pad: then the
     // zones can be fed.
@@ -317,6 +374,73 @@ fn end(block: Arc<ShowPlayback>, sound: Arc<Sound>) {
     });
 }
 
+/// The first buffer is held at the gate: the sound is ready, and plays at
+/// once if it should.
+fn become_ready(block: Arc<ShowPlayback>, sound: Arc<Sound>) {
+    sound.set_state(SoundState::Ready, None);
+    debug!("Show Playback {}: {} is ready", block.block_id, sound.id);
+    if sound
+        .play_on_ready
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // Not from inside the probe: removing it waits for it.
+        std::thread::spawn(move || {
+            if let Err(e) = release(&block, &sound) {
+                warn!(
+                    "Show Playback {}: {} did not start: {}",
+                    block.block_id, sound.id, e
+                );
+            }
+        });
+    }
+}
+
+/// Seek `sound`'s file back to its start, from another thread (a seek
+/// from a streaming thread would wait for itself). `flush` for the first
+/// seek; a segment seek while more plays are to come, so the play after
+/// it follows without a gap, a plain one for the last play (it ends with
+/// EOS). A first seek the file refuses leaves the sound playing once.
+fn seek_from_start(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, flush: bool) {
+    let segment = sound.plays_left.load(std::sync::atomic::Ordering::SeqCst) > 0;
+    let mut flags = gst::SeekFlags::ACCURATE;
+    if flush {
+        flags |= gst::SeekFlags::FLUSH;
+    }
+    if segment {
+        flags |= gst::SeekFlags::SEGMENT;
+    }
+    let (block, sound) = (Arc::downgrade(block), Arc::downgrade(sound));
+    std::thread::spawn(move || {
+        let (Some(block), Some(sound)) = (block.upgrade(), sound.upgrade()) else {
+            return;
+        };
+        let Some(pad) = sound.volume.upgrade().and_then(|v| v.static_pad("sink")) else {
+            return;
+        };
+        let seek = gst::event::Seek::new(
+            1.0,
+            flags,
+            gst::SeekType::Set,
+            gst::ClockTime::ZERO,
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        );
+        if !pad.push_event(seek) {
+            warn!("Show Playback: {} cannot repeat (seek refused)", sound.id);
+            sound
+                .plays_left
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            if flush {
+                // Its first buffer still waits at the gate.
+                sound
+                    .seeking
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                become_ready(block, sound);
+            }
+        }
+    });
+}
+
 /// From the tee to every zone the sound is routed to.
 fn feed_zones(
     block: &Arc<ShowPlayback>,
@@ -380,11 +504,16 @@ fn feed_zones(
             info.data = None;
             gst::PadProbeReturn::Handled
         });
+        let level = attach_level(&mixer_pad, sound)?;
         sound
             .mixer_pads
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .push((mixer.downgrade(), mixer_pad.downgrade()));
+            .push(MixerPad {
+                mixer: mixer.downgrade(),
+                pad: mixer_pad.downgrade(),
+                level,
+            });
         tee.link(&queue).map_err(|e| e.to_string())?;
         for element in [&queue, &convert, &caps] {
             element
@@ -524,49 +653,53 @@ fn take(block: &ShowPlayback, id: &str) -> Option<Arc<Sound>> {
         .remove(id)
 }
 
-/// The cue level, with a control source the fades program.
-fn attach_level(volume: &gst::Element, sound: &Sound) -> Result<(), String> {
-    let mut level = sound.level.lock().unwrap_or_else(|p| p.into_inner());
-    volume.set_property("volume", level.gain);
+/// The cue level on a zone mixer pad: a control source on its volume,
+/// in the zone's running time, so a fade runs on over the seams of a
+/// repeated sound. A ramp already asked for is programmed on it too.
+fn attach_level(pad: &gst::Pad, sound: &Sound) -> Result<InterpolationControlSource, String> {
+    let level = sound.level.lock().unwrap_or_else(|p| p.into_inner());
+    pad.set_property("volume", level.gain);
     let source = InterpolationControlSource::new();
     source.set_mode(InterpolationMode::Linear);
     // Absolute: control values are the volume itself (0..10), not 0..1.
-    let binding = DirectControlBinding::new_absolute(volume, "volume", &source);
-    volume
-        .add_control_binding(&binding)
+    let binding = DirectControlBinding::new_absolute(pad, "volume", &source);
+    pad.add_control_binding(&binding)
         .map_err(|e| e.to_string())?;
-    source.set(gst::ClockTime::ZERO, level.gain);
-    level.source = Some(source);
-    Ok(())
+    match level.ramp {
+        Some(r) => program(&source, r.from, r.to, r.start, r.duration_ms),
+        None => {
+            source.set(gst::ClockTime::ZERO, level.gain);
+        }
+    }
+    Ok(source)
 }
 
-/// Fade a sound's level from where it is to `target` over `duration_ms`.
+/// Fade a sound's level from where it is to `target` over `duration_ms`,
+/// on every zone it feeds.
 fn fade_sound(
     block: &ShowPlayback,
     sound: &Sound,
     target: f64,
     duration_ms: u64,
 ) -> Result<(), String> {
+    let now = block.running_time().ok_or("the zones are not running")?;
     let mut level = sound.level.lock().unwrap_or_else(|p| p.into_inner());
-    let source = level.source.clone().ok_or("the sound has no level")?;
-    // The cue level sits before the shift to running time: its clock is the
-    // position in the file.
-    let position = match *sound.started_at.lock().unwrap_or_else(|p| p.into_inner()) {
-        Some(start) => block
-            .running_time()
-            .map(|now| now.saturating_sub(start))
-            .unwrap_or(gst::ClockTime::ZERO),
-        None => gst::ClockTime::ZERO,
+    let ramp = Ramp {
+        from: level.gain,
+        to: target,
+        start: now,
+        duration_ms: duration_ms.max(MIN_RAMP_MS),
     };
-    let from = level.gain;
     level.gain = target;
-    program(
-        &source,
-        from,
-        target,
-        position,
-        duration_ms.max(MIN_RAMP_MS),
-    );
+    level.ramp = Some(ramp);
+    for pad in sound
+        .mixer_pads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+    {
+        program(&pad.level, ramp.from, ramp.to, ramp.start, ramp.duration_ms);
+    }
     Ok(())
 }
 
@@ -633,7 +766,7 @@ fn stop_after(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, delay_ms: u64) {
 
 /// Take the branch out of the pipeline and give the mixer pads back.
 fn teardown(block: &ShowPlayback, sound: &Sound) {
-    for (mixer, pad) in sound
+    for MixerPad { mixer, pad, .. } in sound
         .mixer_pads
         .lock()
         .unwrap_or_else(|p| p.into_inner())

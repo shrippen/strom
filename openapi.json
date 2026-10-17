@@ -6991,6 +6991,9 @@
             "type": "string",
             "description": "Name of the sound in this block; a sound of the same id is replaced."
           },
+          "repeat": {
+            "$ref": "#/components/schemas/SoundRepeat"
+          },
           "routes": {
             "type": "array",
             "items": {
@@ -11261,6 +11264,39 @@
             "$ref": "#/components/schemas/SoundState"
           }
         }
+      },
+      "SoundRepeat": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "once"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "This many plays in all (1 is once).",
+            "required": [
+              "times"
+            ],
+            "properties": {
+              "times": {
+                "type": "integer",
+                "format": "int32",
+                "description": "This many plays in all (1 is once).",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "string",
+            "description": "Until it is stopped.",
+            "enum": [
+              "forever"
+            ]
+          }
+        ],
+        "description": "How often a sound plays (SND.3); its plays follow each other without a\ngap."
       },
       "SoundRoute": {
         "type": "object",

@@ -79,6 +79,20 @@ pub enum SoundStart {
     Play,
 }
 
+/// How often a sound plays (SND.3); its plays follow each other without a
+/// gap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SoundRepeat {
+    #[default]
+    Once,
+    /// This many plays in all (1 is once).
+    Times(u32),
+    /// Until it is stopped.
+    Forever,
+}
+
 /// Add a sound to the block.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
@@ -96,6 +110,8 @@ pub struct AddSoundRequest {
     pub routes: Vec<SoundRoute>,
     #[serde(default)]
     pub start: SoundStart,
+    #[serde(default)]
+    pub repeat: SoundRepeat,
 }
 
 /// What a fade leaves behind.
