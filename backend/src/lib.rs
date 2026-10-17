@@ -392,6 +392,31 @@ pub async fn create_app_with_config(
             "/flows/{flow_id}/blocks/{block_id}/player/goto",
             post(api::mediaplayer::goto_file),
         )
+        // Show Sound: sound cues in zones
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound",
+            get(api::show_sound::get_show_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds",
+            post(api::show_sound::add_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/play",
+            post(api::show_sound::play_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/fade",
+            post(api::show_sound::fade_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/stop",
+            post(api::show_sound::stop_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_sound/zones/{zone}",
+            post(api::show_sound::set_zone_level),
+        )
         // Remote control of the Chromium browsers behind HTML sources.
         // Minting a link is authenticated; opening one is not, because the
         // key in the link is itself the credential (see api::devtools).

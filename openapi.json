@@ -2225,6 +2225,404 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound": {
+      "get": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "The block's zones and sounds.",
+        "operationId": "get_show_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Zones and sounds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShowSoundState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds": {
+      "post": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "Add a sound: preloaded to start at once on `play`, or played as soon as\nit is decoded. A sound of the same id is replaced.",
+        "operationId": "add_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddSoundRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Sound added"
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The sound cannot be added (zone, channel, limit)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/fade": {
+      "post": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "Fade a sound's level along an S-curve, optionally stopping it at the end.",
+        "operationId": "fade_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundFadeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Fading"
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/play": {
+      "post": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "Play a sound.",
+        "operationId": "play_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Playing, or plays once decoded"
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it has ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/sounds/{sound_id}/stop": {
+      "post": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "Stop a sound, faded out over `fade_ms`.",
+        "operationId": "stop_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundStopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stopping"
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_sound/zones/{zone}": {
+      "post": {
+        "tags": [
+          "show_sound"
+        ],
+        "summary": "Set a zone's level and mute, faded.",
+        "operationId": "set_zone_level",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone index, from 0",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneLevelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Level set"
+          },
+          "404": {
+            "description": "No running Show Sound block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such zone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/state": {
       "get": {
         "tags": [
@@ -6186,6 +6584,39 @@
           }
         }
       },
+      "AddSoundRequest": {
+        "type": "object",
+        "description": "Add a sound to the block.",
+        "required": [
+          "id",
+          "uri"
+        ],
+        "properties": {
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Level of the whole sound (dB)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Name of the sound in this block; a sound of the same id is replaced."
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundRoute"
+            },
+            "description": "Where its channels go. Empty: each file channel to the same channel\nof the first zone."
+          },
+          "start": {
+            "$ref": "#/components/schemas/SoundStart"
+          },
+          "uri": {
+            "type": "string",
+            "description": "`file://` URI (or a path in the media folder) of the sound file."
+          }
+        }
+      },
       "AnimateInputRequest": {
         "type": "object",
         "description": "Request to animate a single input's position/size.",
@@ -7677,6 +8108,14 @@
             "description": "Output pads (mapped to internal element pads)"
           }
         }
+      },
+      "FadeEnd": {
+        "type": "string",
+        "description": "What a fade leaves behind.",
+        "enum": [
+          "keep",
+          "stop"
+        ]
       },
       "FadeToBlackRequest": {
         "type": "object",
@@ -10268,6 +10707,155 @@
           },
           "message": {
             "type": "string"
+          }
+        }
+      },
+      "ShowSoundState": {
+        "type": "object",
+        "description": "The block's sounds.",
+        "required": [
+          "zones",
+          "sounds"
+        ],
+        "properties": {
+          "sounds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundInfo"
+            }
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShowZone"
+            }
+          }
+        }
+      },
+      "ShowZone": {
+        "type": "object",
+        "description": "One zone: a named group of output channels, one block output.",
+        "required": [
+          "name",
+          "channels"
+        ],
+        "properties": {
+          "channels": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 to [`MAX_ZONE_CHANNELS`].",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "SoundFadeRequest": {
+        "type": "object",
+        "description": "Fade a sound's level (S-curve).",
+        "required": [
+          "gain_db",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/FadeEnd"
+          },
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Target level (dB); [`GAIN_MIN_DB`] or lower is silence."
+          }
+        }
+      },
+      "SoundInfo": {
+        "type": "object",
+        "description": "One sound of the block.",
+        "required": [
+          "id",
+          "state"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SoundState"
+          }
+        }
+      },
+      "SoundRoute": {
+        "type": "object",
+        "description": "One crosspoint: a channel of the sound's file into a channel of a zone.",
+        "required": [
+          "channel",
+          "zone",
+          "zone_channel"
+        ],
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "format": "int32",
+            "description": "File channel, from 0.",
+            "minimum": 0
+          },
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Level of this crosspoint (dB)."
+          },
+          "zone": {
+            "type": "integer",
+            "description": "Zone, by its index in the block's `zones`.",
+            "minimum": 0
+          },
+          "zone_channel": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Zone channel, from 0.",
+            "minimum": 0
+          }
+        }
+      },
+      "SoundStart": {
+        "type": "string",
+        "description": "When a sound added to the block starts.",
+        "enum": [
+          "preload",
+          "play"
+        ]
+      },
+      "SoundState": {
+        "type": "string",
+        "description": "Where a sound is.",
+        "enum": [
+          "loading",
+          "ready",
+          "playing",
+          "ended",
+          "failed"
+        ]
+      },
+      "SoundStopRequest": {
+        "type": "object",
+        "description": "Stop a sound, faded out over `fade_ms`.",
+        "properties": {
+          "fade_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -14788,6 +15376,30 @@
             "description": "Border width in PGM canvas pixels, drawn outward from the box edge.\nEvery render target scales it by `region_width / pgm_width`, so the\nborder looks proportionally identical on PGM, the PVW big display and\nthe PiP thumbnails regardless of resolution."
           }
         }
+      },
+      "ZoneLevelRequest": {
+        "type": "object",
+        "description": "Set a zone's level and mute, faded over `duration_ms`.",
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gain_db": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "mute": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
       }
     }
   },
@@ -14847,6 +15459,10 @@
     {
       "name": "media_player",
       "description": "Media player control endpoints"
+    },
+    {
+      "name": "show_sound",
+      "description": "Sound cues in the zones of a Show Sound block"
     },
     {
       "name": "probes",
