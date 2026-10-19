@@ -2290,7 +2290,8 @@ impl AppState {
         // A stinger owns the program until its clip has played out.
         let Some(_claim) = stinger::claim_for_classic(flow_id, block_instance_id) else {
             return Err(PipelineError::TransitionError(
-                "a stinger is on air; move the T-bar when it has finished".to_string(),
+                "a stinger or another take is programming the mixer; move the T-bar when it has finished"
+                    .to_string(),
             ));
         };
         let pipelines = self.inner.pipelines.read().await;

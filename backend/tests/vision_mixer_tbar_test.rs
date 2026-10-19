@@ -371,3 +371,66 @@ async fn the_bar_waits_for_a_running_take_or_fade_from_black() {
         .expect("the bar once everything has landed");
     manager.stop().expect("stop");
 }
+
+/// A push opens no gap between the two pictures on the way, and a take
+/// without a duration is a cut whatever its transition: neither puts the
+/// new program out of the picture for a frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_step_and_a_zero_length_slide_show_no_black() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let outgoing = mixer.static_pad("sink_0").expect("program pad");
+    let incoming = mixer.static_pad("sink_1").expect("preview pad");
+
+    // Push left: the new picture follows the old one out to the left.
+    hold(&manager, &sink, "push_left", 0.1, 'r', '?');
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ids = Vec::new();
+    for pad in [&outgoing, &incoming] {
+        let (log, a, b) = (seen.clone(), outgoing.downgrade(), incoming.downgrade());
+        ids.push(pad.connect_notify(Some("xpos"), move |_, _| {
+            if let (Some(a), Some(b)) = (a.upgrade(), b.upgrade()) {
+                log.lock()
+                    .unwrap()
+                    .push((a.property::<i32>("xpos"), b.property::<i32>("xpos")));
+            }
+        }));
+    }
+    manager
+        .hold_vision_mixer_transition(BLOCK, "push_left", 0.9)
+        .expect("hold");
+    manager
+        .hold_vision_mixer_transition(BLOCK, "push_left", 0.2)
+        .expect("hold");
+    for (pad, id) in [&outgoing, &incoming].into_iter().zip(ids) {
+        pad.disconnect(id);
+    }
+    let states = seen.lock().unwrap().clone();
+    assert!(states.len() >= 4, "both pads should move twice: {states:?}");
+    assert!(
+        states.iter().all(|&(old, new)| new <= old + W as i32),
+        "a gap opened between the pictures: {states:?}"
+    );
+
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+    let take = states_during(&incoming, || {
+        manager
+            .trigger_transition(BLOCK, 0, 1, "slide_left", 0)
+            .expect("take");
+    });
+    assert!(
+        take.iter().all(|&(alpha, xpos)| alpha == 0.0 || xpos == 0),
+        "the new program left the picture on a cut: {take:?}"
+    );
+    manager.stop().expect("stop");
+}
