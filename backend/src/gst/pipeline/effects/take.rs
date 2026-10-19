@@ -442,6 +442,64 @@ impl PipelineManager {
         };
         Ok((was_ftb, old_pgm, new_pgm, actual_kind))
     }
+    /// Hold the take from program to preview at `position` (a T-bar):
+    /// the pads rest as for a classic take, then show `transition_type` at
+    /// that point (see `transitions::tbar`). Inputs only: a PiP on either
+    /// bus is refused. A take (at the end) or position 0 puts it back.
+    pub fn hold_vision_mixer_transition(
+        &self,
+        block_instance_id: &str,
+        transition_type: &str,
+        position: f64,
+    ) -> Result<(), PipelineError> {
+        use crate::gst::transitions::{TransitionController, TransitionType};
+
+        let invalid = |reason: String| PipelineError::InvalidProperty {
+            element: block_instance_id.to_string(),
+            property: "tbar".to_string(),
+            reason,
+        };
+        if !(0.0..=1.0).contains(&position) {
+            return Err(invalid(format!("position {} is outside 0..1", position)));
+        }
+        let trans_type = transition_type
+            .parse::<TransitionType>()
+            .map_err(|_| invalid(format!("Unknown transition type: {}", transition_type)))?;
+        let mixer_id = format!("{}:mixer", block_instance_id);
+        let mixer = self
+            .elements
+            .get(&mixer_id)
+            .ok_or_else(|| PipelineError::ElementNotFound(mixer_id.clone()))?;
+        let state = crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(
+            &self.flow_id,
+            block_instance_id,
+        )
+        .ok_or_else(|| PipelineError::ElementNotFound(block_instance_id.to_string()))?;
+        if state.pgm_pip().is_some() || state.pvw_pip().is_some() {
+            return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string()));
+        }
+        let (Some(from), Some(to)) = (state.pgm_input(), state.pvw_input()) else {
+            return Err(invalid(
+                "needs an input on program and on preview".to_string(),
+            ));
+        };
+
+        self.reset_take_fx(block_instance_id);
+        let (canvas_width, canvas_height) = self.dist_canvas_size(block_instance_id);
+        self.reset_classic_take_pads(
+            block_instance_id,
+            mixer,
+            Some(&state),
+            Some(from),
+            state.num_inputs,
+            canvas_width,
+            canvas_height,
+        );
+        TransitionController::new(mixer.clone(), canvas_width, canvas_height)
+            .hold_at(from, to, trans_type, position)
+            .map_err(|e| PipelineError::TransitionError(e.to_string()))
+    }
+
     /// Put every dist mixer pad in its resting state for an input-to-input
     /// take: animation bindings neutralised, inputs aspect-fit to the canvas
     /// with only `active_pgm_input` visible, DSKs as switched, everything

@@ -2280,6 +2280,27 @@ impl AppState {
     }
 
     /// Trigger a transition on a compositor/mixer block.
+    /// Hold the take from program to preview at a T-bar position.
+    pub async fn hold_vision_mixer_transition(
+        &self,
+        flow_id: &FlowId,
+        block_instance_id: &str,
+        transition_type: &str,
+        position: f64,
+    ) -> Result<(), PipelineError> {
+        // A stinger owns the program until its clip has played out.
+        let Some(_claim) = stinger::claim_for_classic(flow_id, block_instance_id) else {
+            return Err(PipelineError::TransitionError(
+                "a stinger is on air; move the T-bar when it has finished".to_string(),
+            ));
+        };
+        let pipelines = self.inner.pipelines.read().await;
+        let manager = pipelines.get(flow_id).ok_or_else(|| {
+            PipelineError::InvalidFlow(format!("Pipeline not running for flow: {}", flow_id))
+        })?;
+        manager.hold_vision_mixer_transition(block_instance_id, transition_type, position)
+    }
+
     pub async fn trigger_transition(
         &self,
         flow_id: &FlowId,

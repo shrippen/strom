@@ -3549,6 +3549,61 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/tbar": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Hold the take from program to preview at a T-bar position.",
+        "description": "Program and preview must be inputs (not PiPs). The pads show the\ntransition at `position` until the next call, a take, or position 0.",
+        "operationId": "hold_transition",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HoldTransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Held at the position"
+          },
+          "400": {
+            "description": "Invalid request, PiP on a bus, or a stinger on air",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/transition": {
       "post": {
         "tags": [
@@ -9063,6 +9118,24 @@
           "default": {
             "type": "string",
             "description": "The default GST_DEBUG filter the server started with"
+          }
+        }
+      },
+      "HoldTransitionRequest": {
+        "type": "object",
+        "description": "Request to hold the take from program to preview at a T-bar position.",
+        "required": [
+          "position"
+        ],
+        "properties": {
+          "position": {
+            "type": "number",
+            "format": "double",
+            "description": "How far the take is: 0 = program as it is, 1 = preview fully in.\nThe take itself is a transition request (usually a cut at 1)."
+          },
+          "transition_type": {
+            "type": "string",
+            "description": "The transition the bar runs, as for a take (\"fade\", \"slide_left\",\n\"push_up\", \"dip_to_black\", ...). Wipes and master FX show as a fade."
           }
         }
       },
