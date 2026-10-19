@@ -273,6 +273,29 @@ impl PipelineManager {
                     // animate position+size; fresh sources alpha-fade in; departing
                     // sources alpha-fade out. Runs in parallel on both dist (PGM)
                     // and mv PVW big regions.
+                    // An input in neither composition is left alone by the
+                    // morph: one a held T-bar showed goes off first.
+                    for pad in mixer.sink_pads() {
+                        let Some(idx) = pad
+                            .name()
+                            .strip_prefix("sink_")
+                            .and_then(|i| i.parse::<usize>().ok())
+                            .filter(|idx| *idx < state.num_inputs)
+                        else {
+                            continue;
+                        };
+                        if old_dist_targets
+                            .iter()
+                            .chain(&new_dist_targets)
+                            .all(|t| t.pad_idx != idx)
+                        {
+                            crate::gst::control_bindings::wipe_control_bindings(
+                                pad.upcast_ref(),
+                                &["alpha"],
+                            );
+                            pad.set_property("alpha", 0.0f64);
+                        }
+                    }
                     let dist_controller =
                         TransitionController::new(mixer.clone(), canvas_width, canvas_height);
                     dist_controller

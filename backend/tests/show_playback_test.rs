@@ -334,10 +334,11 @@ fn a_zone_keeps_time_behind_a_sink_that_does_not_sync() {
     );
 }
 
-/// GO to heard is mostly the zone pipeline's latency: the zone mixer's
-/// own slack, one block, and its live silence. The silence reports its
-/// buffer as latency, so at audiotestsrc's default (1024 samples, 21 ms)
-/// and the mixer's old 30 ms this rig waited 60 ms; now 45 ms.
+/// GO to heard is the zone pipeline's latency plus the output's: here
+/// 5 ms silence (it reports its buffer), 5 ms block, 15 ms zone mixer and
+/// the appsink's 20 ms processing deadline, 45 ms. With the silence at
+/// audiotestsrc's default (1024 samples, 21 ms) it was 61 ms; before
+/// this change (mixer 30 ms, 10 ms blocks) 90 ms.
 #[test]
 fn a_zone_waits_little_before_it_plays() {
     let rig = rig_with(true);

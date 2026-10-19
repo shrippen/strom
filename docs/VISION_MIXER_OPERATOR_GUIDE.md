@@ -226,13 +226,14 @@ supported:
 
 | Kind | What the clip holds | How the program changes | Backend |
 |---|---|---|---|
-| **Classic** | A graphic with an alpha channel | Cut (or mix) at the cut point, while the graphic covers the frame | GPU and CPU |
-| **Track matte** | Graphic and matte in one file, side by side or stacked (the OBS layout) | Pixel by pixel, following the matte: black shows the old source, white the new one, grey blends | GPU |
-| **Mask only** | A matte, no graphic: an animated wipe | As track matte | GPU |
+| **Classic** | A graphic with an alpha channel | Cut (or mix) at the cut point, while the graphic covers the frame | all (CPU, OpenGL, CUDA) |
+| **Track matte** | Graphic and matte in one file, side by side or stacked (the OBS layout) | Pixel by pixel, following the matte: black shows the old source, white the new one, grey blends | OpenGL |
+| **Mask only** | A matte, no graphic: an animated wipe | As track matte | OpenGL |
 
-On the CPU backend a track-matte or mask-only clip plays as classic: its
-graphic (if any) on top and a cut where the matte crosses half way (a mix
-across the matte's movement for a mask). The panel marks such clips **CPU**.
+On the CPU and CUDA backends a track-matte or mask-only clip plays as
+classic (they have no matte stage): its graphic (if any) on top and a cut
+where the matte crosses half way (a mix across the matte's movement for a
+mask). The panel marks such clips **CPU**, on the CUDA mixer too.
 
 **Setting up.**
 
