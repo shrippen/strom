@@ -69,8 +69,22 @@ const STAGE_DIMMER_ZORDER: u32 = MAX_LAYER + 1;
 /// Rate every zone runs at.
 pub const ZONE_RATE: i32 = 48_000;
 
-/// Aggregator latency of a zone (ms): slack for a sound's first buffer.
-const ZONE_LATENCY_MS: u64 = 30;
+/// Aggregator latency of a zone (ms): slack for a sound's first buffer
+/// between `play` and the zone mixer. Everything in a zone's pipeline
+/// waits this long, so it is most of the way from GO to heard (lmix
+/// SND.12: 50 ms with the sound server). On PipeWire with a Scarlett
+/// Solo, GO to the first sample took 44 ms with 15 ms here, 44-56 ms with
+/// 20 and 63-74 ms with 30 (and a 1024-sample silence); 10 ms dropped
+/// samples once with 16 sounds at once.
+const ZONE_LATENCY_MS: u64 = 15;
+
+/// A zone mixes in blocks of this length (ms); it adds to GO-to-heard.
+const ZONE_BLOCK_MS: u64 = 5;
+
+/// Samples per buffer of a zone's live silence: one block. A live source
+/// reports its buffer as latency, and audiotestsrc's default of 1024
+/// samples (21 ms) added that much to every sound's way to the sink.
+const ZONE_SILENCE_SAMPLES: i32 = (ZONE_RATE as u64 * ZONE_BLOCK_MS / 1000) as i32;
 
 /// The zones of a block nobody has configured.
 fn default_zones() -> Vec<ShowZone> {
@@ -271,19 +285,23 @@ impl BlockBuilder for ShowPlaybackBuilder {
         let mut zone_volumes = Vec::new();
         for (i, zone) in zones.iter().enumerate() {
             let id = |part: &str| format!("{}:{}_{}", instance_id, part, i);
+            // Upstream latency: the live silence's one block; sounds are
+            // not live and report none.
             let mixer = crate::blocks::builtin::mixer::make_audiomixer(
                 &id("zone_mixer"),
                 true,
                 ZONE_LATENCY_MS,
-                ZONE_LATENCY_MS,
+                ZONE_BLOCK_MS,
                 crate::blocks::builtin::start_time::StartTime::Zero,
             )?;
+            mixer.set_property("output-buffer-duration", ZONE_BLOCK_MS * 1_000_000);
             // Live silence clocks the zone: without a live input the mixer
             // mixes a sound as fast as it arrives (5 s of a file in ~0.1 s
             // on a PipeWire sink), so the sound's end and any stop come
             // seconds before it is heard. Like the stage's live black.
             let silence = make("audiotestsrc", id("zone_silence"))?;
             silence.set_property("is-live", true);
+            silence.set_property("samplesperbuffer", ZONE_SILENCE_SAMPLES);
             silence.set_property_from_str("wave", "silence");
             let silence_caps = make("capsfilter", id("zone_scaps"))?;
             silence_caps.set_property("caps", zone_caps(zone.channels));
