@@ -643,11 +643,15 @@ impl PipelineManager {
             to_pad.property::<i32>("ypos"),
         );
         let distance = |(x, y): (i32, i32)| (x - to_rect.0).abs() + (y - to_rect.1).abs();
-        let towards_preview = frame.to_alpha > to_pad.property::<f64>("alpha")
-            || distance({
-                let (x, y, _, _) = moved(to_rect, frame.to_offset);
-                (x, y)
-            }) < distance(to_now);
+        // An incoming pad that gets fainter (the effect changed under the
+        // held bar) goes last, so the outgoing one covers first.
+        let to_alpha_now = to_pad.property::<f64>("alpha");
+        let towards_preview = frame.to_alpha >= to_alpha_now
+            && (frame.to_alpha > to_alpha_now
+                || distance({
+                    let (x, y, _, _) = moved(to_rect, frame.to_offset);
+                    (x, y)
+                }) < distance(to_now));
         let from_values = (
             moved(from_rect, frame.from_offset),
             frame.from_alpha,

@@ -114,6 +114,12 @@ impl TransitionController {
             transitions.clear();
         }
 
+        // A cut needs no time: asking anyway could fail it after the take
+        // has already rested the pads on the new program.
+        if transition_type == TransitionType::Cut {
+            return self.transition_cut(from_input, to_input);
+        }
+
         // Adjust for pipeline latency so keyframes align with compositor processing
         let current_time = self.query_stream_time(pipeline)?;
         let end_time = current_time + gst::ClockTime::from_mseconds(duration_ms);
