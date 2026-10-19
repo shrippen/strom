@@ -92,6 +92,9 @@ pub fn make_dist_compositor(
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
     }
+    if backend == CompositorBackend::Cuda {
+        guard_cuda_full_alpha(&mixer);
+    }
     debug!(
         "Created distribution compositor: {} ({})",
         element_type,
@@ -119,6 +122,9 @@ pub fn make_mv_compositor(
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
     }
+    if backend == CompositorBackend::Cuda {
+        guard_cuda_full_alpha(&mixer);
+    }
 
     debug!(
         "Created multiview compositor: {} ({})",
@@ -126,6 +132,32 @@ pub fn make_mv_compositor(
         backend_name(backend)
     );
     Ok(mixer)
+}
+
+/// Alpha just below 1.0 that is still exactly 1.0 as `f32`.
+const CUDA_FULL_ALPHA: f64 = 1.0 - 1e-12;
+
+/// Work around `cudaconverter` (GStreamer 1.28, also main): its `alpha`
+/// setter compares against a field it never updates (always 1.0), so a pad
+/// going from a fraction back to exactly 1.0 keeps the fraction. After a
+/// fade the new program stayed at its last in-between alpha (~0.97, Ball
+/// on grey) and the old source, cut back later, at ~0.03 (nearly black).
+/// 1.0 on a `cudacompositor` pad becomes `CUDA_FULL_ALPHA`: a change for the
+/// converter, and 1.0 again in the kernel's `f32`, so no level is lost.
+fn guard_cuda_full_alpha(mixer: &gst::Element) {
+    mixer.connect_pad_added(|_, pad| {
+        if pad.direction() != gst::PadDirection::Sink || pad.find_property("alpha").is_none() {
+            return;
+        }
+        pad.connect_notify(Some("alpha"), |pad, _| {
+            if pad.property::<f64>("alpha") == 1.0 {
+                pad.set_property("alpha", CUDA_FULL_ALPHA);
+            }
+        });
+        if pad.property::<f64>("alpha") == 1.0 {
+            pad.set_property("alpha", CUDA_FULL_ALPHA);
+        }
+    });
 }
 
 /// Apply compositor properties that can be set after construction.

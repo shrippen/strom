@@ -622,6 +622,62 @@ fn test_compositors_ignore_inactive_pads() {
     }
 }
 
+/// A CUDA mixer pad back at alpha 1.0 after a fraction (the end of a fade)
+/// is fully opaque again: `cudaconverter` drops a change back to exactly
+/// 1.0, so without the guard white stays at half.
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_pad_alpha_back_to_one() {
+    use super::elements::{make_dist_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+
+    gst::init().unwrap();
+    let mixer = make_dist_compositor(CompositorBackend::Cuda, 20, 20, StartTime::First).unwrap();
+    let pipeline = gst::parse::launch(
+        "videotestsrc is-live=true pattern=white ! video/x-raw,width=320,height=180,framerate=30/1 \
+         ! cudaupload name=up cudadownload name=down ! videoconvert ! video/x-raw,format=GRAY8 \
+         ! appsink name=sink sync=false max-buffers=1 drop=true",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline.add(&mixer).unwrap();
+    pipeline.by_name("up").unwrap().link(&mixer).unwrap();
+    mixer.link(&pipeline.by_name("down").unwrap()).unwrap();
+    let pad = mixer.static_pad("sink_0").unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<AppSink>()
+        .unwrap();
+    let mean = || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let sample = sink.pull_sample().unwrap();
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        map.iter().map(|&v| v as u64).sum::<u64>() / map.len() as u64
+    };
+    pipeline.set_state(gst::State::Playing).unwrap();
+    // White as the mixer's output format carries it (235 in limited range).
+    let full = mean();
+    assert!(full > 200, "white at alpha 1.0: {}", full);
+    pad.set_property("alpha", 0.5f64);
+    let half = mean();
+    assert!(
+        half < full * 3 / 4,
+        "white at alpha 0.5: {} of {}",
+        half,
+        full
+    );
+    pad.set_property("alpha", 1.0f64);
+    let back = mean();
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(back, full, "white back at alpha 1.0 after 0.5");
+}
+
 /// CUDA inputs take formats `cudaupload` has no caps for: ProRes 4444
 /// decodes to A444_10LE, VP9 with alpha to A420 (stingers with alpha).
 /// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
