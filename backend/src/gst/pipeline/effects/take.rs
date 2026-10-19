@@ -378,12 +378,22 @@ impl PipelineManager {
             }
         }
 
+        // Parse transition type (before any pad changes: a refused take
+        // leaves program as it is)
+        let trans_type = transition_type.parse::<TransitionType>().map_err(|_| {
+            PipelineError::InvalidProperty {
+                element: block_instance_id.to_string(),
+                property: "transition_type".to_string(),
+                reason: format!("Unknown transition type: {}", transition_type),
+            }
+        })?;
+
         // Reset all video pads to a clean state before the transition:
         // clear control bindings, restore alpha/position/size for the current
         // PGM input. Single-input PGM only (multi-source compositions are PiPs).
         // A cut rests the new program straight away: from a held T-bar the
         // old one would otherwise come back whole for a frame.
-        let is_cut = duration_ms == 0 || transition_type == "cut";
+        let is_cut = duration_ms == 0 || matches!(trans_type, TransitionType::Cut);
         self.reset_classic_take_pads(
             block_instance_id,
             mixer,
@@ -393,15 +403,6 @@ impl PipelineManager {
             canvas_width,
             canvas_height,
         );
-
-        // Parse transition type
-        let trans_type = transition_type.parse::<TransitionType>().map_err(|_| {
-            PipelineError::InvalidProperty {
-                element: block_instance_id.to_string(),
-                property: "transition_type".to_string(),
-                reason: format!("Unknown transition type: {}", transition_type),
-            }
-        })?;
 
         // Single-input transition only. Multi-source compositions are now
         // expressed as PiPs which are handled by the PiP-aware branch above.
@@ -456,8 +457,8 @@ impl PipelineManager {
     /// Hold the take from program to preview at `position` (a T-bar):
     /// the input pads show `transition_type` at that point (see
     /// `transitions::tbar`); DSKs and the rest keep what they do. A PiP on
-    /// program or preview is refused, except that position 0 always puts
-    /// program back as it was. A cut (at the end) finishes it; a take with
+    /// program or preview is refused, except at position 0, which always
+    /// puts program back as it was (with a PiP on program, as it is). A cut (at the end) finishes it; a take with
     /// a duration, or a stinger, starts from program as it rests, so the
     /// held picture jumps back first. Nothing remembers the hold: a
     /// geometry refresh (an input changing size) rests the pads too.
@@ -510,6 +511,11 @@ impl PipelineManager {
             )));
         }
         if state.pgm_pip().is_some() {
+            // Nothing can be held with a PiP on program (a take to it rests
+            // the pads): at 0 there is nothing to put back.
+            if position == 0.0 {
+                return Ok(());
+            }
             return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string()));
         }
         let Some(from) = state.pgm_input() else {
