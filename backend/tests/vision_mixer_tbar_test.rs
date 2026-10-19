@@ -910,3 +910,70 @@ async fn a_wipe_after_a_fade_under_the_held_bar_changes_nothing() {
     );
     manager.stop().expect("stop");
 }
+
+/// A take with a duration to a PiP after a dip held past black: program
+/// comes back fully before the bar's preview goes off, so the picture is
+/// never black at the start of the take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_take_to_a_pip_after_a_held_dip_shows_no_black() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_pips".to_string(), PV::String("1".into()));
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let outgoing = mixer.static_pad("sink_0").expect("program pad");
+    let incoming = mixer.static_pad("sink_1").expect("preview pad");
+
+    // Past the black: program off, blue half in.
+    hold(&manager, &sink, "dip_to_black", 0.75, '?', '?');
+    assert_eq!(outgoing.property::<f64>("alpha"), 0.0);
+    manager
+        .apply_vision_mixer_pip_config(
+            BLOCK,
+            0,
+            Some(0),
+            Vec::new(),
+            strom_types::vision_mixer::PipTransforms::new(),
+        )
+        .expect("PiP config");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP to preview");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ids = Vec::new();
+    for pad in [&outgoing, &incoming] {
+        let (log, a, b) = (seen.clone(), outgoing.downgrade(), incoming.downgrade());
+        ids.push(pad.connect_notify(Some("alpha"), move |_, _| {
+            if let (Some(a), Some(b)) = (a.upgrade(), b.upgrade()) {
+                log.lock()
+                    .unwrap()
+                    .push((a.property::<f64>("alpha"), b.property::<f64>("alpha")));
+            }
+        }));
+    }
+    manager
+        .trigger_transition(BLOCK, 0, 0, "fade", 300)
+        .expect("take the PiP");
+    for (pad, id) in [&outgoing, &incoming].into_iter().zip(ids) {
+        pad.disconnect(id);
+    }
+    let states = seen.lock().unwrap().clone();
+    assert!(
+        states
+            .iter()
+            .all(|&(old_alpha, new_alpha)| old_alpha == 1.0 || new_alpha > 0.0),
+        "both pads off at once: {states:?}"
+    );
+    manager.stop().expect("stop");
+}
