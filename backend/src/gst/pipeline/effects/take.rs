@@ -286,8 +286,10 @@ impl PipelineManager {
                     // input a held T-bar showed goes off first (the morph
                     // would leave it, or move it from where the bar put it).
                     use gstreamer_controller::prelude::*;
-                    // Set by the bar: no fade programmed on its alpha.
-                    let held_by_bar = |pad: &gstreamer::Pad| {
+                    // No fade programmed on its alpha: set by the bar, or
+                    // resting after a cut (already at its values or off, so
+                    // the writes below change nothing there).
+                    let no_fade_programmed = |pad: &gstreamer::Pad| {
                         !pad.control_binding("alpha")
                             .and_then(|b| {
                                 b.property::<Option<gstreamer::ControlSource>>("control-source")
@@ -299,12 +301,12 @@ impl PipelineManager {
                             .is_some_and(|cs| !cs.list_control_points().is_empty())
                     };
                     // Program's pads back to where its composition has them
-                    // (a held push moved them), before anything goes off.
+                    // and fully on (a held push moved them, a held fade or
+                    // dip dimmed them), before anything goes off.
                     for t in &old_dist_targets {
                         if let Some(pad) = mixer.static_pad(&format!("sink_{}", t.pad_idx)) {
-                            if held_by_bar(&pad) {
-                                let alpha = pad.property::<f64>("alpha");
-                                set_bar_pad(&pad, (t.x, t.y, t.w, t.h), alpha, None);
+                            if no_fade_programmed(&pad) {
+                                set_bar_pad(&pad, (t.x, t.y, t.w, t.h), 1.0, None);
                             }
                         }
                     }
@@ -318,7 +320,7 @@ impl PipelineManager {
                             continue;
                         };
                         // Set by the bar: visible, no fade programmed.
-                        let animated = !held_by_bar(&pad);
+                        let animated = !no_fade_programmed(&pad);
                         if old_dist_targets.iter().all(|t| t.pad_idx != idx)
                             && pad.property::<f64>("alpha") > 0.0
                             && !animated
