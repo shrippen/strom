@@ -465,3 +465,45 @@ async fn a_refused_take_leaves_program_alone() {
     );
     manager.stop().expect("stop");
 }
+
+/// A take with a duration to a PiP, while the bar holds an input on
+/// program: that input goes off with the take instead of staying on air
+/// over the PiP (the morph only moves the pads of both compositions).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_take_to_a_pip_clears_what_the_bar_held() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_pips".to_string(), PV::String("1".into()));
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+
+    // Blue slid half in over red, then a PiP of red alone on preview.
+    hold(&manager, &sink, "slide_left", 0.5, 'r', 'b');
+    manager
+        .apply_vision_mixer_pip_config(
+            BLOCK,
+            0,
+            Some(0),
+            Vec::new(),
+            strom_types::vision_mixer::PipTransforms::new(),
+        )
+        .expect("PiP config");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP to preview");
+    manager
+        .trigger_transition(BLOCK, 0, 0, "fade", 300)
+        .expect("take the PiP");
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    // `hold` with position 0 and a PiP on program changes nothing; it
+    // waits for program to show red on both halves.
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+    manager.stop().expect("stop");
+}
