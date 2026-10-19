@@ -11,7 +11,9 @@
 //! compositor has one pad per input, fed from the input's tee, and
 //! [`mirror`] copies each change of a multiview PVW pad to its twin, scaled
 //! from `pvw_rect` to the full frame. So no operation has to know about it.
-//! Border underlays are not mirrored: zone borders do not show here.
+//! Zone borders: with PiPs, each input also has a border underlay chain to
+//! `pvw_comp.sink_{N+i}`, mirrored from the multiview's PVW underlay pad;
+//! its colour and hold come from `underlays` like every other underlay.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -83,6 +85,10 @@ pub(super) fn append(
         ));
     }
 
+    if p.num_pips > 0 {
+        append_underlays(p, &comp_id, elems, links)?;
+    }
+
     let q_out_id = p.id("queue_pvw_out");
     elems.push((q_out_id.clone(), elements::make_queue(&q_out_id)?));
     let cf_id = p.id("capsfilter_pvw");
@@ -128,6 +134,57 @@ pub(super) fn append(
         p.instance_id, p.pgm_w, p.pgm_h
     );
     Ok(pvw_comp)
+}
+
+/// One border underlay chain per input into `pvw_comp.sink_{N+i}`, built
+/// like the multiview's (see the backend builders).
+fn append_underlays(
+    p: &PipelineParams,
+    comp_id: &str,
+    elems: &mut Vec<(String, gst::Element)>,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) -> Result<(), BlockBuildError> {
+    let (live, caps) = p.underlay_source();
+    let caps: gst::Caps = caps
+        .parse()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
+    for i in 0..p.num_inputs {
+        let name = |part: &str| p.id(&format!("underlay_pvw_out_{}_{}", i, part));
+        let src = crate::gst::underlay::make_underlay_src(&name("src"), live)
+            .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", name("src"), e)))?;
+        let cf = capsfilter(&name("caps"), &caps)?;
+        let mut chain = vec![name("src"), name("caps")];
+        elems.push((name("src"), src));
+        let upload = match p.backend {
+            CompositorBackend::OpenGL => {
+                if let Some(pad) = cf.static_pad("src") {
+                    super::pipeline_gpu::keep_own_memory(&pad);
+                }
+                Some("glupload")
+            }
+            CompositorBackend::Cuda => Some(super::pipeline_cpu::CUDA_UPLOAD),
+            CompositorBackend::Software => None,
+        };
+        elems.push((name("caps"), cf));
+        if let Some(factory) = upload {
+            elems.push((
+                name("upload"),
+                elements::make_element(factory, &name("upload"))?,
+            ));
+            chain.push(name("upload"));
+        }
+        for pair in chain.windows(2) {
+            links.push((
+                ElementPadRef::pad(&pair[0], "src"),
+                ElementPadRef::pad(&pair[1], "sink"),
+            ));
+        }
+        links.push((
+            ElementPadRef::pad(chain.last().expect("chain"), "src"),
+            ElementPadRef::pad(comp_id, format!("sink_{}", p.num_inputs + i)),
+        ));
+    }
+    Ok(())
 }
 
 fn capsfilter(id: &str, caps: &gst::Caps) -> Result<gst::Element, BlockBuildError> {
@@ -192,23 +249,29 @@ fn upstream_crop(pad: &gst::Pad) -> Option<gst::Element> {
 }
 
 /// Make the preview compositor follow the multiview's PVW pads (from the
-/// element setup, once the request pads exist). `pvw_rect` is the
+/// element setup, once the request pads exist): each input's PVW pad, and
+/// its border underlay pad from `mv_underlay_base` on. `pvw_rect` is the
 /// multiview's PVW rectangle, `out_w`×`out_h` the preview output's size.
 pub(super) fn mirror(
     mv_comp: &gst::Element,
     pvw_comp: &gst::Element,
     num_inputs: usize,
+    mv_underlay_base: Option<usize>,
     pvw_rect: &Rect,
     out_w: u32,
     out_h: u32,
 ) {
     let scale = Scale::new(pvw_rect, out_w, out_h);
-    for i in 0..num_inputs {
+    let inputs = (0..num_inputs).map(|i| (num_inputs + 1 + i, i));
+    let underlays = mv_underlay_base
+        .into_iter()
+        .flat_map(|base| (0..num_inputs).map(move |i| (base + i, num_inputs + i)));
+    for (mv_idx, pvw_idx) in inputs.chain(underlays) {
         let (Some(from), Some(to)) = (
-            mv_comp.static_pad(&format!("sink_{}", num_inputs + 1 + i)),
-            pvw_comp.static_pad(&format!("sink_{}", i)),
+            mv_comp.static_pad(&format!("sink_{}", mv_idx)),
+            pvw_comp.static_pad(&format!("sink_{}", pvw_idx)),
         ) else {
-            debug!("preview output: no pad pair for input {}", i);
+            debug!("preview output: no pad pair {} -> {}", mv_idx, pvw_idx);
             continue;
         };
         for property in GEOMETRY.iter().chain(COPIED.iter()) {
