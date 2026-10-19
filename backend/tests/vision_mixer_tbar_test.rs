@@ -724,3 +724,47 @@ async fn an_effect_change_under_the_held_bar_shows_no_black() {
     );
     manager.stop().expect("stop");
 }
+
+/// After a wipe take on the GL mixer the outgoing input's take slot is
+/// masked away (an inverted wipe ends fully transparent). The bar back to
+/// that input shows it again: here a fade at half mixes the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bar_after_a_wipe_shows_the_wiped_input_again() {
+    if gstreamer::init().is_err()
+        || ["glvideomixerelement", "glshader", "gltestsrc"]
+            .iter()
+            .any(|e| gstreamer::ElementFactory::find(e).is_none())
+    {
+        return;
+    }
+    let mut flow = build_flow(false);
+    for (k, v) in [
+        ("compositor_preference", PV::String("gpu".into())),
+        ("gl_download", PV::Bool(true)),
+    ] {
+        flow.blocks[0].properties.insert(k.to_string(), v);
+    }
+    let flow_id = flow.id;
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+
+    manager
+        .trigger_transition(BLOCK, 0, 1, "wipe_left", 400)
+        .expect("wipe take");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // What the API does after the take: blue on program, red on preview.
+    let state = strom::blocks::builtin::vision_mixer::overlay::get_overlay_state(&flow_id, BLOCK)
+        .expect("mixer state");
+    state.set_pgm_input(Some(1));
+    state.set_pvw_input(Some(0));
+    hold(&manager, &sink, "fade", 0.0, 'b', 'b');
+    hold(&manager, &sink, "fade", 0.5, 'm', 'm');
+    manager.stop().expect("stop");
+}
