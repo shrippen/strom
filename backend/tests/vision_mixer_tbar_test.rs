@@ -879,3 +879,34 @@ async fn a_take_to_a_pip_after_a_held_push_shows_no_black() {
     );
     manager.stop().expect("stop");
 }
+
+/// Button 1 from fade to a wipe under the held bar: the bar shows both as
+/// a fade, so nothing changes on air (no rest in between).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wipe_after_a_fade_under_the_held_bar_changes_nothing() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let incoming = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_1")
+        .expect("preview pad");
+    hold(&manager, &sink, "fade", 0.5, 'm', 'm');
+    let states = states_during(&incoming, || {
+        manager
+            .hold_vision_mixer_transition(BLOCK, "wipe_left", 0.5)
+            .expect("hold");
+    });
+    assert!(
+        states.iter().all(|&(alpha, _)| alpha == 0.5),
+        "the preview left the mix: {states:?}"
+    );
+    manager.stop().expect("stop");
+}
