@@ -657,3 +657,70 @@ async fn a_new_preview_under_a_held_bar_replaces_the_old_one_without_a_gap() {
     );
     manager.stop().expect("stop");
 }
+
+/// A cut needs no stream time: one taken while the mixer answers no
+/// position (here before the pipeline runs) still succeeds, so the state
+/// follows the picture it has already put on air.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_does_not_need_the_mixer_position() {
+    let (manager, _registry) = build_manager(&build_flow(false));
+    manager
+        .trigger_transition(BLOCK, 0, 1, "cut", 0)
+        .expect("cut without a position");
+    let incoming = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_1")
+        .expect("preview pad");
+    assert_eq!(incoming.property::<f64>("alpha"), 1.0);
+}
+
+/// The effect changed while the bar is held (push, then fade): the
+/// outgoing picture covers its place before the incoming one fades, so
+/// no frame shows the incoming one faint over black.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_effect_change_under_the_held_bar_shows_no_black() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let outgoing = mixer.static_pad("sink_0").expect("program pad");
+    let incoming = mixer.static_pad("sink_1").expect("preview pad");
+
+    hold(&manager, &sink, "push_left", 0.5, 'r', 'b');
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ids = Vec::new();
+    for pad in [&outgoing, &incoming] {
+        let (log, a, b) = (seen.clone(), outgoing.downgrade(), incoming.downgrade());
+        ids.push(pad.connect_notify(None, move |_, _| {
+            if let (Some(a), Some(b)) = (a.upgrade(), b.upgrade()) {
+                log.lock()
+                    .unwrap()
+                    .push((a.property::<i32>("xpos"), b.property::<f64>("alpha")));
+            }
+        }));
+    }
+    manager
+        .hold_vision_mixer_transition(BLOCK, "fade", 0.55)
+        .expect("hold");
+    for (pad, id) in [&outgoing, &incoming].into_iter().zip(ids) {
+        pad.disconnect(id);
+    }
+    let states = seen.lock().unwrap().clone();
+    assert!(
+        states
+            .iter()
+            .all(|&(old_x, new_alpha)| new_alpha == 1.0 || old_x == 0),
+        "the incoming picture faded while the old one was still pushed out: {states:?}"
+    );
+    manager.stop().expect("stop");
+}
