@@ -199,20 +199,33 @@ pub(super) fn build_cpu_pipeline(
             crop_id.clone(),
             elements::make_element("videocrop", &crop_id)?,
         ));
-        links.push((
-            ElementPadRef::pad(&q_id, "src"),
-            ElementPadRef::pad(&vc_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&vc_id, "src"),
-            ElementPadRef::pad(&crop_id, "sink"),
-        ));
         if p.backend == CompositorBackend::Cuda {
+            // Crop before the convert: videocrop takes the clip's alpha
+            // formats (A420 from VP9, A444_10LE from ProRes), so a convert
+            // in front of it passes them through, and cudaupload has no
+            // caps for them (not-negotiated, no stinger on air).
             let up_id = p.id("cudaupload_stinger");
             elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
             links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
+            ));
+            links.push((
                 ElementPadRef::pad(&crop_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
                 ElementPadRef::pad(&up_id, "sink"),
+            ));
+        } else {
+            links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
             ));
         }
     }

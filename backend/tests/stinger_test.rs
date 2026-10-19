@@ -243,27 +243,7 @@ async fn cuda_stingers_play_classic() {
     let dir = tempfile::tempdir().unwrap();
     let clips = vec![dir.path().join("classic.mov")];
     classic_clip(&clips[0]);
-    // Program leaves the CUDA mixer in CUDA memory.
-    let r = start_edited("cuda", "cuda", dir, clips, |flow| {
-        flow.elements.push(strom_types::Element {
-            id: "pgmdown".to_string(),
-            element_type: "cudadownload".to_string(),
-            properties: Default::default(),
-            position: [0.0, 0.0].into(),
-            pad_properties: Default::default(),
-        });
-        let link = flow
-            .links
-            .iter_mut()
-            .find(|l| l.to == "pgmconv:sink")
-            .unwrap();
-        link.to = "pgmdown:sink".to_string();
-        flow.links.push(strom_types::element::Link {
-            from: "pgmdown:src".to_string(),
-            to: "pgmconv:sink".to_string(),
-        });
-    })
-    .await;
+    let r = start_edited("cuda", "cuda", dir, clips, download_cuda_program).await;
     classic_take(&r).await;
     r.state.stop_flow(&r.flow_id).await.unwrap();
 }
