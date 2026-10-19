@@ -286,6 +286,28 @@ impl PipelineManager {
                     // input a held T-bar showed goes off first (the morph
                     // would leave it, or move it from where the bar put it).
                     use gstreamer_controller::prelude::*;
+                    // Set by the bar: no fade programmed on its alpha.
+                    let held_by_bar = |pad: &gstreamer::Pad| {
+                        !pad.control_binding("alpha")
+                            .and_then(|b| {
+                                b.property::<Option<gstreamer::ControlSource>>("control-source")
+                            })
+                            .and_then(|cs| {
+                                cs.downcast::<gstreamer_controller::InterpolationControlSource>()
+                                    .ok()
+                            })
+                            .is_some_and(|cs| !cs.list_control_points().is_empty())
+                    };
+                    // Program's pads back to where its composition has them
+                    // (a held push moved them), before anything goes off.
+                    for t in &old_dist_targets {
+                        if let Some(pad) = mixer.static_pad(&format!("sink_{}", t.pad_idx)) {
+                            if held_by_bar(&pad) {
+                                let alpha = pad.property::<f64>("alpha");
+                                set_bar_pad(&pad, (t.x, t.y, t.w, t.h), alpha, None);
+                            }
+                        }
+                    }
                     for pad in mixer.sink_pads() {
                         let Some(idx) = pad
                             .name()
@@ -296,16 +318,7 @@ impl PipelineManager {
                             continue;
                         };
                         // Set by the bar: visible, no fade programmed.
-                        let animated = pad
-                            .control_binding("alpha")
-                            .and_then(|b| {
-                                b.property::<Option<gstreamer::ControlSource>>("control-source")
-                            })
-                            .and_then(|cs| {
-                                cs.downcast::<gstreamer_controller::InterpolationControlSource>()
-                                    .ok()
-                            })
-                            .is_some_and(|cs| !cs.list_control_points().is_empty());
+                        let animated = !held_by_bar(&pad);
                         if old_dist_targets.iter().all(|t| t.pad_idx != idx)
                             && pad.property::<f64>("alpha") > 0.0
                             && !animated
@@ -563,6 +576,9 @@ impl PipelineManager {
             // Position 0 (or nothing to mix): program as it rests,
             // whatever preview has become meanwhile.
             _ if position == 0.0 || state.pvw_pip().is_none() => {
+                if let Ok(mut held) = state.tbar_effect.lock() {
+                    *held = None;
+                }
                 self.reset_take_pads(
                     block_instance_id,
                     mixer,
@@ -584,6 +600,32 @@ impl PipelineManager {
         // program's take slot is left alone: an envelope still decaying
         // from a take outlasts the pads' keyframes and ends by itself.
         self.reset_input_take_fx(block_instance_id);
+        // Another effect under the held bar (button 1 changed): the pads
+        // rest first, program before the rest goes off, so the step from
+        // one effect's geometry to the other's shows the old picture for a
+        // frame at most, never black or the whole preview.
+        let effect_changed = state
+            .tbar_effect
+            .lock()
+            .map(|mut held| {
+                let name = trans_type.to_string();
+                let changed = held.as_deref().is_some_and(|h| h != name);
+                *held = Some(name);
+                changed
+            })
+            .unwrap_or(false);
+        if effect_changed {
+            self.reset_take_pads(
+                block_instance_id,
+                mixer,
+                Some(&state),
+                Some(from),
+                state.num_inputs,
+                canvas_width,
+                canvas_height,
+                false,
+            );
+        }
         let aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
         let canvas_aspect = if canvas_height > 0 {
             canvas_width as f64 / canvas_height as f64

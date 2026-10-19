@@ -768,3 +768,114 @@ async fn the_bar_after_a_wipe_shows_the_wiped_input_again() {
     hold(&manager, &sink, "fade", 0.5, 'm', 'm');
     manager.stop().expect("stop");
 }
+
+/// Button 1 changed from slide left to slide up under the held bar: the
+/// incoming picture never stands whole at its resting place on the way
+/// from one effect's geometry to the other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_effect_under_the_held_bar_never_shows_the_whole_preview() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let incoming = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_1")
+        .expect("preview pad");
+
+    hold(&manager, &sink, "slide_left", 0.5, 'r', 'b');
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let id = incoming.connect_notify(None, move |pad, _| {
+        log.lock().unwrap().push((
+            pad.property::<f64>("alpha"),
+            pad.property::<i32>("xpos"),
+            pad.property::<i32>("ypos"),
+        ));
+    });
+    manager
+        .hold_vision_mixer_transition(BLOCK, "slide_up", 0.5)
+        .expect("hold");
+    incoming.disconnect(id);
+    let states = seen.lock().unwrap().clone();
+    assert!(
+        states
+            .iter()
+            .all(|&(alpha, x, y)| alpha == 0.0 || (x, y) != (0, 0)),
+        "the whole preview went on air: {states:?}"
+    );
+    manager.stop().expect("stop");
+}
+
+/// A take with a duration to a PiP after a held push: program's pad goes
+/// back to its place before the bar's preview goes off, so no part of the
+/// picture is black at the start of the take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_take_to_a_pip_after_a_held_push_shows_no_black() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_pips".to_string(), PV::String("1".into()));
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let outgoing = mixer.static_pad("sink_0").expect("program pad");
+    let incoming = mixer.static_pad("sink_1").expect("preview pad");
+
+    hold(&manager, &sink, "push_left", 0.5, 'r', 'b');
+    manager
+        .apply_vision_mixer_pip_config(
+            BLOCK,
+            0,
+            Some(1),
+            Vec::new(),
+            strom_types::vision_mixer::PipTransforms::new(),
+        )
+        .expect("PiP config");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP to preview");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ids = Vec::new();
+    for pad in [&outgoing, &incoming] {
+        let (log, a, b) = (seen.clone(), outgoing.downgrade(), incoming.downgrade());
+        ids.push(pad.connect_notify(None, move |_, _| {
+            if let (Some(a), Some(b)) = (a.upgrade(), b.upgrade()) {
+                log.lock()
+                    .unwrap()
+                    .push((a.property::<i32>("xpos"), b.property::<f64>("alpha")));
+            }
+        }));
+    }
+    manager
+        .trigger_transition(BLOCK, 0, 0, "fade", 300)
+        .expect("take the PiP");
+    for (pad, id) in [&outgoing, &incoming].into_iter().zip(ids) {
+        pad.disconnect(id);
+    }
+    let states = seen.lock().unwrap().clone();
+    // While program is still pushed out, the preview must still cover the
+    // other half.
+    assert!(
+        states
+            .iter()
+            .all(|&(old_x, new_alpha)| old_x == 0 || new_alpha == 1.0),
+        "half the picture went black: {states:?}"
+    );
+    manager.stop().expect("stop");
+}

@@ -2321,7 +2321,8 @@ impl AppState {
         // take does.
         let Some(claim) = stinger::claim_for_classic(flow_id, block_instance_id) else {
             return Err(PipelineError::TransitionError(
-                "a stinger is on air; take again when it has finished".to_string(),
+                "a stinger or another take is programming the mixer; take again when it has finished"
+                    .to_string(),
             ));
         };
 
