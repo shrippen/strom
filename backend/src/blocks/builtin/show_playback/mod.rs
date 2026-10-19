@@ -5,6 +5,7 @@
 //! The zones are built with the flow; each one is a bus with a block output:
 //!
 //! ```text
+//! zone_silence_Z (audiotestsrc, live) -> zone_scaps_Z -> zone_mixer_Z
 //! zone_mixer_Z (audiomixer, force-live) -> zone_caps_Z -> zone_vol_Z (volume)
 //!     -> zone_out_Z (identity) -> [zone_out_Z]
 //! ```

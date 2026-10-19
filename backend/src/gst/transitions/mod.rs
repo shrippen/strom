@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 mod controller;
-mod plan;
+pub(crate) mod plan;
 pub mod tbar;
 
 pub use plan::plan_transition;

@@ -2279,7 +2279,6 @@ impl AppState {
         Ok(out)
     }
 
-    /// Trigger a transition on a compositor/mixer block.
     /// Hold the take from program to preview at a T-bar position.
     pub async fn hold_vision_mixer_transition(
         &self,
@@ -2301,6 +2300,7 @@ impl AppState {
         manager.hold_vision_mixer_transition(block_instance_id, transition_type, position)
     }
 
+    /// Trigger a transition on a compositor/mixer block.
     pub async fn trigger_transition(
         &self,
         flow_id: &FlowId,
