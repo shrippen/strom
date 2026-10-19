@@ -12,8 +12,14 @@
 //! [`mirror`] copies each change of a multiview PVW pad to its twin, scaled
 //! from `pvw_rect` to the full frame. So no operation has to know about it.
 //! Zone borders: with PiPs, each input also has a border underlay chain to
-//! `pvw_comp.sink_{N+i}`, mirrored from the multiview's PVW underlay pad;
-//! its colour and hold come from `underlays` like every other underlay.
+//! `pvw_comp.sink_{N+i}`, mirrored from the multiview's PVW underlay pad,
+//! its colour too (takes set it on the multiview's source directly); its
+//! hold comes from `underlays` like every other underlay.
+//!
+//! The output follows the multiview's geometry, scaled up: positions and
+//! border widths land on a grid of the scale factor (about 3 px for a
+//! 1280×720 multiview and a 1080p program), and animations follow at the
+//! multiview's frame rate.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -205,12 +211,15 @@ struct Scale {
 }
 
 impl Scale {
+    /// The pads get `pvw_rect` cut to whole pixels (`as i32`), so the
+    /// scale does too: else the last column or row stays black.
     fn new(pvw_rect: &Rect, out_w: u32, out_h: u32) -> Self {
+        let (x, y, w, h) = pvw_rect.as_ints();
         Self {
-            x: pvw_rect.x,
-            y: pvw_rect.y,
-            sx: f64::from(out_w) / pvw_rect.w.max(1.0),
-            sy: f64::from(out_h) / pvw_rect.h.max(1.0),
+            x: f64::from(x),
+            y: f64::from(y),
+            sx: f64::from(out_w) / f64::from(w.max(1)),
+            sy: f64::from(out_h) / f64::from(h.max(1)),
         }
     }
 
@@ -262,11 +271,11 @@ pub(super) fn mirror(
     out_h: u32,
 ) {
     let scale = Scale::new(pvw_rect, out_w, out_h);
-    let inputs = (0..num_inputs).map(|i| (num_inputs + 1 + i, i));
+    let inputs = (0..num_inputs).map(|i| (num_inputs + 1 + i, i, false));
     let underlays = mv_underlay_base
         .into_iter()
-        .flat_map(|base| (0..num_inputs).map(move |i| (base + i, num_inputs + i)));
-    for (mv_idx, pvw_idx) in inputs.chain(underlays) {
+        .flat_map(|base| (0..num_inputs).map(move |i| (base + i, num_inputs + i, true)));
+    for (mv_idx, pvw_idx, underlay) in inputs.chain(underlays) {
         let (Some(from), Some(to)) = (
             mv_comp.static_pad(&format!("sink_{}", mv_idx)),
             pvw_comp.static_pad(&format!("sink_{}", pvw_idx)),
@@ -286,6 +295,10 @@ pub(super) fn mirror(
             }
         });
 
+        if underlay {
+            mirror_underlay_color(&from, &to);
+            continue;
+        }
         let (Some(crop_from), Some(crop_to)) = (upstream_crop(&from), upstream_crop(&to)) else {
             continue;
         };
@@ -303,6 +316,23 @@ pub(super) fn mirror(
             }
         });
     }
+}
+
+/// The border colour of the multiview underlay pad `from`'s source, on
+/// the preview underlay pad `to` (with the source restart a colour change
+/// needs, see `underlay::set_underlay_color`).
+fn mirror_underlay_color(from: &gst::Pad, to: &gst::Pad) {
+    use crate::gst::underlay;
+    let Some(src) = underlay::upstream_underlay_src(from) else {
+        return;
+    };
+    underlay::set_underlay_color(to, src.property::<u32>("foreground-color"));
+    let to_weak = to.downgrade();
+    src.connect_notify(Some("foreground-color"), move |src, _| {
+        if let Some(to) = to_weak.upgrade() {
+            underlay::set_underlay_color(&to, src.property::<u32>("foreground-color"));
+        }
+    });
 }
 
 #[cfg(test)]
