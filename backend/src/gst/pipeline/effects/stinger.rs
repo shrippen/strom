@@ -425,7 +425,7 @@ impl PipelineManager {
             }
             if take.plan.premultiplied {
                 warn!(
-                    "Vision mixer {}: the software mixer composites premultiplied stinger graphics as straight; edges come out dark",
+                    "Vision mixer {}: premultiplied stinger graphic on a mixer without the matte stage, composited as straight alpha; edges can come out dark",
                     block_instance_id
                 );
             }
