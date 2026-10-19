@@ -72,8 +72,8 @@ pub const ZONE_RATE: i32 = 48_000;
 
 /// Aggregator latency of a zone (ms): slack for a sound's first buffer
 /// between `play` and the zone mixer. Everything in a zone's pipeline
-/// waits this long, so it is most of the way from GO to heard (lmix
-/// SND.12: 50 ms with the sound server). On PipeWire with a Scarlett
+/// waits this long, the largest part of the zone's share of GO to heard
+/// (lmix SND.12: 50 ms with the sound server; the sink adds its own). On PipeWire with a Scarlett
 /// Solo, GO to the first sample took 44 ms with 15 ms here, 44-56 ms with
 /// 20 and 63-74 ms with 30 (and a 1024-sample silence); 10 ms dropped
 /// samples once with 16 sounds at once.
