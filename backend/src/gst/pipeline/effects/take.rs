@@ -578,9 +578,12 @@ impl PipelineManager {
             _ => return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string())),
         };
 
-        // No shader slot is touched: the bar shows wipes and master FX as
-        // a fade, and an envelope still decaying from a take (it outlasts
-        // the pads' keyframes) ends by itself.
+        // The bar shows wipes and master FX as a fade. The inputs' take
+        // slots go neutral (an inverted wipe left the outgoing input
+        // masked away; the bar only runs once its keyframes are past). The
+        // program's take slot is left alone: an envelope still decaying
+        // from a take outlasts the pads' keyframes and ends by itself.
+        self.reset_input_take_fx(block_instance_id);
         let aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
         let canvas_aspect = if canvas_height > 0 {
             canvas_width as f64 / canvas_height as f64
