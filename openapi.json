@@ -7955,6 +7955,13 @@
             "$ref": "#/components/schemas/DeviceCategory",
             "description": "Device category."
           },
+          "channel_positions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Speaker position of each channel of an audio device, in the\ndevice's channel order: PipeWire's names (`FL`, `FR`, `FC`, `LFE`,\n`RL`, `SL`, ..., `AUX0`... on pro-audio profiles). A sound server\nroutes a stream to a device by position, not by index, so a client\nthat addresses one device channel needs them. Empty when the device\ndoes not say."
+          },
           "device_class": {
             "type": "string",
             "description": "Device class (e.g., \"Audio/Source\", \"Video/Source\", \"Source/Network\")."
