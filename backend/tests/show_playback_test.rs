@@ -25,6 +25,8 @@ struct Ear {
     buffers: u64,
     /// Peak of every buffer since the first sound.
     peaks: Vec<f32>,
+    /// Length of the zone's buffers.
+    buffer: Option<gst::ClockTime>,
 }
 
 struct Rig {
@@ -137,6 +139,7 @@ fn rig_with(sync: bool) -> Rig {
                     let mut ear = heard.lock().unwrap();
                     ear.peak = peak;
                     ear.buffers += 1;
+                    ear.buffer = buffer.duration();
                     if peak > 0.05 && ear.first_sound.is_none() {
                         ear.first_sound = Some(Instant::now());
                     }
@@ -385,8 +388,14 @@ fn a_repeated_sound_plays_its_times_without_a_gap() {
         "3 plays of 1 s took {played:?}"
     );
     let ear = rig.ears[0].lock().unwrap();
-    // 10 ms buffers: the first 2.9 s are all tone.
-    let quiet = ear.peaks.iter().take(290).filter(|p| **p < 0.05).count();
+    // The first 2.9 s are all tone, both seams included.
+    let window = (2900 / ear.buffer.expect("buffer duration").mseconds().max(1)) as usize;
+    assert!(
+        ear.peaks.len() >= window,
+        "only {} buffers heard",
+        ear.peaks.len()
+    );
+    let quiet = ear.peaks.iter().take(window).filter(|p| **p < 0.05).count();
     assert_eq!(quiet, 0, "{quiet} quiet buffers between the plays");
 }
 
