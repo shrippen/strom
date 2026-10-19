@@ -36,7 +36,7 @@ fn build_flow(backend: &str) -> Flow {
     let props: HashMap<String, PV> = [
         ("compositor_preference", PV::String(backend.into())),
         ("num_inputs", PV::UInt(3)),
-        ("num_pips", PV::UInt(1)),
+        ("num_pips", PV::UInt(2)),
         ("pgm_resolution", PV::String(format!("{}x{}", W, H))),
         (
             "multiview_resolution",
@@ -179,25 +179,47 @@ fn band_color(sample: &gstreamer::Sample, x0: usize, x1: usize) -> Option<usize>
     (0..3).find(|&c| counts[c] * 10 > n * 8)
 }
 
-/// Fraction of yellow pixels in a rectangle of an RGBA frame.
-fn yellow_fraction(sample: &gstreamer::Sample, xs: (usize, usize), ys: (usize, usize)) -> f64 {
+/// Wait until the band just above the PiP box (input 2 fits into the
+/// right half as 160x90 at y 45) is mostly `rgb`.
+fn wait_border(sink: &gstreamer_app::AppSink, rgb: (u8, u8, u8), what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut share = 0.0;
+    while std::time::Instant::now() < deadline && share < 0.8 {
+        if let Some(sample) = sink.try_pull_sample(gstreamer::ClockTime::from_mseconds(500)) {
+            share = color_fraction(&sample, (W / 2 + 20, W - 20), (39, 44), rgb);
+        }
+    }
+    assert!(
+        share >= 0.8,
+        "{what}: {share:.2} of the border band is {rgb:?}"
+    );
+}
+
+/// Fraction of pixels near `rgb` in a rectangle of an RGBA frame.
+fn color_fraction(
+    sample: &gstreamer::Sample,
+    xs: (usize, usize),
+    ys: (usize, usize),
+    rgb: (u8, u8, u8),
+) -> f64 {
     use gstreamer_video::{VideoFrameRef, VideoInfo};
     let info = VideoInfo::from_caps(sample.caps().expect("caps")).expect("video info");
     let buffer = sample.buffer().expect("buffer");
     let frame = VideoFrameRef::from_buffer_ref_readable(buffer, &info).expect("map frame");
     let stride = info.stride()[0] as usize;
     let data = frame.plane_data(0).expect("plane 0");
-    let (mut yellow, mut n) = (0u64, 0u64);
+    let near = |v: u8, want: u8| v.abs_diff(want) < 60;
+    let (mut hits, mut n) = (0u64, 0u64);
     for y in ys.0..ys.1 {
         for x in xs.0..xs.1 {
             let o = y * stride + x * 4;
-            if data[o] > 200 && data[o + 1] > 200 && data[o + 2] < 80 {
-                yellow += 1;
+            if near(data[o], rgb.0) && near(data[o + 1], rgb.1) && near(data[o + 2], rgb.2) {
+                hits += 1;
             }
             n += 1;
         }
     }
-    yellow as f64 / n as f64
+    hits as f64 / n as f64
 }
 
 /// Pull preview frames until the left and right halves show `left` and
@@ -254,24 +276,44 @@ fn preview_follows_the_mixer(backend: &str) {
         }),
     };
     manager
-        .apply_vision_mixer_pip_config(BLOCK, 0, Some(0), vec![zone], Default::default())
+        .apply_vision_mixer_pip_config(BLOCK, 0, Some(0), vec![zone.clone()], Default::default())
         .expect("PiP config");
     manager
         .select_vision_mixer_pip_for_preview(BLOCK, 0)
         .expect("PiP on preview");
     wait_for(&sink, 0, 2, "PiP on preview");
-    // The zone's border: yellow just above the box (input 2 fits into the
-    // right half as 160x90 at y 45).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let mut yellow = 0.0;
-    while std::time::Instant::now() < deadline && yellow < 0.8 {
-        if let Some(sample) = sink.try_pull_sample(gstreamer::ClockTime::from_mseconds(500)) {
-            yellow = yellow_fraction(&sample, (W / 2 + 20, W - 20), (39, 44));
-        }
-    }
-    assert!(
-        yellow >= 0.8,
-        "zone border on the preview output: {yellow:.2} yellow"
+    wait_border(&sink, (255, 255, 0), "zone border on the preview output");
+
+    // A take puts its PiP's border colours on the multiview itself: the
+    // preview output follows. PiP 1 (white border) to program, PiP 0
+    // (yellow) on preview, take: PiP 1 is back on preview, white.
+    let white = Zone {
+        border: Some(ZoneBorder {
+            color: "#FFFFFF".into(),
+            width: 8.0,
+        }),
+        ..zone.clone()
+    };
+    manager
+        .apply_vision_mixer_pip_config(BLOCK, 1, Some(0), vec![white], Default::default())
+        .expect("PiP 1 config");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 1)
+        .expect("PiP 1 on preview");
+    manager
+        .trigger_transition(BLOCK, 0, 0, "cut", 0)
+        .expect("take PiP 1");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP 0 on preview");
+    wait_border(&sink, (255, 255, 0), "PiP 0 on preview");
+    manager
+        .trigger_transition(BLOCK, 0, 0, "cut", 0)
+        .expect("take PiP 0");
+    wait_border(
+        &sink,
+        (255, 255, 255),
+        "PiP 1 back on preview after the take",
     );
 
     // The mirror's handlers hold the preview pads weakly: nothing keeps
