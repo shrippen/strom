@@ -22,11 +22,21 @@ fn ease_in_out(t: f64) -> f64 {
 
 /// The frame of `transition` at `position` on a `width`×`height` canvas.
 /// Shader transitions (wipes, master FX) and a cut show as a fade: a wipe
-/// needs the FX engine's uniforms, a cut has no in-between.
-pub fn tbar_frame(transition: TransitionType, position: f64, width: i32, height: i32) -> TbarFrame {
+/// needs the FX engine's uniforms, a cut has no in-between. `covers`: the
+/// incoming picture covers the outgoing one when both rest (same aspect);
+/// if not, the outgoing one fades out as the bar goes, as the animated
+/// transitions do, so nothing of it is left to vanish at the end.
+pub fn tbar_frame(
+    transition: TransitionType,
+    position: f64,
+    width: i32,
+    height: i32,
+    covers: bool,
+) -> TbarFrame {
     let p = position.clamp(0.0, 1.0);
+    let from_alpha = if covers { 1.0 } else { 1.0 - p };
     let still = TbarFrame {
-        from_alpha: 1.0,
+        from_alpha,
         to_alpha: p,
         from_offset: (0, 0),
         to_offset: (0, 0),
@@ -75,7 +85,8 @@ pub fn tbar_frame(transition: TransitionType, position: f64, width: i32, height:
         (0, 0)
     };
     TbarFrame {
-        from_alpha: 1.0,
+        // A push moves the old picture out whole.
+        from_alpha: if push { 1.0 } else { from_alpha },
         to_alpha: 1.0,
         from_offset,
         to_offset,
@@ -88,7 +99,7 @@ mod tests {
 
     #[test]
     fn a_fade_shows_the_new_source_at_the_bar_position() {
-        let f = tbar_frame(TransitionType::Fade, 0.25, 1920, 1080);
+        let f = tbar_frame(TransitionType::Fade, 0.25, 1920, 1080, true);
         assert_eq!((f.from_alpha, f.to_alpha), (1.0, 0.25));
         assert_eq!((f.from_offset, f.to_offset), ((0, 0), (0, 0)));
     }
@@ -96,30 +107,41 @@ mod tests {
     #[test]
     fn a_slide_brings_the_new_source_in_from_its_side() {
         // Slide left: the new picture comes from the right.
-        let f = tbar_frame(TransitionType::SlideLeft, 0.25, 1920, 1080);
+        let f = tbar_frame(TransitionType::SlideLeft, 0.25, 1920, 1080, true);
         assert_eq!(f.to_offset, (1440, 0));
         assert_eq!(f.from_offset, (0, 0), "the old one stays");
         assert_eq!(f.to_alpha, 1.0);
-        let f = tbar_frame(TransitionType::SlideDown, 0.5, 1920, 1080);
+        let f = tbar_frame(TransitionType::SlideDown, 0.5, 1920, 1080, true);
         assert_eq!(f.to_offset, (0, -540));
-        let end = tbar_frame(TransitionType::SlideLeft, 1.0, 1920, 1080);
+        let end = tbar_frame(TransitionType::SlideLeft, 1.0, 1920, 1080, true);
         assert_eq!(end.to_offset, (0, 0));
     }
 
     #[test]
     fn a_push_moves_both_sources() {
-        let f = tbar_frame(TransitionType::PushRight, 0.5, 1920, 1080);
+        let f = tbar_frame(TransitionType::PushRight, 0.5, 1920, 1080, true);
         assert_eq!(f.from_offset, (960, 0));
         assert_eq!(f.to_offset, (-960, 0));
     }
 
     #[test]
+    fn an_uncovered_old_picture_fades_out_with_the_bar() {
+        // 4:3 coming over 16:9 leaves pillarbox stripes of the old one.
+        let f = tbar_frame(TransitionType::Fade, 0.75, 1920, 1080, false);
+        assert_eq!((f.from_alpha, f.to_alpha), (0.25, 0.75));
+        let f = tbar_frame(TransitionType::SlideLeft, 0.75, 1920, 1080, false);
+        assert_eq!(f.from_alpha, 0.25);
+        let f = tbar_frame(TransitionType::PushLeft, 0.75, 1920, 1080, false);
+        assert_eq!(f.from_alpha, 1.0, "a push moves it out instead");
+    }
+
+    #[test]
     fn a_dip_goes_through_black_at_half() {
-        let half = tbar_frame(TransitionType::DipToBlack, 0.5, 1920, 1080);
+        let half = tbar_frame(TransitionType::DipToBlack, 0.5, 1920, 1080, true);
         assert_eq!((half.from_alpha, half.to_alpha), (0.0, 0.0));
-        let quarter = tbar_frame(TransitionType::DipToBlack, 0.25, 1920, 1080);
+        let quarter = tbar_frame(TransitionType::DipToBlack, 0.25, 1920, 1080, true);
         assert!((quarter.from_alpha - 0.5).abs() < 1e-9 && quarter.to_alpha == 0.0);
-        let end = tbar_frame(TransitionType::DipToBlack, 1.0, 1920, 1080);
+        let end = tbar_frame(TransitionType::DipToBlack, 1.0, 1920, 1080, true);
         assert_eq!((end.from_alpha, end.to_alpha), (0.0, 1.0));
     }
 }

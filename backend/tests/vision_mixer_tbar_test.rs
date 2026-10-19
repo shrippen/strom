@@ -266,3 +266,108 @@ async fn a_held_take_leaves_overlays_and_fade_to_black_alone() {
     );
     manager.stop().expect("stop");
 }
+
+/// Every (alpha, xpos) a mixer pad passes through while `act` runs: the
+/// mixer may render a frame between any two property writes.
+fn states_during(pad: &gstreamer::Pad, act: impl FnOnce()) -> Vec<(f64, i32)> {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let id = pad.connect_notify(None, move |pad, _| {
+        log.lock()
+            .unwrap()
+            .push((pad.property::<f64>("alpha"), pad.property::<i32>("xpos")));
+    });
+    act();
+    pad.disconnect(id);
+    let states = seen.lock().unwrap().clone();
+    states
+}
+
+/// A fader step goes straight from one bar position to the next, and the
+/// take at the end straight to the new program: no write in between puts
+/// a pad back in its resting place first (that would flash on air).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bar_step_never_passes_through_the_resting_pads() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let incoming = mixer.static_pad("sink_1").expect("preview pad");
+
+    hold(&manager, &sink, "slide_left", 0.3, 'r', '?');
+    let step = states_during(&incoming, || {
+        manager
+            .hold_vision_mixer_transition(BLOCK, "slide_left", 0.31)
+            .expect("hold");
+    });
+    assert!(!step.is_empty(), "the step should move the incoming pad");
+    assert!(
+        step.iter().all(|&(alpha, xpos)| alpha == 1.0 && xpos > 0),
+        "the incoming pad passed through its resting place: {step:?}"
+    );
+
+    hold(&manager, &sink, "fade", 0.95, 'b', 'b');
+    let take = states_during(&incoming, || {
+        manager
+            .trigger_transition(BLOCK, 0, 1, "cut", 0)
+            .expect("take");
+    });
+    assert!(
+        take.iter().all(|&(alpha, _)| alpha >= 0.95),
+        "the take from the bar hid the new program on the way: {take:?}"
+    );
+    manager.stop().expect("stop");
+}
+
+/// A bar moved while a take animates, or while program fades back from
+/// black, would cut the animation short: the bar waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bar_waits_for_a_running_take_or_fade_from_black() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+
+    manager
+        .trigger_transition(BLOCK, 0, 1, "fade", 2000)
+        .expect("auto take");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        manager
+            .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+            .is_err(),
+        "the bar during an auto take"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    manager.fade_to_black(BLOCK, 0).expect("fade to black");
+    manager
+        .fade_to_black(BLOCK, 2000)
+        .expect("fade back from black");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        manager
+            .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+            .is_err(),
+        "the bar while program fades back from black"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(2200));
+    manager
+        .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+        .expect("the bar once everything has landed");
+    manager.stop().expect("stop");
+}

@@ -381,11 +381,14 @@ impl PipelineManager {
         // Reset all video pads to a clean state before the transition:
         // clear control bindings, restore alpha/position/size for the current
         // PGM input. Single-input PGM only (multi-source compositions are PiPs).
+        // A cut rests the new program straight away: from a held T-bar the
+        // old one would otherwise come back whole for a frame.
+        let is_cut = duration_ms == 0 || transition_type == "cut";
         self.reset_classic_take_pads(
             block_instance_id,
             mixer,
             overlay_state.as_deref(),
-            old_pgm,
+            if is_cut { new_pgm } else { old_pgm },
             num_video_inputs,
             canvas_width,
             canvas_height,
@@ -443,16 +446,18 @@ impl PipelineManager {
         Ok((was_ftb, old_pgm, new_pgm, actual_kind))
     }
     /// Hold the take from program to preview at `position` (a T-bar):
-    /// the pads rest as for a classic take, then show `transition_type` at
-    /// that point (see `transitions::tbar`). Inputs only: a PiP on either
-    /// bus is refused. A take (at the end) or position 0 puts it back.
+    /// the input pads show `transition_type` at that point (see
+    /// `transitions::tbar`); DSKs and the rest keep what they do. A PiP on
+    /// program or preview is refused, except that position 0 always puts
+    /// program back as it was. A take (at the end) finishes it.
     pub fn hold_vision_mixer_transition(
         &self,
         block_instance_id: &str,
         transition_type: &str,
         position: f64,
     ) -> Result<(), PipelineError> {
-        use crate::gst::transitions::{TransitionController, TransitionType};
+        use crate::gst::transitions::TransitionType;
+        use strom_types::vision_mixer::{aspect_fit_rect, DIST_PGM_ZORDER};
 
         let invalid = |reason: String| PipelineError::InvalidProperty {
             element: block_instance_id.to_string(),
@@ -475,36 +480,119 @@ impl PipelineManager {
             block_instance_id,
         )
         .ok_or_else(|| PipelineError::ElementNotFound(block_instance_id.to_string()))?;
-        if state.pgm_pip().is_some() || state.pvw_pip().is_some() {
-            return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string()));
-        }
-        // Resting the pads would bring program back under the black while
+        // Setting the pads would bring program back under the black while
         // fade to black stays on.
         if state.ftb_active.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(invalid("fade to black is on".to_string()));
         }
-        let (Some(from), Some(to)) = (state.pgm_input(), state.pvw_input()) else {
-            return Err(invalid(
-                "needs an input on program and on preview".to_string(),
-            ));
+        // A take still animating, or program fading back from black,
+        // would jump to the bar's values: the bar waits until they land.
+        if let Some(left) =
+            crate::blocks::builtin::vision_mixer::geometry::inputs_animation_remaining(
+                mixer,
+                state.num_inputs,
+            )
+        {
+            return Err(invalid(format!(
+                "a transition is still running ({} ms left)",
+                left.as_millis()
+            )));
+        }
+        if state.pgm_pip().is_some() {
+            return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string()));
+        }
+        let Some(from) = state.pgm_input() else {
+            return Err(invalid("needs an input on program".to_string()));
+        };
+        let (canvas_width, canvas_height) = self.dist_canvas_size(block_instance_id);
+        let to = match state.pvw_input() {
+            Some(to) if to != from && position > 0.0 => to,
+            // Position 0 (or nothing to mix): program as it rests,
+            // whatever preview has become meanwhile.
+            _ if position == 0.0 || state.pvw_pip().is_none() => {
+                self.reset_take_fx(block_instance_id);
+                self.reset_take_pads(
+                    block_instance_id,
+                    mixer,
+                    Some(&state),
+                    Some(from),
+                    state.num_inputs,
+                    canvas_width,
+                    canvas_height,
+                    false,
+                );
+                return Ok(());
+            }
+            _ => return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string())),
         };
 
         self.reset_take_fx(block_instance_id);
-        let (canvas_width, canvas_height) = self.dist_canvas_size(block_instance_id);
-        // Inputs only: a DSK fade in progress keeps running under the bar.
-        self.reset_take_pads(
-            block_instance_id,
-            mixer,
-            Some(&state),
-            Some(from),
-            state.num_inputs,
+        let aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
+        let canvas_aspect = if canvas_height > 0 {
+            canvas_width as f64 / canvas_height as f64
+        } else {
+            16.0 / 9.0
+        };
+        let rest = |idx: usize| {
+            let aspect = aspects.get(&idx).copied().unwrap_or(canvas_aspect);
+            aspect_fit_rect(0, 0, canvas_width, canvas_height, aspect)
+        };
+        let (from_rect, to_rect) = (rest(from), rest(to));
+        let frame = crate::gst::transitions::tbar::tbar_frame(
+            trans_type,
+            position,
             canvas_width,
             canvas_height,
-            false,
+            crate::gst::transitions::plan::rect_contains(to_rect, from_rect),
         );
-        TransitionController::new(mixer.clone(), canvas_width, canvas_height)
-            .hold_at(from, to, trans_type, position)
-            .map_err(|e| PipelineError::TransitionError(e.to_string()))
+        let moved =
+            |(x, y, w, h): (i32, i32, i32, i32), (dx, dy): (i32, i32)| (x + dx, y + dy, w, h);
+
+        // Each pad goes straight to its values, never through its resting
+        // place: the mixer renders between two property writes, and a
+        // detour would flash as a frame on air.
+        let mut bar_pads = (None, None);
+        for pad in mixer.sink_pads() {
+            let Some(idx) = pad
+                .name()
+                .strip_prefix("sink_")
+                .and_then(|i| i.parse::<usize>().ok())
+                .filter(|idx| *idx < state.num_inputs)
+            else {
+                continue;
+            };
+            crate::gst::control_bindings::wipe_control_bindings(
+                pad.upcast_ref(),
+                &["alpha", "xpos", "ypos", "width", "height", "zorder"],
+            );
+            set_pad_crop(&pad, &Default::default());
+            if idx == from {
+                bar_pads.0 = Some(pad);
+            } else if idx == to {
+                bar_pads.1 = Some(pad);
+            } else {
+                set_bar_pad(&pad, rest(idx), 0.0, None);
+            }
+        }
+        let (Some(from_pad), Some(to_pad)) = bar_pads else {
+            return Err(PipelineError::ElementNotFound(format!(
+                "{}:mixer sink_{} or sink_{}",
+                block_instance_id, from, to
+            )));
+        };
+        set_bar_pad(
+            &from_pad,
+            moved(from_rect, frame.from_offset),
+            frame.from_alpha,
+            Some(DIST_PGM_ZORDER),
+        );
+        set_bar_pad(
+            &to_pad,
+            moved(to_rect, frame.to_offset),
+            frame.to_alpha,
+            Some(DIST_PGM_ZORDER + 1),
+        );
+        Ok(())
     }
 
     /// Put every dist mixer pad in its resting state for an input-to-input
@@ -566,6 +654,23 @@ impl PipelineManager {
             16.0 / 9.0
         };
 
+        // Explicit geometry: aspect-fit each source into the canvas (pads
+        // run sizing-policy=none). Classic takes are input↔input — wipe any
+        // crop left behind by an earlier PiP render on these pads.
+        let rest = |pad: &gstreamer::Pad, idx: usize, alpha: f64, zorder: Option<u32>| {
+            set_pad_crop(pad, &Default::default());
+            let aspect = classic_aspects.get(&idx).copied().unwrap_or(canvas_aspect);
+            let rect = strom_types::vision_mixer::aspect_fit_rect(
+                0,
+                0,
+                canvas_width,
+                canvas_height,
+                aspect,
+            );
+            set_bar_pad(pad, rect, alpha, zorder);
+        };
+        let mut active = None;
+        let mut hidden = Vec::new();
         for pad in mixer.sink_pads() {
             let name = pad.name();
             if name.starts_with("sink_") {
@@ -580,28 +685,10 @@ impl PipelineManager {
                         &["alpha", "xpos", "ypos", "width", "height"],
                     );
                     if idx < num_video_inputs {
-                        // Classic takes are input↔input — wipe any crop left
-                        // behind by an earlier PiP render on these pads.
-                        set_pad_crop(&pad, &Default::default());
-                        // Explicit geometry: aspect-fit the source into the
-                        // canvas (pads run sizing-policy=none).
-                        let aspect = classic_aspects.get(&idx).copied().unwrap_or(canvas_aspect);
-                        let (x, y, w, h) = strom_types::vision_mixer::aspect_fit_rect(
-                            0,
-                            0,
-                            canvas_width,
-                            canvas_height,
-                            aspect,
-                        );
-                        pad.set_property("xpos", x);
-                        pad.set_property("ypos", y);
-                        pad.set_property("width", w);
-                        pad.set_property("height", h);
                         if Some(idx) == active_pgm_input {
-                            pad.set_property("alpha", 1.0f64);
-                            pad.set_property("zorder", strom_types::vision_mixer::DIST_PGM_ZORDER);
+                            active = Some(pad.clone());
                         } else {
-                            pad.set_property("alpha", 0.0f64);
+                            hidden.push((idx, pad.clone()));
                         }
                     } else if let Some(state) = overlay_state {
                         let dsk_idx = idx - num_video_inputs;
@@ -620,5 +707,47 @@ impl PipelineManager {
                 }
             }
         }
+        // Program first, then the others out, then program on top: a frame
+        // rendered between two writes shows the old or the new picture (a
+        // take from a held T-bar starts half way), never neither.
+        if let (Some(pad), Some(idx)) = (&active, active_pgm_input) {
+            rest(pad, idx, 1.0, None);
+        }
+        for (idx, pad) in &hidden {
+            rest(pad, *idx, 0.0, None);
+        }
+        if let (Some(pad), Some(idx)) = (&active, active_pgm_input) {
+            rest(
+                pad,
+                idx,
+                1.0,
+                Some(strom_types::vision_mixer::DIST_PGM_ZORDER),
+            );
+        }
+    }
+}
+
+/// Put `pad` at `rect` and `alpha` (and `zorder`), writing only what
+/// changes, in an order a frame between two writes cannot catch half way:
+/// a pad that gets fainter fades before it moves, one that gets stronger
+/// moves before it shows.
+fn set_bar_pad(pad: &gstreamer::Pad, rect: (i32, i32, i32, i32), alpha: f64, zorder: Option<u32>) {
+    let fainter = alpha < pad.property::<f64>("alpha");
+    if fainter {
+        pad.set_property("alpha", alpha);
+    }
+    let (x, y, w, h) = rect;
+    for (name, value) in [("xpos", x), ("ypos", y), ("width", w), ("height", h)] {
+        if pad.property::<i32>(name) != value {
+            pad.set_property(name, value);
+        }
+    }
+    if let Some(z) = zorder {
+        if pad.property::<u32>("zorder") != z {
+            pad.set_property("zorder", z);
+        }
+    }
+    if !fainter && pad.property::<f64>("alpha") != alpha {
+        pad.set_property("alpha", alpha);
     }
 }
