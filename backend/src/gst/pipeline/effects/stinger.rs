@@ -256,7 +256,11 @@ impl PipelineManager {
                     .is_some_and(|e| e.name() == want)
             })
         };
-        let fill = fed_by("queue_stinger_fill").or_else(|| fed_by("videocrop_stinger"))?;
+        // GL: the fill branch of the matte tee; CPU: the crop; CUDA: the
+        // upload behind the crop.
+        let fill = fed_by("queue_stinger_fill")
+            .or_else(|| fed_by("videocrop_stinger"))
+            .or_else(|| fed_by("cudaupload_stinger"))?;
         Some(StingerPads {
             fill,
             matte: fed_by("stinger_matte"),
