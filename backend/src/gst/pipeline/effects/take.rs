@@ -509,8 +509,9 @@ impl PipelineManager {
     /// program or preview is refused, except at position 0, which always
     /// puts program back as it was (with a PiP on program, as it is). A cut (at the end) finishes it; a take with
     /// a duration, or a stinger, starts from program as it rests, so the
-    /// held picture jumps back first. Nothing remembers the hold: a
-    /// geometry refresh (an input changing size) rests the pads too.
+    /// held picture jumps back first. Only the effect is remembered, not
+    /// the position: a geometry refresh (an input changing size) rests
+    /// the pads too.
     pub fn hold_vision_mixer_transition(
         &self,
         block_instance_id: &str,
@@ -608,7 +609,14 @@ impl PipelineManager {
             .tbar_effect
             .lock()
             .map(|mut held| {
-                let name = trans_type.to_string();
+                // What the bar shows: cut, wipes and master FX all as a fade.
+                let name = match trans_type {
+                    TransitionType::Cut
+                    | TransitionType::Fade
+                    | TransitionType::Wipe(_)
+                    | TransitionType::MasterFx(_) => TransitionType::Fade.to_string(),
+                    t => t.to_string(),
+                };
                 let changed = held.as_deref().is_some_and(|h| h != name);
                 *held = Some(name);
                 changed
