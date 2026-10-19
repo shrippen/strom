@@ -478,6 +478,11 @@ impl PipelineManager {
         if state.pgm_pip().is_some() || state.pvw_pip().is_some() {
             return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string()));
         }
+        // Resting the pads would bring program back under the black while
+        // fade to black stays on.
+        if state.ftb_active.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(invalid("fade to black is on".to_string()));
+        }
         let (Some(from), Some(to)) = (state.pgm_input(), state.pvw_input()) else {
             return Err(invalid(
                 "needs an input on program and on preview".to_string(),
@@ -486,7 +491,8 @@ impl PipelineManager {
 
         self.reset_take_fx(block_instance_id);
         let (canvas_width, canvas_height) = self.dist_canvas_size(block_instance_id);
-        self.reset_classic_take_pads(
+        // Inputs only: a DSK fade in progress keeps running under the bar.
+        self.reset_take_pads(
             block_instance_id,
             mixer,
             Some(&state),
@@ -494,6 +500,7 @@ impl PipelineManager {
             state.num_inputs,
             canvas_width,
             canvas_height,
+            false,
         );
         TransitionController::new(mixer.clone(), canvas_width, canvas_height)
             .hold_at(from, to, trans_type, position)
@@ -517,6 +524,34 @@ impl PipelineManager {
         canvas_width: i32,
         canvas_height: i32,
     ) {
+        self.reset_take_pads(
+            block_instance_id,
+            mixer,
+            overlay_state,
+            active_pgm_input,
+            num_video_inputs,
+            canvas_width,
+            canvas_height,
+            true,
+        );
+    }
+
+    /// [`Self::reset_classic_take_pads`]; without `others`, only the
+    /// input pads, so DSK, underlay and stinger pads keep what they do.
+    #[allow(clippy::too_many_arguments)]
+    fn reset_take_pads(
+        &self,
+        block_instance_id: &str,
+        mixer: &gstreamer::Element,
+        overlay_state: Option<
+            &crate::blocks::builtin::vision_mixer::overlay::VisionMixerOverlayState,
+        >,
+        active_pgm_input: Option<usize>,
+        num_video_inputs: usize,
+        canvas_width: i32,
+        canvas_height: i32,
+        others: bool,
+    ) {
         let classic_aspects = self.vision_mixer_source_aspects(
             block_instance_id,
             if num_video_inputs == usize::MAX {
@@ -535,6 +570,9 @@ impl PipelineManager {
             let name = pad.name();
             if name.starts_with("sink_") {
                 if let Ok(idx) = name.trim_start_matches("sink_").parse::<usize>() {
+                    if !others && idx >= num_video_inputs {
+                        continue;
+                    }
                     // Neutralize lingering animation bindings (keyframe wipe
                     // — never removed, see crate::gst::control_bindings).
                     crate::gst::control_bindings::wipe_control_bindings(

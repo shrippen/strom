@@ -26,7 +26,7 @@ fn elem(id: &str, ty: &str, props: Vec<(&str, PV)>) -> strom_types::Element {
 
 /// Red on program (input 0), blue on preview (input 1), program into an
 /// RGBA appsink.
-fn build_flow() -> Flow {
+fn build_flow(dsk: bool) -> Flow {
     let mut flow = Flow::new("vm_tbar");
     let props: HashMap<String, PV> = [
         ("compositor_preference", PV::String("cpu".into())),
@@ -35,6 +35,10 @@ fn build_flow() -> Flow {
         ("multiview_resolution", PV::String(format!("{}x{}", W, H))),
         ("initial_pgm_input", PV::UInt(0)),
         ("initial_pvw_input", PV::UInt(1)),
+        (
+            "num_dsk_inputs",
+            PV::String(if dsk { "1" } else { "0" }.into()),
+        ),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -48,7 +52,16 @@ fn build_flow() -> Flow {
         runtime_data: None,
         computed_external_pads: None,
     });
-    for (i, pattern) in ["red", "blue"].iter().enumerate() {
+    let sources: &[(&str, &str)] = if dsk {
+        &[
+            ("red", "video_in_0"),
+            ("blue", "video_in_1"),
+            ("green", "dsk_in_0"),
+        ]
+    } else {
+        &[("red", "video_in_0"), ("blue", "video_in_1")]
+    };
+    for (i, (pattern, pad)) in sources.iter().enumerate() {
         flow.elements.push(elem(
             &format!("src{i}"),
             "videotestsrc",
@@ -71,7 +84,7 @@ fn build_flow() -> Flow {
         });
         flow.links.push(strom_types::Link {
             from: format!("caps{i}:src"),
-            to: format!("{BLOCK}:video_in_{i}"),
+            to: format!("{BLOCK}:{pad}"),
         });
     }
     flow.elements.push(elem("conv", "videoconvert", vec![]));
@@ -184,7 +197,7 @@ fn hold(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_take_shows_its_transition_at_the_bar() {
-    let (mut manager, _registry) = build_manager(&build_flow());
+    let (mut manager, _registry) = build_manager(&build_flow(false));
     manager.start().expect("start pipeline");
     let sink = manager
         .pipeline()
@@ -206,5 +219,50 @@ async fn a_held_take_shows_its_transition_at_the_bar() {
     assert!(manager
         .hold_vision_mixer_transition(BLOCK, "fade", 1.5)
         .is_err());
+    manager.stop().expect("stop");
+}
+
+/// The bar rests only the input pads: an overlay fading in keeps fading,
+/// and fade to black refuses the bar (it would bring program back under
+/// the black).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_take_leaves_overlays_and_fade_to_black_alone() {
+    let (mut manager, _registry) = build_manager(&build_flow(true));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+
+    manager
+        .set_dsk_enabled(BLOCK, 0, 2, true, 3000)
+        .expect("fade the overlay in over 3 s");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    manager
+        .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+        .expect("hold");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let dsk_pad = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_2")
+        .expect("DSK pad");
+    let alpha = dsk_pad.property::<f64>("alpha");
+    assert!(
+        alpha > 0.05 && alpha < 0.9,
+        "the overlay should still be fading in after 1 s of 3, alpha {alpha}"
+    );
+
+    manager.fade_to_black(BLOCK, 0).expect("fade to black");
+    assert!(
+        manager
+            .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+            .is_err(),
+        "the bar under fade to black"
+    );
     manager.stop().expect("stop");
 }
