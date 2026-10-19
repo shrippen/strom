@@ -699,6 +699,41 @@ impl TransitionController {
     /// height (position animation), zorder (morph z lift/step), and the GL
     /// mixer crop properties (crop morph — absent on the CPU backend, where
     /// `control_binding` simply returns `None`).
+    /// Hold the transition from `from_input` to `to_input` at `position`
+    /// (T-bar): static pad values instead of an animation. The pads must be
+    /// at rest (classic take reset); the incoming one goes on top.
+    pub fn hold_at(
+        &self,
+        from_input: usize,
+        to_input: usize,
+        transition_type: TransitionType,
+        position: f64,
+    ) -> Result<(), TransitionError> {
+        if from_input == to_input {
+            return Ok(());
+        }
+        let from_pad = self.get_sink_pad(from_input)?;
+        let to_pad = self.get_sink_pad(to_input)?;
+        self.clear_control_bindings(&from_pad);
+        self.clear_control_bindings(&to_pad);
+        let frame = super::tbar::tbar_frame(
+            transition_type,
+            position,
+            self.canvas_width,
+            self.canvas_height,
+        );
+        for (pad, alpha, (dx, dy)) in [
+            (&from_pad, frame.from_alpha, frame.from_offset),
+            (&to_pad, frame.to_alpha, frame.to_offset),
+        ] {
+            pad.set_property("xpos", pad.property::<i32>("xpos") + dx);
+            pad.set_property("ypos", pad.property::<i32>("ypos") + dy);
+            pad.set_property("alpha", alpha);
+        }
+        to_pad.set_property("zorder", from_pad.property::<u32>("zorder") + 1);
+        Ok(())
+    }
+
     fn clear_control_bindings(&self, pad: &gst::Pad) {
         crate::gst::control_bindings::wipe_control_bindings(
             pad.upcast_ref(),

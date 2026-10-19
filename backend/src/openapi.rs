@@ -72,6 +72,7 @@ use utoipa::OpenApi;
         crate::api::flows::update_element_property,
         crate::api::flows::trigger_transition,
         crate::api::flows::select_preview,
+        crate::api::flows::hold_transition,
         crate::api::flows::get_pip_config,
         crate::api::flows::update_pip_config,
         crate::api::flows::get_vision_mixer_state,
@@ -326,6 +327,7 @@ use utoipa::OpenApi;
             UpdateBlockPropertiesRequest,
             BlockPropertiesResponse,
             TriggerTransitionRequest,
+            strom_types::api::HoldTransitionRequest,
             TransitionResponse,
             AnimateInputRequest,
             // Vision mixer types
