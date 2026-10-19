@@ -69,6 +69,15 @@ impl PipelineManager {
             None => Some(to_input),
         };
 
+        // An unknown transition is refused before anything changes.
+        let parsed_type = transition_type.parse::<TransitionType>().map_err(|_| {
+            PipelineError::InvalidProperty {
+                element: block_instance_id.to_string(),
+                property: "transition_type".to_string(),
+                reason: format!("Unknown transition type: {}", transition_type),
+            }
+        })?;
+
         // Auto-cancel FTB if active. Zone-border underlays need no special
         // handling here: they are regular pads driven by the take paths
         // below exactly like their content pads.
@@ -109,7 +118,7 @@ impl PipelineManager {
                     .get(&mv_comp_id)
                     .ok_or_else(|| PipelineError::ElementNotFound(mv_comp_id.clone()))?;
 
-                let parsed = transition_type.parse::<TransitionType>().ok();
+                let parsed = Some(parsed_type);
                 let is_cut = duration_ms == 0 || matches!(parsed, Some(TransitionType::Cut));
                 // Explicit position animation across heterogeneous Source kinds
                 // (input ↔ PiP) isn't supported yet — Slide/Push/Dip-to-Black
@@ -273,8 +282,10 @@ impl PipelineManager {
                     // animate position+size; fresh sources alpha-fade in; departing
                     // sources alpha-fade out. Runs in parallel on both dist (PGM)
                     // and mv PVW big regions.
-                    // An input in neither composition is left alone by the
-                    // morph: one a held T-bar showed goes off first.
+                    // Only program's pads are on air before the morph: an
+                    // input a held T-bar showed goes off first (the morph
+                    // would leave it, or move it from where the bar put it).
+                    use gstreamer_controller::prelude::*;
                     for pad in mixer.sink_pads() {
                         let Some(idx) = pad
                             .name()
@@ -284,10 +295,20 @@ impl PipelineManager {
                         else {
                             continue;
                         };
-                        if old_dist_targets
-                            .iter()
-                            .chain(&new_dist_targets)
-                            .all(|t| t.pad_idx != idx)
+                        // Set by the bar: visible, no fade programmed.
+                        let animated = pad
+                            .control_binding("alpha")
+                            .and_then(|b| {
+                                b.property::<Option<gstreamer::ControlSource>>("control-source")
+                            })
+                            .and_then(|cs| {
+                                cs.downcast::<gstreamer_controller::InterpolationControlSource>()
+                                    .ok()
+                            })
+                            .is_some_and(|cs| !cs.list_control_points().is_empty());
+                        if old_dist_targets.iter().all(|t| t.pad_idx != idx)
+                            && pad.property::<f64>("alpha") > 0.0
+                            && !animated
                         {
                             crate::gst::control_bindings::wipe_control_bindings(
                                 pad.upcast_ref(),
@@ -401,15 +422,7 @@ impl PipelineManager {
             }
         }
 
-        // Parse transition type (before any pad changes: a refused take
-        // leaves program as it is)
-        let trans_type = transition_type.parse::<TransitionType>().map_err(|_| {
-            PipelineError::InvalidProperty {
-                element: block_instance_id.to_string(),
-                property: "transition_type".to_string(),
-                reason: format!("Unknown transition type: {}", transition_type),
-            }
-        })?;
+        let trans_type = parsed_type;
 
         // Reset all video pads to a clean state before the transition:
         // clear control bindings, restore alpha/position/size for the current
@@ -550,7 +563,6 @@ impl PipelineManager {
             // Position 0 (or nothing to mix): program as it rests,
             // whatever preview has become meanwhile.
             _ if position == 0.0 || state.pvw_pip().is_none() => {
-                self.reset_take_fx(block_instance_id);
                 self.reset_take_pads(
                     block_instance_id,
                     mixer,
@@ -566,7 +578,9 @@ impl PipelineManager {
             _ => return Err(invalid("the T-bar mixes inputs only, not PiPs".to_string())),
         };
 
-        self.reset_take_fx(block_instance_id);
+        // No shader slot is touched: the bar shows wipes and master FX as
+        // a fade, and an envelope still decaying from a take (it outlasts
+        // the pads' keyframes) ends by itself.
         let aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
         let canvas_aspect = if canvas_height > 0 {
             canvas_width as f64 / canvas_height as f64
