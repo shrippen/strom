@@ -10,8 +10,8 @@
 //! - **Mask only**: the whole clip is a matte, with no graphic: an animated
 //!   wipe.
 //!
-//! The matte variants need the GPU mixer; the software mixer plays them as a
-//! classic stinger.
+//! The matte variants need the OpenGL mixer; the CPU and CUDA mixers have no
+//! matte stage and play them as a classic stinger.
 
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +91,7 @@ pub enum StingerVariant {
 }
 
 impl StingerVariant {
-    /// Whether this variant composites a matte, which needs the GPU mixer.
+    /// Whether this variant composites a matte, which needs the OpenGL mixer.
     pub fn uses_matte(self) -> bool {
         !matches!(self, StingerVariant::Classic)
     }
