@@ -68,6 +68,11 @@ fn write_tone(dir: &std::path::Path, seconds: u32) -> String {
 
 /// Two stereo zones, each into an appsink that measures its level.
 fn rig() -> Rig {
+    rig_with(true)
+}
+
+/// [`rig`], with sinks that sync to the clock or not.
+fn rig_with(sync: bool) -> Rig {
     gst::init().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let tone = write_tone(dir.path(), 3);
@@ -115,7 +120,7 @@ fn rig() -> Rig {
     let mut ears = Vec::new();
     for zone in 0..2 {
         let ear = Arc::new(Mutex::new(Ear::default()));
-        let sink = gst_app::AppSink::builder().sync(true).build();
+        let sink = gst_app::AppSink::builder().sync(sync).build();
         let heard = ear.clone();
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -300,6 +305,29 @@ fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
     assert!(
         rig.ears[0].lock().unwrap().buffers > buffers,
         "the zone stopped with the sound"
+    );
+}
+
+/// A zone keeps time by itself, not by its sink: behind a sink that does
+/// not hold it back (as a PipeWire `pulsesink` on the monotonic clock did),
+/// a 3 s sound is still playing after 1.5 s. Without its live silence the
+/// zone mixed the whole file at once, the sound counted as ended at once,
+/// and a stop or panic no longer found it while it was heard.
+#[test]
+fn a_zone_keeps_time_behind_a_sink_that_does_not_sync() {
+    let rig = rig_with(false);
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut request = hall_tone(&rig, "tone");
+    request.start = SoundStart::Play;
+    sound::add(&block, &request).unwrap();
+    wait_for("the Hall hears the tone", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        state_of(&rig, "tone"),
+        Some(SoundState::Playing),
+        "a 3 s sound counted as over after 1.5 s"
     );
 }
 
