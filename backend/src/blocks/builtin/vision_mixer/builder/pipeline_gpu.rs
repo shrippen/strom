@@ -654,6 +654,16 @@ pub(super) fn build_gpu_pipeline(
     }
 
     // --- Pad properties (applied after linking when auto-created pads exist) ---
+    // Preview output: one more tee branch per input, after the PiP ones.
+    let pvw_weak = if p.enable_preview_out {
+        let pvw_comp = super::preview_out::append(p, 3 + p.num_pips, &mut elems, &mut links)?;
+        Some(pvw_comp.downgrade())
+    } else {
+        None
+    };
+    let pvw_rect = mv_layout.pvw_rect;
+    let (pgm_w, pgm_h) = (p.pgm_w, p.pgm_h);
+
     let pad_properties = pad_layout::build_pad_properties(p, &mv_layout);
 
     // --- Audio metering branches (per-input + PGM) ---
@@ -679,6 +689,11 @@ pub(super) fn build_gpu_pipeline(
             super::super::geometry::install_caps_probes(
                 flow_id, &block_id, &mixer, &mv_comp, num_inputs, num_pips,
             );
+            if let Some(pvw_comp) = pvw_weak.as_ref().and_then(|w| w.upgrade()) {
+                super::preview_out::mirror(
+                    &mv_comp, &pvw_comp, num_inputs, &pvw_rect, pgm_w, pgm_h,
+                );
+            }
             // Border underlays hold a frame only while their border is
             // configured or still visible.
             if num_pips > 0 {

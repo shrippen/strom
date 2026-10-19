@@ -28,6 +28,7 @@ mod audio_meter;
 mod pad_layout;
 pub(crate) mod pipeline_cpu;
 mod pipeline_gpu;
+mod preview_out;
 
 /// Caps feature of CUDA device memory (NVIDIA `nvcodec` elements).
 const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
@@ -94,7 +95,7 @@ impl BlockBuilder for VisionMixerBuilder {
             "sink",
         ));
 
-        let outputs = vec![
+        let mut outputs = vec![
             ExternalPad::with_label("pgm_out", "PGM", MediaType::Video, "queue_dist_out", "src"),
             ExternalPad::with_label(
                 "multiview_out",
@@ -104,6 +105,15 @@ impl BlockBuilder for VisionMixerBuilder {
                 "src",
             ),
         ];
+        if properties::parse_bool(props, vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY, false) {
+            outputs.push(ExternalPad::with_label(
+                vision_mixer::PREVIEW_OUTPUT_PAD,
+                "PVW",
+                MediaType::Video,
+                "queue_pvw_out",
+                "src",
+            ));
+        }
 
         Some(ExternalPads { inputs, outputs })
     }
@@ -167,6 +177,8 @@ impl BlockBuilder for VisionMixerBuilder {
             properties::parse_bool(props, "swap_pvw_pgm", vision_mixer::DEFAULT_SWAP_PVW_PGM);
         let enable_stinger =
             properties::parse_bool(props, strom_types::stinger::ENABLE_STINGER_PROPERTY, false);
+        let enable_preview_out =
+            properties::parse_bool(props, vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY, false);
 
         let pref = props
             .get("compositor_preference")
@@ -214,6 +226,7 @@ impl BlockBuilder for VisionMixerBuilder {
             enable_fx,
             swap_pvw_pgm,
             enable_stinger,
+            enable_preview_out,
         };
 
         match backend {
@@ -260,6 +273,8 @@ pub(super) struct PipelineParams<'a> {
     pub(super) swap_pvw_pgm: bool,
     /// Build the stinger input: a graphic pad, and on the GPU a matte pad.
     pub(super) enable_stinger: bool,
+    /// Build the preview output (`preview_out`).
+    pub(super) enable_preview_out: bool,
 }
 
 impl PipelineParams<'_> {
