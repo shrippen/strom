@@ -317,7 +317,7 @@ impl PipelineManager {
             .map_err(unchanged)?;
         if take.plan.variant.uses_matte() && pads.matte.is_none() {
             return Err(unchanged(PipelineError::TransitionError(
-                "a matte stinger needs the GPU mixer".to_string(),
+                "a matte stinger needs the OpenGL mixer".to_string(),
             )));
         }
         let state = overlay::get_overlay_state(&self.flow_id, block_instance_id)

@@ -144,6 +144,10 @@ const CUDA_FULL_ALPHA: f64 = 1.0 - 1e-12;
 /// on grey) and the old source, cut back later, at ~0.03 (nearly black).
 /// 1.0 on a `cudacompositor` pad becomes `CUDA_FULL_ALPHA`: a change for the
 /// converter, and 1.0 again in the kernel's `f32`, so no level is lost.
+/// Known limit: the handler reads, then writes. A direct write of another
+/// value from the API thread (a cut) landing between the two while a fade
+/// binding still sets 1.0 each frame is overwritten; the window is
+/// microseconds once per frame, not seen. Goes with the upstream fix.
 fn guard_cuda_full_alpha(mixer: &gst::Element) {
     mixer.connect_pad_added(|_, pad| {
         if pad.direction() != gst::PadDirection::Sink || pad.find_property("alpha").is_none() {

@@ -56,7 +56,17 @@ impl TransitionController {
         &self,
         pipeline: &gst::Pipeline,
     ) -> Result<gst::ClockTime, TransitionError> {
-        let mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        // A compositor answers no position for a moment while it
+        // reconfigures (right after a PiP configuration, for one): ask
+        // again for up to 50 ms before the take fails.
+        let mut mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        for _ in 0..10 {
+            if mixer_position.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        }
 
         let pipeline_position = pipeline.query_position::<gst::ClockTime>();
 

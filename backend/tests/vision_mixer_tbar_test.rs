@@ -463,6 +463,18 @@ async fn a_refused_take_leaves_program_alone() {
         changes.iter().all(|&(alpha, _)| alpha == 0.0),
         "preview went on air for a refused take: {changes:?}"
     );
+
+    // Nor does it lift fade to black: the bar stays refused under it.
+    manager.fade_to_black(BLOCK, 0).expect("fade to black");
+    assert!(manager
+        .trigger_transition(BLOCK, 0, 1, "slide_lft", 0)
+        .is_err());
+    assert!(
+        manager
+            .hold_vision_mixer_transition(BLOCK, "fade", 0.3)
+            .is_err(),
+        "a refused take cancelled fade to black"
+    );
     manager.stop().expect("stop");
 }
 
@@ -505,5 +517,59 @@ async fn a_take_to_a_pip_clears_what_the_bar_held() {
     // `hold` with position 0 and a PiP on program changes nothing; it
     // waits for program to show red on both halves.
     hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+    manager.stop().expect("stop");
+}
+
+/// A take to a PiP that holds the input the bar slid in: that input goes
+/// off before the morph moves it, instead of flashing whole in its PiP
+/// place for a frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_take_to_a_pip_with_the_held_input_hides_it_before_moving_it() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_pips".to_string(), PV::String("1".into()));
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let incoming = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_1")
+        .expect("preview pad");
+
+    hold(&manager, &sink, "slide_left", 0.5, 'r', 'b');
+    let held_x = incoming.property::<i32>("xpos");
+    // A PiP of blue alone on preview: blue is in the new composition.
+    manager
+        .apply_vision_mixer_pip_config(
+            BLOCK,
+            0,
+            Some(1),
+            Vec::new(),
+            strom_types::vision_mixer::PipTransforms::new(),
+        )
+        .expect("PiP config");
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP to preview");
+    let take = states_during(&incoming, || {
+        manager
+            .trigger_transition(BLOCK, 0, 0, "fade", 300)
+            .expect("take the PiP");
+    });
+    assert!(
+        take.iter()
+            .all(|&(alpha, xpos)| alpha < 1.0 || xpos == held_x),
+        "blue moved while fully visible: held at {held_x}, {take:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    hold(&manager, &sink, "fade", 0.0, 'b', 'b');
     manager.stop().expect("stop");
 }
