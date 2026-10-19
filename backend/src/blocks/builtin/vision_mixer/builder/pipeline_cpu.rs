@@ -671,7 +671,13 @@ pub(super) fn build_cpu_pipeline(
             );
             if let Some(pvw_comp) = pvw_weak.as_ref().and_then(|w| w.upgrade()) {
                 super::preview_out::mirror(
-                    &mv_comp, &pvw_comp, num_inputs, &pvw_rect, pgm_w, pgm_h,
+                    &mv_comp,
+                    &pvw_comp,
+                    num_inputs,
+                    underlay_state.mv_pvw_underlay_base(),
+                    &pvw_rect,
+                    pgm_w,
+                    pgm_h,
                 );
             }
             // Border underlays hold a frame only while their border is

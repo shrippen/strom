@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use strom::blocks::BlockRegistry;
 use strom::events::EventBroadcaster;
 use strom::gst::pipeline::PipelineManager;
-use strom_types::vision_mixer::{NormRect, Zone, ENABLE_PREVIEW_OUT_PROPERTY, PREVIEW_OUTPUT_PAD};
+use strom_types::vision_mixer::{
+    NormRect, Zone, ZoneBorder, ENABLE_PREVIEW_OUT_PROPERTY, PREVIEW_OUTPUT_PAD,
+};
 use strom_types::{Flow, PropertyValue as PV};
 use tempfile::NamedTempFile;
 
@@ -177,6 +179,27 @@ fn band_color(sample: &gstreamer::Sample, x0: usize, x1: usize) -> Option<usize>
     (0..3).find(|&c| counts[c] * 10 > n * 8)
 }
 
+/// Fraction of yellow pixels in a rectangle of an RGBA frame.
+fn yellow_fraction(sample: &gstreamer::Sample, xs: (usize, usize), ys: (usize, usize)) -> f64 {
+    use gstreamer_video::{VideoFrameRef, VideoInfo};
+    let info = VideoInfo::from_caps(sample.caps().expect("caps")).expect("video info");
+    let buffer = sample.buffer().expect("buffer");
+    let frame = VideoFrameRef::from_buffer_ref_readable(buffer, &info).expect("map frame");
+    let stride = info.stride()[0] as usize;
+    let data = frame.plane_data(0).expect("plane 0");
+    let (mut yellow, mut n) = (0u64, 0u64);
+    for y in ys.0..ys.1 {
+        for x in xs.0..xs.1 {
+            let o = y * stride + x * 4;
+            if data[o] > 200 && data[o + 1] > 200 && data[o + 2] < 80 {
+                yellow += 1;
+            }
+            n += 1;
+        }
+    }
+    yellow as f64 / n as f64
+}
+
 /// Pull preview frames until the left and right halves show `left` and
 /// `right` (indices into `PATTERNS`).
 fn wait_for(sink: &gstreamer_app::AppSink, left: usize, right: usize, what: &str) {
@@ -225,7 +248,10 @@ fn preview_follows_the_mixer(backend: &str) {
         }),
         capacity: None,
         sources: vec![2],
-        border: None,
+        border: Some(ZoneBorder {
+            color: "#FFFF00".into(),
+            width: 8.0,
+        }),
     };
     manager
         .apply_vision_mixer_pip_config(BLOCK, 0, Some(0), vec![zone], Default::default())
@@ -234,6 +260,19 @@ fn preview_follows_the_mixer(backend: &str) {
         .select_vision_mixer_pip_for_preview(BLOCK, 0)
         .expect("PiP on preview");
     wait_for(&sink, 0, 2, "PiP on preview");
+    // The zone's border: yellow just above the box (input 2 fits into the
+    // right half as 160x90 at y 45).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut yellow = 0.0;
+    while std::time::Instant::now() < deadline && yellow < 0.8 {
+        if let Some(sample) = sink.try_pull_sample(gstreamer::ClockTime::from_mseconds(500)) {
+            yellow = yellow_fraction(&sample, (W / 2 + 20, W - 20), (39, 44));
+        }
+    }
+    assert!(
+        yellow >= 0.8,
+        "zone border on the preview output: {yellow:.2} yellow"
+    );
 
     // The mirror's handlers hold the preview pads weakly: nothing keeps
     // the pipeline alive after stop.

@@ -691,7 +691,13 @@ pub(super) fn build_gpu_pipeline(
             );
             if let Some(pvw_comp) = pvw_weak.as_ref().and_then(|w| w.upgrade()) {
                 super::preview_out::mirror(
-                    &mv_comp, &pvw_comp, num_inputs, &pvw_rect, pgm_w, pgm_h,
+                    &mv_comp,
+                    &pvw_comp,
+                    num_inputs,
+                    underlay_state.mv_pvw_underlay_base(),
+                    &pvw_rect,
+                    pgm_w,
+                    pgm_h,
                 );
             }
             // Border underlays hold a frame only while their border is
@@ -743,7 +749,7 @@ fn install_input_front(queue: &gst::Element, glupload: &gst::Element, label: &st
 /// `gpu::udmabuf_upload_broken`), hide its allocation proposal from
 /// everything upstream of `pad`, so the source keeps its own memory and
 /// `glupload` does a plain texture upload.
-fn keep_own_memory(pad: &gst::Pad) {
+pub(super) fn keep_own_memory(pad: &gst::Pad) {
     if crate::gpu::udmabuf_upload_broken() {
         // Per allocation query (each negotiation), not per buffer.
         pad.add_probe(
