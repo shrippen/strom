@@ -573,3 +573,87 @@ async fn a_take_to_a_pip_with_the_held_input_hides_it_before_moving_it() {
     hold(&manager, &sink, "fade", 0.0, 'b', 'b');
     manager.stop().expect("stop");
 }
+
+/// Another input chosen for preview while a push is held: on the next bar
+/// step the new preview takes its place before the old one goes off, so
+/// no frame shows black where the old one was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_preview_under_a_held_bar_replaces_the_old_one_without_a_gap() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_inputs".to_string(), PV::UInt(3));
+    for (id, ty, props) in [
+        (
+            "src2",
+            "videotestsrc",
+            vec![
+                ("pattern", PV::String("green".into())),
+                ("is-live", PV::Bool(true)),
+            ],
+        ),
+        (
+            "caps2",
+            "capsfilter",
+            vec![(
+                "caps",
+                PV::String(format!("video/x-raw,width={W},height={H},framerate=30/1")),
+            )],
+        ),
+    ] {
+        flow.elements.push(elem(id, ty, props));
+    }
+    for (from, to) in [
+        ("src2:src".to_string(), "caps2:sink".to_string()),
+        ("caps2:src".to_string(), format!("{BLOCK}:video_in_2")),
+    ] {
+        flow.links.push(strom_types::Link { from, to });
+    }
+    let builder = strom::blocks::builtin::get_builder("builtin.vision_mixer").expect("builder");
+    flow.blocks[0].computed_external_pads = builder.get_external_pads(&flow.blocks[0].properties);
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+
+    hold(&manager, &sink, "push_left", 0.5, 'r', 'b');
+    manager
+        .select_vision_mixer_preview(BLOCK, 2, 3)
+        .expect("green to preview");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ids = Vec::new();
+    let pads = [
+        mixer.static_pad("sink_1").expect("old preview"),
+        mixer.static_pad("sink_2").expect("new preview"),
+    ];
+    for pad in &pads {
+        let log = seen.clone();
+        ids.push(pad.connect_notify(Some("alpha"), move |pad, _| {
+            log.lock()
+                .unwrap()
+                .push((pad.name().to_string(), pad.property::<f64>("alpha")));
+        }));
+    }
+    manager
+        .hold_vision_mixer_transition(BLOCK, "push_left", 0.55)
+        .expect("hold");
+    for (pad, id) in pads.iter().zip(ids) {
+        pad.disconnect(id);
+    }
+    let log = seen.lock().unwrap().clone();
+    let old_off = log.iter().position(|(n, a)| n == "sink_1" && *a == 0.0);
+    let new_on = log.iter().position(|(n, a)| n == "sink_2" && *a == 1.0);
+    assert!(
+        matches!((new_on, old_off), (Some(on), Some(off)) if on < off),
+        "the old preview went off before the new one came in: {log:?}"
+    );
+    manager.stop().expect("stop");
+}

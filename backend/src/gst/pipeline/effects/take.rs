@@ -606,6 +606,7 @@ impl PipelineManager {
         // place: the mixer renders between two property writes, and a
         // detour would flash as a frame on air.
         let mut bar_pads = (None, None);
+        let mut others = Vec::new();
         for pad in mixer.sink_pads() {
             let Some(idx) = pad
                 .name()
@@ -625,7 +626,7 @@ impl PipelineManager {
             } else if idx == to {
                 bar_pads.1 = Some(pad);
             } else {
-                set_bar_pad(&pad, rest(idx), 0.0, None);
+                others.push((idx, pad));
             }
         }
         let (Some(from_pad), Some(to_pad)) = bar_pads else {
@@ -664,6 +665,11 @@ impl PipelineManager {
         };
         for (pad, (rect, alpha, zorder)) in order {
             set_bar_pad(pad, rect, alpha, zorder);
+        }
+        // The rest goes off last: a preview chosen while the bar was held
+        // replaces the old one only once the new one is in its place.
+        for (idx, pad) in &others {
+            set_bar_pad(pad, rest(*idx), 0.0, None);
         }
         Ok(())
     }
