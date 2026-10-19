@@ -9131,7 +9131,7 @@
           "position": {
             "type": "number",
             "format": "double",
-            "description": "How far the take is: 0 = program as it is, 1 = preview fully in.\nThe take itself is a transition request (usually a cut at 1)."
+            "description": "How far the take is: 0 = program as it is, 1 = preview fully in.\nThe take itself is a transition request: a cut at 1 goes on from\nthe held picture, a take with a duration (or a stinger) starts from\nprogram as it rests."
           },
           "transition_type": {
             "type": "string",

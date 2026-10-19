@@ -423,6 +423,14 @@ impl PipelineManager {
             }
             t => t,
         };
+        // Without a duration every transition is a cut: the pads already
+        // rest on the new program, and a slide, push or dip would first put
+        // it out of the picture again.
+        let trans_type = if is_cut {
+            TransitionType::Cut
+        } else {
+            trans_type
+        };
 
         match trans_type {
             TransitionType::Wipe(kind) => {
@@ -449,7 +457,10 @@ impl PipelineManager {
     /// the input pads show `transition_type` at that point (see
     /// `transitions::tbar`); DSKs and the rest keep what they do. A PiP on
     /// program or preview is refused, except that position 0 always puts
-    /// program back as it was. A take (at the end) finishes it.
+    /// program back as it was. A cut (at the end) finishes it; a take with
+    /// a duration, or a stinger, starts from program as it rests, so the
+    /// held picture jumps back first. Nothing remembers the hold: a
+    /// geometry refresh (an input changing size) rests the pads too.
     pub fn hold_vision_mixer_transition(
         &self,
         block_instance_id: &str,
@@ -580,18 +591,37 @@ impl PipelineManager {
                 block_instance_id, from, to
             )));
         };
-        set_bar_pad(
-            &from_pad,
+        // Between the two pads the same: towards preview the incoming one
+        // (on top) moves first, back towards program the outgoing one, so a
+        // push never opens a gap between them for a frame.
+        let to_now = (
+            to_pad.property::<i32>("xpos"),
+            to_pad.property::<i32>("ypos"),
+        );
+        let distance = |(x, y): (i32, i32)| (x - to_rect.0).abs() + (y - to_rect.1).abs();
+        let towards_preview = frame.to_alpha > to_pad.property::<f64>("alpha")
+            || distance({
+                let (x, y, _, _) = moved(to_rect, frame.to_offset);
+                (x, y)
+            }) < distance(to_now);
+        let from_values = (
             moved(from_rect, frame.from_offset),
             frame.from_alpha,
             Some(DIST_PGM_ZORDER),
         );
-        set_bar_pad(
-            &to_pad,
+        let to_values = (
             moved(to_rect, frame.to_offset),
             frame.to_alpha,
             Some(DIST_PGM_ZORDER + 1),
         );
+        let order = if towards_preview {
+            [(&to_pad, to_values), (&from_pad, from_values)]
+        } else {
+            [(&from_pad, from_values), (&to_pad, to_values)]
+        };
+        for (pad, (rect, alpha, zorder)) in order {
+            set_bar_pad(pad, rect, alpha, zorder);
+        }
         Ok(())
     }
 
