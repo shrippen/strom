@@ -678,6 +678,73 @@ fn test_cuda_pad_alpha_back_to_one() {
     assert_eq!(back, full, "white back at alpha 1.0 after 0.5");
 }
 
+/// The same on air: a take animates alpha through keyframes, and the last
+/// one lands on exactly 1.0. The guard must catch each value the control
+/// binding sets, not only direct writes.
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_pad_alpha_keyframes_back_to_one() {
+    use super::elements::{make_dist_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+    use gstreamer_controller::prelude::*;
+    use gstreamer_controller::InterpolationMode;
+
+    gst::init().unwrap();
+    let mixer = make_dist_compositor(CompositorBackend::Cuda, 20, 20, StartTime::First).unwrap();
+    let pipeline = gst::parse::launch(
+        "videotestsrc is-live=true pattern=white ! video/x-raw,width=320,height=180,framerate=30/1 \
+         ! cudaupload name=up cudadownload name=down ! videoconvert ! video/x-raw,format=GRAY8 \
+         ! appsink name=sink sync=false max-buffers=1 drop=true",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline.add(&mixer).unwrap();
+    pipeline.by_name("up").unwrap().link(&mixer).unwrap();
+    mixer.link(&pipeline.by_name("down").unwrap()).unwrap();
+    let pad = mixer.static_pad("sink_0").unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<AppSink>()
+        .unwrap();
+    let mean = |wait_ms| {
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        let sample = sink.pull_sample().unwrap();
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        map.iter().map(|&v| v as u64).sum::<u64>() / map.len() as u64
+    };
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let full = mean(400);
+    assert!(full > 200, "white at alpha 1.0: {}", full);
+
+    // Hold at 0.5 for 600 ms, then up to exactly 1.0 over 300 ms, in the
+    // mixer's stream time as the transitions program it.
+    let now = mixer.query_position::<gst::ClockTime>().unwrap();
+    let cs = crate::gst::control_bindings::fresh_control_source(
+        pad.upcast_ref(),
+        "alpha",
+        InterpolationMode::Linear,
+    )
+    .unwrap();
+    let ms = gst::ClockTime::from_mseconds;
+    assert!(cs.set(now, 0.5) && cs.set(now + ms(600), 0.5) && cs.set(now + ms(900), 1.0));
+    let half = mean(300);
+    assert!(
+        half < full * 3 / 4,
+        "white at keyframe alpha 0.5: {} of {}",
+        half,
+        full
+    );
+    let back = mean(1000);
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(back, full, "white back after keyframes 0.5 -> 1.0");
+}
+
 /// CUDA inputs take formats `cudaupload` has no caps for: ProRes 4444
 /// decodes to A444_10LE, VP9 with alpha to A420 (stingers with alpha).
 /// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.

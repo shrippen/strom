@@ -434,3 +434,34 @@ async fn a_push_step_and_a_zero_length_slide_show_no_black() {
     );
     manager.stop().expect("stop");
 }
+
+/// A take strom refuses (an unknown transition) changes nothing on air:
+/// the state stays with the old program, so must the picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_take_leaves_program_alone() {
+    let (mut manager, _registry) = build_manager(&build_flow(false));
+    manager.start().expect("start pipeline");
+    let sink = manager
+        .pipeline()
+        .by_name("pgmsink")
+        .expect("pgmsink")
+        .downcast::<gstreamer_app::AppSink>()
+        .expect("appsink");
+    hold(&manager, &sink, "fade", 0.0, 'r', 'r');
+    let incoming = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer")
+        .static_pad("sink_1")
+        .expect("preview pad");
+    let changes = states_during(&incoming, || {
+        assert!(manager
+            .trigger_transition(BLOCK, 0, 1, "slide_lft", 0)
+            .is_err());
+    });
+    assert!(
+        changes.iter().all(|&(alpha, _)| alpha == 0.0),
+        "preview went on air for a refused take: {changes:?}"
+    );
+    manager.stop().expect("stop");
+}
