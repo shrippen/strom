@@ -332,8 +332,10 @@ impl ThumbnailTap {
         let adapter_prefix = format!("{}_thumb", prefix);
         let mut output = TapOutput::Rgba;
 
-        // GPU memory on the tee: scale on the GPU, download only the small frame.
-        if memory == TapMemory::Cuda {
+        // GPU memory on the tee: scale on the GPU, download only the small
+        // frame. Without `cudaconvertscale` (an nvcodec build lacking it),
+        // download first as for system memory.
+        if memory == TapMemory::Cuda && gst::ElementFactory::find("cudaconvertscale").is_some() {
             let (elements, cuda_output) = self.cuda_scale_elements()?;
             branch_elements.extend(elements);
             output = cuda_output;
