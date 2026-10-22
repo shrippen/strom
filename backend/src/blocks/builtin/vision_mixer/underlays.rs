@@ -36,26 +36,47 @@ fn shared_region_argb(
         .find_map(|pip| border_argb(state, pip, input))
 }
 
+/// The preview output's compositor beside `mv_comp`, if the mixer has one
+/// (`builder::preview_out`).
+fn preview_compositor(mv_comp: &gst::Element) -> Option<gst::Element> {
+    let name = mv_comp.name();
+    let block = name.strip_suffix(":mv_comp")?;
+    mv_comp
+        .parent()?
+        .downcast::<gst::Bin>()
+        .ok()?
+        .by_name(&format!("{}:pvw_comp", block))
+}
+
 /// Every underlay pad as (compositor, sink index, configured border color).
-fn underlay_pads<'a>(
+fn underlay_pads(
     state: &VisionMixerOverlayState,
-    mixer: &'a gst::Element,
-    mv_comp: &'a gst::Element,
-) -> Vec<(&'a gst::Element, usize, Option<u32>)> {
+    mixer: &gst::Element,
+    mv_comp: &gst::Element,
+) -> Vec<(gst::Element, usize, Option<u32>)> {
     let mut pads = Vec::new();
     let (pgm_pip, pvw_pip) = (state.pgm_pip(), state.pvw_pip());
+    let pvw_comp = preview_compositor(mv_comp);
     for input in 0..state.num_inputs {
         if let Some(base) = state.dist_underlay_base() {
             let argb = shared_region_argb(state, pgm_pip, pvw_pip, input);
-            pads.push((mixer, base + input, argb));
+            pads.push((mixer.clone(), base + input, argb));
         }
         if let Some(base) = state.mv_pvw_underlay_base() {
             let argb = shared_region_argb(state, pvw_pip, None, input);
-            pads.push((mv_comp, base + input, argb));
+            pads.push((mv_comp.clone(), base + input, argb));
+            // The preview output shows what the PVW big display shows.
+            if let Some(pvw_comp) = &pvw_comp {
+                pads.push((pvw_comp.clone(), state.num_inputs + input, argb));
+            }
         }
         for pip in 0..state.num_pips {
             if let Some(base) = state.mv_pip_underlay_base(pip) {
-                pads.push((mv_comp, base + input, border_argb(state, pip, input)));
+                pads.push((
+                    mv_comp.clone(),
+                    base + input,
+                    border_argb(state, pip, input),
+                ));
             }
         }
     }
@@ -70,7 +91,7 @@ fn sink_pad(compositor: &gst::Element, idx: usize) -> Option<gst::Pad> {
 /// apply the initial zones.
 pub(crate) fn watch(state: &VisionMixerOverlayState, mixer: &gst::Element, mv_comp: &gst::Element) {
     for (compositor, idx, _) in underlay_pads(state, mixer, mv_comp) {
-        if let Some(pad) = sink_pad(compositor, idx) {
+        if let Some(pad) = sink_pad(&compositor, idx) {
             underlay::watch_underlay_pad(&pad);
         }
     }
@@ -87,7 +108,7 @@ pub(crate) fn refresh(
     mv_comp: &gst::Element,
 ) {
     for (compositor, idx, argb) in underlay_pads(state, mixer, mv_comp) {
-        let Some(pad) = sink_pad(compositor, idx) else {
+        let Some(pad) = sink_pad(&compositor, idx) else {
             continue;
         };
         // Color first, so a pad that starts holding gets its frame in it.

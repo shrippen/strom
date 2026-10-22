@@ -82,7 +82,7 @@ fn is_underlay_src(el: &gst::Element) -> bool {
 
 /// The underlay source feeding an underlay pad, found by walking upstream
 /// past the short static chain (capsfilter / glupload / videoconvert).
-fn upstream_underlay_src(pad: &gst::Pad) -> Option<gst::Element> {
+pub(crate) fn upstream_underlay_src(pad: &gst::Pad) -> Option<gst::Element> {
     let mut el = pad.peer()?.parent_element()?;
     for _ in 0..6 {
         if is_underlay_src(&el) {
