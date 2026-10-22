@@ -319,6 +319,15 @@ pub(crate) fn apply_pip_layout_to_region(
         // they keep driving the property and our set_property calls below would
         // be invisible until the next take rebuilds bindings.
         clear_layout_bindings(&pad);
+        // Crop applies to the source wherever it renders in this PiP —
+        // including hidden pads, whose retained transform stays staged so the
+        // source returns pre-framed. Non-PiP reveal paths wipe crop
+        // themselves (apply_input_group_to_region, the classic-take reset).
+        // A shown pad is cropped before it shows, a hidden one once it is off.
+        let crop = transforms.get(&i).copied().unwrap_or_default();
+        if Some(i) == bg || layout_map.contains_key(&i) {
+            set_pad_crop(&pad, &crop);
+        }
         // Border underlay for this input: shown only for a zone source whose
         // zone has a visible border; hidden otherwise (incl. bg + hidden pads).
         let mut underlay_shown = false;
@@ -361,21 +370,16 @@ pub(crate) fn apply_pip_layout_to_region(
                 underlay_shown = true;
             }
         } else {
-            hidden.push(pad.clone());
+            hidden.push((pad.clone(), crop));
         }
         if let Some(u) = underlay {
             if !underlay_shown {
                 hide_underlay(compositor, u.base + i);
             }
         }
-        // Crop applies to the source wherever it renders in this PiP —
-        // including hidden pads, whose retained transform stays staged so the
-        // source returns pre-framed. Non-PiP reveal paths wipe crop
-        // themselves (apply_input_group_to_region, the classic-take reset).
-        let crop = transforms.get(&i).copied().unwrap_or_default();
-        set_pad_crop(&pad, &crop);
     }
-    for pad in hidden {
+    for (pad, crop) in hidden {
         pad.set_property("alpha", 0.0f64);
+        set_pad_crop(&pad, &crop);
     }
 }
