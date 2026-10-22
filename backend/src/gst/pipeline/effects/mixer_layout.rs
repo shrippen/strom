@@ -245,12 +245,13 @@ pub(crate) fn apply_input_group_to_region(
         let Some(pad) = find_pad(compositor, &pad_name) else {
             continue;
         };
-        // Plain-input mode never crops — wipe any crop left by a PiP render.
-        set_pad_crop(&pad, &Default::default());
         // Clear any lingering control bindings from a previous morph/fade so
         // our set_property writes aren't silently overridden by stale values.
         clear_layout_bindings(&pad);
         if Some(i) == active {
+            // Plain-input mode never crops — wipe any crop left by a PiP
+            // render: before it shows here, after it is off for the others.
+            set_pad_crop(&pad, &Default::default());
             let aspect = src_aspects.get(&i).copied().unwrap_or(fallback_aspect);
             let (x, y, w, h) = strom_types::vision_mixer::aspect_fit_rect(rx, ry, rw, rh, aspect);
             pad.set_property("xpos", x);
@@ -268,6 +269,7 @@ pub(crate) fn apply_input_group_to_region(
     }
     for pad in hidden {
         pad.set_property("alpha", 0.0f64);
+        set_pad_crop(&pad, &Default::default());
     }
 }
 
