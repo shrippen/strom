@@ -103,6 +103,9 @@ pub struct VisionMixerOverlayState {
     /// An input changed size while a take or FTB was animating the layout,
     /// so the layout still has to be re-fitted once the animation is over.
     pub layout_refit_pending: AtomicBool,
+    /// The effect a held T-bar last showed (strom remembers no more of the
+    /// hold than this): a different one rests the pads first.
+    pub tbar_effect: std::sync::Mutex<Option<String>>,
     /// Multiview overlay alpha (0.0–1.0), stored as f64 bits.
     overlay_alpha: AtomicU64,
     /// DSK enabled states (one per DSK input, max 4).
@@ -225,6 +228,7 @@ impl VisionMixerOverlayState {
             num_inputs,
             ftb_active: AtomicBool::new(false),
             layout_refit_pending: AtomicBool::new(false),
+            tbar_effect: std::sync::Mutex::new(None),
             overlay_alpha: AtomicU64::new(1.0f64.to_bits()),
             dsk_enabled: (0..num_dsk_inputs)
                 .map(|_| AtomicBool::new(false))

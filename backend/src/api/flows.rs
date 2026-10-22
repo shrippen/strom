@@ -1874,6 +1874,44 @@ pub async fn trigger_transition(
     }))
 }
 
+/// Hold the take from program to preview at a T-bar position.
+///
+/// Program and preview must be inputs (not PiPs). The pads show the
+/// transition at `position` until the next call, a take, or position 0.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/tbar",
+    tag = "flows",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Vision mixer block instance ID")
+    ),
+    request_body = strom_types::api::HoldTransitionRequest,
+    responses(
+        (status = 204, description = "Held at the position"),
+        (status = 400, description = "Invalid request, PiP on a bus, or a stinger on air", body = ErrorResponse),
+    )
+)]
+pub async fn hold_transition(
+    State(state): State<AppState>,
+    Path((flow_id, block_id)): Path<(FlowId, String)>,
+    ValidatedJson(req): ValidatedJson<strom_types::api::HoldTransitionRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .hold_vision_mixer_transition(&flow_id, &block_id, &req.transition_type, req.position)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::with_details(
+                    "Failed to hold the transition",
+                    e.to_string(),
+                )),
+            )
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Select a preview source on a vision mixer block.
 #[utoipa::path(
     put,

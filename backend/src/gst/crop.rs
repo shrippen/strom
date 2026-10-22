@@ -68,8 +68,11 @@ pub(crate) fn set_pad_crop(pad: &gst::Pad, crop: &strom_types::vision_mixer::Sou
         // removed, see crate::gst::control_bindings).
         crate::gst::control_bindings::wipe_control_bindings(pad.upcast_ref(), &CROP_PAD_PROPS);
         if crop.is_zero() {
+            // Only what is set: a T-bar comes here on every fader step.
             for prop in CROP_PAD_PROPS {
-                pad.set_property(prop, 0i32);
+                if pad.property::<i32>(prop) != 0 {
+                    pad.set_property(prop, 0i32);
+                }
             }
             return;
         }
@@ -97,8 +100,12 @@ pub(crate) fn set_pad_crop(pad: &gst::Pad, crop: &strom_types::vision_mixer::Sou
         // thread — see crate::gst::control_bindings.
         crate::gst::control_bindings::wipe_control_bindings(vc.upcast_ref(), &VIDEOCROP_PROPS);
         if crop.is_zero() {
+            // Only what is set: each write renegotiates, and a T-bar comes
+            // here on every fader step.
             for prop in VIDEOCROP_PROPS {
-                vc.set_property(prop, 0i32);
+                if vc.property::<i32>(prop) != 0 {
+                    vc.set_property(prop, 0i32);
+                }
             }
             return;
         }

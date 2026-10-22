@@ -96,6 +96,24 @@ pub struct UpdatePropertyRequest {
     pub ramp_ms: Option<u32>,
 }
 
+/// Request to hold the take from program to preview at a T-bar position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[cfg_attr(feature = "validation", derive(garde::Validate))]
+pub struct HoldTransitionRequest {
+    /// How far the take is: 0 = program as it is, 1 = preview fully in.
+    /// The take itself is a transition request: a cut at 1 goes on from
+    /// the held picture, a take with a duration (or a stinger) starts from
+    /// program as it rests.
+    #[cfg_attr(feature = "validation", garde(range(min = 0.0, max = 1.0)))]
+    pub position: f64,
+    /// The transition the bar runs, as for a take ("fade", "slide_left",
+    /// "push_up", "dip_to_black", ...). Wipes and master FX show as a fade.
+    #[serde(default = "default_transition_type")]
+    #[cfg_attr(feature = "validation", garde(length(min = 1, max = 50)))]
+    pub transition_type: String,
+}
+
 /// Request to trigger a transition on a compositor block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]

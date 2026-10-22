@@ -299,10 +299,25 @@ const REFIT_MARGIN: Duration = Duration::from_millis(50);
 /// pads, or `None` when none lies ahead. Keyframes are in the compositor's
 /// stream time, which is what its position query reports.
 fn animation_remaining(compositor: &gst::Element) -> Option<Duration> {
+    pads_animation_remaining(compositor, &compositor.sink_pads())
+}
+
+/// [`animation_remaining`] of the first `num_inputs` sink pads (the
+/// inputs, not DSK, border or stinger pads): a take or the program
+/// fading back from black.
+pub(crate) fn inputs_animation_remaining(
+    compositor: &gst::Element,
+    num_inputs: usize,
+) -> Option<Duration> {
+    let inputs: Vec<gst::Pad> = (0..num_inputs)
+        .filter_map(|i| compositor.static_pad(&format!("sink_{i}")))
+        .collect();
+    pads_animation_remaining(compositor, &inputs)
+}
+
+fn pads_animation_remaining(compositor: &gst::Element, pads: &[gst::Pad]) -> Option<Duration> {
     let now = compositor.query_position::<gst::ClockTime>()?;
-    compositor
-        .sink_pads()
-        .iter()
+    pads.iter()
         .flat_map(|pad| {
             ANIMATED_PAD_PROPS
                 .iter()
