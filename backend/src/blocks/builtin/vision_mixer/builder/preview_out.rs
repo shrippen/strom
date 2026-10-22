@@ -164,7 +164,7 @@ fn append_underlays(
         let upload = match p.backend {
             CompositorBackend::OpenGL => {
                 if let Some(pad) = cf.static_pad("src") {
-                    super::pipeline_gpu::keep_own_memory(&pad);
+                    crate::gst::gl_input_front::keep_own_memory(&pad);
                 }
                 Some("glupload")
             }
