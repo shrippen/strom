@@ -200,6 +200,13 @@ fn tap_config() -> ThumbnailTapConfig {
 fn thumbnail_on_a_cuda_memory_tee_downloads_first_and_keeps_the_stream_flowing() {
     gst::init().unwrap();
     common::require_elements(ELEMENTS);
+    // With real nvcodec the tap encodes on the GPU and needs real CUDA
+    // memory, which the stand-in cannot make; that path is
+    // `thumbnail_tap::tests::test_thumbnail_from_cuda_memory` (--ignored).
+    if gst::ElementFactory::find("cudaconvertscale").is_some() {
+        eprintln!("SKIP: real nvcodec present, the stand-in's download path is not taken");
+        return;
+    }
     stand_in::register();
 
     let harness = Harness::start(CUDA_CAPS);
