@@ -619,8 +619,10 @@ impl ThumbnailTap {
             .property("quality", u32::from(self.config.jpeg_quality))
             .build()
             .ok();
+        // JPEG (JFIF) is full-range BT.601 and nvjpegenc does not convert:
+        // video-range NV12 would show black as 16 and white as 235.
         let format = if jpeg_encoder.is_some() {
-            "NV12"
+            "NV12,colorimetry=1:4:0:0"
         } else {
             "RGBA"
         };
@@ -821,7 +823,7 @@ mod tests {
     fn test_thumbnail_from_cuda_memory() {
         gst::init().unwrap();
         let pipeline = gst::parse::launch(
-            "videotestsrc is-live=true ! video/x-raw,width=640,height=360,framerate=30/1 ! \
+            "videotestsrc is-live=true pattern=white ! video/x-raw,width=640,height=360,framerate=30/1 ! \
              cudaupload ! video/x-raw(memory:CUDAMemory) ! \
              tee name=t allow-not-linked=true ! queue ! fakesink",
         )
@@ -849,5 +851,13 @@ mod tests {
         let jpeg = result.expect("no thumbnail from a CUDA-memory tee");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
         assert!(encoded_on_gpu);
+        // Full range: white is white, not video-range 235.
+        let rgb = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        let white = rgb.get_pixel(rgb.width() / 2, rgb.height() / 2);
+        assert!(
+            white.0.iter().all(|&v| v >= 250),
+            "white decoded as {:?}",
+            white.0
+        );
     }
 }

@@ -199,20 +199,56 @@ pub(super) fn build_cpu_pipeline(
             crop_id.clone(),
             elements::make_element("videocrop", &crop_id)?,
         ));
-        links.push((
-            ElementPadRef::pad(&q_id, "src"),
-            ElementPadRef::pad(&vc_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&vc_id, "src"),
-            ElementPadRef::pad(&crop_id, "sink"),
-        ));
         if p.backend == CompositorBackend::Cuda {
+            // Crop before the last convert: videocrop takes the clip's
+            // alpha formats (A420 from VP9, A444_10LE from ProRes), so a
+            // convert in front of it would pass them through, and
+            // cudaupload has no caps for them (not-negotiated, no stinger
+            // on air). A first convert, held to what videocrop takes, only
+            // changes the formats it does not (A444_16LE, RGBA64); videocrop
+            // would accept those at the caps query and fail in set_info.
+            let pre_id = p.id("videoconvert_stinger_in");
+            let caps_id = p.id("capsfilter_stinger_in");
+            elems.push((
+                pre_id.clone(),
+                elements::make_element(CPU_CONVERT, &pre_id)?,
+            ));
+            let capsfilter = gst::ElementFactory::make("capsfilter")
+                .name(&caps_id)
+                .property("caps", videocrop_sink_caps()?)
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", caps_id, e)))?;
+            elems.push((caps_id.clone(), capsfilter));
             let up_id = p.id("cudaupload_stinger");
             elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
             links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&pre_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&pre_id, "src"),
+                ElementPadRef::pad(&caps_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&caps_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
+            ));
+            links.push((
                 ElementPadRef::pad(&crop_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
                 ElementPadRef::pad(&up_id, "sink"),
+            ));
+        } else {
+            links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
             ));
         }
     }
@@ -622,6 +658,16 @@ pub(super) fn build_cpu_pipeline(
         ElementPadRef::pad(&mv_comp_id, format!("sink_{}", p.num_inputs)),
     ));
 
+    // Preview output: one more tee branch per input, after the PiP ones.
+    let pvw_weak = if p.enable_preview_out {
+        let pvw_comp = super::preview_out::append(p, 3 + p.num_pips, &mut elems, &mut links)?;
+        Some(pvw_comp.downgrade())
+    } else {
+        None
+    };
+    let pvw_rect = mv_layout.pvw_rect;
+    let (pgm_w, pgm_h) = (p.pgm_w, p.pgm_h);
+
     let pad_properties = pad_layout::build_pad_properties(p, &mv_layout);
 
     // Audio metering branches (per-input + PGM)
@@ -646,6 +692,17 @@ pub(super) fn build_cpu_pipeline(
             super::super::geometry::install_caps_probes(
                 flow_id, &block_id, &mixer, &mv_comp, num_inputs, num_pips,
             );
+            if let Some(pvw_comp) = pvw_weak.as_ref().and_then(|w| w.upgrade()) {
+                super::preview_out::mirror(
+                    &mv_comp,
+                    &pvw_comp,
+                    num_inputs,
+                    underlay_state.mv_pvw_underlay_base(),
+                    &pvw_rect,
+                    pgm_w,
+                    pgm_h,
+                );
+            }
             // Border underlays hold a frame only while their border is
             // configured or still visible.
             if num_pips > 0 {

@@ -150,6 +150,13 @@ pub const DEFAULT_ENABLE_FX: bool = true;
 /// are mirrored.
 pub const DEFAULT_SWAP_PVW_PGM: bool = false;
 
+/// Block property that builds the preview output.
+pub const ENABLE_PREVIEW_OUT_PROPERTY: &str = "enable_preview_out";
+
+/// Output pad of the preview: at program size, what the multiview's PVW
+/// shows (an input or a PiP), without the multiview's labels and tallies.
+pub const PREVIEW_OUTPUT_PAD: &str = "pvw_out";
+
 // --- Z-order constants for compositor pads ---
 
 /// Z-order for thumbnail pads on the multiview compositor.

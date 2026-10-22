@@ -317,11 +317,26 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Preview output
+        ExposedProperty {
+            name: strom_types::vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY.to_string(),
+            label: "Preview Output".to_string(),
+            description: "Add a preview output (PVW) at program size: what the multiview's preview shows, an input or a PiP, without labels and tallies. Costs one more compositor at program size.".to_string(),
+            property_type: PropertyType::Bool,
+            default_value: Some(PropertyValue::Bool(false)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Stinger input
         ExposedProperty {
             name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),
             label: "Stinger Input".to_string(),
-            description: "Add a stinger input: wire a Media Player with Stinger Clip Source turned on into it, and take stingers from the vision mixer panel. Classic stingers run on both backends; track-matte and mask-only stingers need the GPU backend and play as classic on the CPU one.".to_string(),
+            description: "Add a stinger input: wire a Media Player with Stinger Clip Source turned on into it, and take stingers from the vision mixer panel. Classic stingers run on every mixer (CPU, OpenGL, CUDA); track-matte and mask-only stingers need the OpenGL mixer and play as classic on the CPU and CUDA ones.".to_string(),
             property_type: PropertyType::Bool,
             default_value: Some(PropertyValue::Bool(false)),
             mapping: PropertyMapping {

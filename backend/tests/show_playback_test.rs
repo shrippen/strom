@@ -25,6 +25,8 @@ struct Ear {
     buffers: u64,
     /// Peak of every buffer since the first sound.
     peaks: Vec<f32>,
+    /// Length of the zone's buffers.
+    buffer: Option<gst::ClockTime>,
 }
 
 struct Rig {
@@ -68,6 +70,11 @@ fn write_tone(dir: &std::path::Path, seconds: u32) -> String {
 
 /// Two stereo zones, each into an appsink that measures its level.
 fn rig() -> Rig {
+    rig_with(true)
+}
+
+/// [`rig`], with sinks that sync to the clock or not.
+fn rig_with(sync: bool) -> Rig {
     gst::init().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let tone = write_tone(dir.path(), 3);
@@ -115,7 +122,7 @@ fn rig() -> Rig {
     let mut ears = Vec::new();
     for zone in 0..2 {
         let ear = Arc::new(Mutex::new(Ear::default()));
-        let sink = gst_app::AppSink::builder().sync(true).build();
+        let sink = gst_app::AppSink::builder().sync(sync).build();
         let heard = ear.clone();
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -132,6 +139,7 @@ fn rig() -> Rig {
                     let mut ear = heard.lock().unwrap();
                     ear.peak = peak;
                     ear.buffers += 1;
+                    ear.buffer = buffer.duration();
                     if peak > 0.05 && ear.first_sound.is_none() {
                         ear.first_sound = Some(Instant::now());
                     }
@@ -303,6 +311,49 @@ fn a_sound_plays_to_its_end_and_the_zone_runs_on() {
     );
 }
 
+/// A zone keeps time by itself, not by its sink: behind a sink that does
+/// not hold it back (as a PipeWire `pulsesink` on the monotonic clock did),
+/// a 3 s sound is still playing after 1.5 s. Without its live silence the
+/// zone mixed the whole file at once, the sound counted as ended at once,
+/// and a stop or panic no longer found it while it was heard.
+#[test]
+fn a_zone_keeps_time_behind_a_sink_that_does_not_sync() {
+    let rig = rig_with(false);
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut request = hall_tone(&rig, "tone");
+    request.start = SoundStart::Play;
+    sound::add(&block, &request).unwrap();
+    wait_for("the Hall hears the tone", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        state_of(&rig, "tone"),
+        Some(SoundState::Playing),
+        "a 3 s sound counted as over after 1.5 s"
+    );
+}
+
+/// GO to heard is the zone pipeline's latency plus the output's: here
+/// 5 ms silence (it reports its buffer), 5 ms block, 15 ms zone mixer and
+/// the appsink's 20 ms processing deadline, 45 ms. With the silence at
+/// audiotestsrc's default (1024 samples, 21 ms) it was 61 ms; before
+/// this change (mixer 30 ms, 10 ms blocks) 90 ms.
+#[test]
+fn a_zone_waits_little_before_it_plays() {
+    let rig = rig_with(true);
+    wait_for("the zones run", || rig.ears[0].lock().unwrap().buffers > 0);
+    let mut query = gst::query::Latency::new();
+    assert!(rig.pipeline.query(&mut query), "latency query");
+    let (live, min, _) = query.result();
+    assert!(live, "the zones are live");
+    assert!(
+        min <= gst::ClockTime::from_mseconds(50),
+        "zone latency {} ms, budget 50 ms",
+        min.mseconds()
+    );
+}
+
 /// A 1 s tone in the Hall, starting at once, repeated as `repeat` says.
 fn repeated(rig: &Rig, id: &str, repeat: SoundRepeat) -> AddSoundRequest {
     let dir = std::path::Path::new(&rig.tone).parent().unwrap().join(id);
@@ -338,8 +389,14 @@ fn a_repeated_sound_plays_its_times_without_a_gap() {
         "3 plays of 1 s took {played:?}"
     );
     let ear = rig.ears[0].lock().unwrap();
-    // 10 ms buffers: the first 2.9 s are all tone.
-    let quiet = ear.peaks.iter().take(290).filter(|p| **p < 0.05).count();
+    // The first 2.9 s are all tone, both seams included.
+    let window = (2900 / ear.buffer.expect("buffer duration").mseconds().max(1)) as usize;
+    assert!(
+        ear.peaks.len() >= window,
+        "only {} buffers heard",
+        ear.peaks.len()
+    );
+    let quiet = ear.peaks.iter().take(window).filter(|p| **p < 0.05).count();
     assert_eq!(quiet, 0, "{quiet} quiet buffers between the plays");
 }
 

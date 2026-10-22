@@ -221,6 +221,10 @@ pub async fn create_app_with_config(
             put(api::flows::select_preview),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/tbar",
+            post(api::flows::hold_transition),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/pip/{pip_idx}",
             get(api::flows::get_pip_config).put(api::flows::update_pip_config),
         )

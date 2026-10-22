@@ -56,7 +56,17 @@ impl TransitionController {
         &self,
         pipeline: &gst::Pipeline,
     ) -> Result<gst::ClockTime, TransitionError> {
-        let mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        // A compositor answers no position for a moment while it
+        // reconfigures (right after a PiP configuration, for one): ask
+        // again for up to 50 ms before the take fails.
+        let mut mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        for _ in 0..10 {
+            if mixer_position.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            mixer_position = self.mixer.query_position::<gst::ClockTime>();
+        }
 
         let pipeline_position = pipeline.query_position::<gst::ClockTime>();
 
@@ -102,6 +112,12 @@ impl TransitionController {
         // Clean up any previous transitions (they're no longer needed)
         if let Ok(mut transitions) = self.active_transitions.lock() {
             transitions.clear();
+        }
+
+        // A cut needs no time: asking anyway could fail it after the take
+        // has already rested the pads on the new program.
+        if transition_type == TransitionType::Cut {
+            return self.transition_cut(from_input, to_input);
         }
 
         // Adjust for pipeline latency so keyframes align with compositor processing

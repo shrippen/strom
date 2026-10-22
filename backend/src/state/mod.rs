@@ -2279,6 +2279,28 @@ impl AppState {
         Ok(out)
     }
 
+    /// Hold the take from program to preview at a T-bar position.
+    pub async fn hold_vision_mixer_transition(
+        &self,
+        flow_id: &FlowId,
+        block_instance_id: &str,
+        transition_type: &str,
+        position: f64,
+    ) -> Result<(), PipelineError> {
+        // A stinger owns the program until its clip has played out.
+        let Some(_claim) = stinger::claim_for_classic(flow_id, block_instance_id) else {
+            return Err(PipelineError::TransitionError(
+                "a stinger or another take is programming the mixer; move the T-bar when it has finished"
+                    .to_string(),
+            ));
+        };
+        let pipelines = self.inner.pipelines.read().await;
+        let manager = pipelines.get(flow_id).ok_or_else(|| {
+            PipelineError::InvalidFlow(format!("Pipeline not running for flow: {}", flow_id))
+        })?;
+        manager.hold_vision_mixer_transition(block_instance_id, transition_type, position)
+    }
+
     /// Trigger a transition on a compositor/mixer block.
     pub async fn trigger_transition(
         &self,
@@ -2299,7 +2321,8 @@ impl AppState {
         // take does.
         let Some(claim) = stinger::claim_for_classic(flow_id, block_instance_id) else {
             return Err(PipelineError::TransitionError(
-                "a stinger is on air; take again when it has finished".to_string(),
+                "a stinger or another take is programming the mixer; take again when it has finished"
+                    .to_string(),
             ));
         };
 
@@ -2318,8 +2341,10 @@ impl AppState {
         )?;
 
         drop(pipelines);
-        drop(claim);
 
+        // The claim lasts until program and preview have swapped: a T-bar
+        // step of another client in between would read the old program
+        // and pull it back on air.
         self.after_vision_mixer_take(
             flow_id,
             block_instance_id,
@@ -2332,6 +2357,7 @@ impl AppState {
             new_pgm,
         )
         .await;
+        drop(claim);
 
         Ok(actual_kind)
     }
