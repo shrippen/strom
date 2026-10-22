@@ -278,6 +278,28 @@ impl BlockBuilder for ShowPlaybackBuilder {
                 ZONE_LATENCY_MS,
                 crate::blocks::builtin::start_time::StartTime::Zero,
             )?;
+            // Live silence clocks the zone: without a live input the mixer
+            // mixes a sound as fast as it arrives (5 s of a file in ~0.1 s
+            // on a PipeWire sink), so the sound's end and any stop come
+            // seconds before it is heard. Like the stage's live black.
+            let silence = make("audiotestsrc", id("zone_silence"))?;
+            silence.set_property("is-live", true);
+            silence.set_property_from_str("wave", "silence");
+            let silence_caps = make("capsfilter", id("zone_scaps"))?;
+            silence_caps.set_property("caps", zone_caps(zone.channels));
+            let silence_pad = mixer
+                .request_pad_simple("sink_%u")
+                .ok_or_else(|| BlockBuildError::ElementCreation("audiomixer gave no pad".into()))?;
+            internal_links.push((
+                ElementPadRef::pad(id("zone_silence"), "src"),
+                ElementPadRef::pad(id("zone_scaps"), "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(id("zone_scaps"), "src"),
+                ElementPadRef::pad(id("zone_mixer"), silence_pad.name().as_str()),
+            ));
+            elements.push((id("zone_silence"), silence));
+            elements.push((id("zone_scaps"), silence_caps));
             let caps = make("capsfilter", id("zone_caps"))?;
             caps.set_property("caps", zone_caps(zone.channels));
             let volume = make("volume", id("zone_vol"))?;
