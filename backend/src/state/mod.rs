@@ -2341,8 +2341,10 @@ impl AppState {
         )?;
 
         drop(pipelines);
-        drop(claim);
 
+        // The claim lasts until program and preview have swapped: a T-bar
+        // step of another client in between would read the old program
+        // and pull it back on air.
         self.after_vision_mixer_take(
             flow_id,
             block_instance_id,
@@ -2355,6 +2357,7 @@ impl AppState {
             new_pgm,
         )
         .await;
+        drop(claim);
 
         Ok(actual_kind)
     }

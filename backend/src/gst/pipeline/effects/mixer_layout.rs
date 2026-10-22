@@ -223,8 +223,9 @@ pub(super) fn pads_for_source(
 
 /// Apply a single-input source layout (aspect-fitted into the region) to a
 /// contiguous range of compositor sink pads. Pads not equal to the active
-/// input are hidden. Plain inputs never have borders, so the region's
-/// underlay pads (when it has any) are all hidden too.
+/// input are hidden, after it shows: a frame between two writes shows the
+/// old or the new picture, never neither. Plain inputs never have borders,
+/// so the region's underlay pads (when it has any) are all hidden too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_input_group_to_region(
     compositor: &gst::Element,
@@ -238,6 +239,7 @@ pub(crate) fn apply_input_group_to_region(
     underlay: Option<UnderlayCtx>,
 ) {
     let (rx, ry, rw, rh) = region;
+    let mut hidden = Vec::new();
     for i in 0..num_inputs {
         let pad_name = format!("sink_{}", pad_base + i);
         let Some(pad) = find_pad(compositor, &pad_name) else {
@@ -258,11 +260,14 @@ pub(crate) fn apply_input_group_to_region(
             pad.set_property("alpha", 1.0f64);
             pad.set_property("zorder", fg_zorder);
         } else {
-            pad.set_property("alpha", 0.0f64);
+            hidden.push(pad);
         }
         if let Some(u) = underlay {
             hide_underlay(compositor, u.base + i);
         }
+    }
+    for pad in hidden {
+        pad.set_property("alpha", 0.0f64);
     }
 }
 
@@ -271,7 +276,8 @@ pub(crate) fn apply_input_group_to_region(
 ///
 /// Each pad whose input index matches `bg` becomes the background; each pad whose
 /// input is found in `overlays` is positioned at its corresponding tile; all other
-/// pads in the range are hidden (alpha=0).
+/// pads in the range are hidden (alpha=0) after those show, so a frame between two
+/// writes never shows neither the old nor the new picture.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_pip_layout_to_region(
     compositor: &gst::Element,
@@ -303,6 +309,7 @@ pub(crate) fn apply_pip_layout_to_region(
     let layout_map: std::collections::HashMap<usize, &strom_types::vision_mixer::ZonePadLayout> =
         layouts.iter().map(|l| (l.input, l)).collect();
 
+    let mut hidden = Vec::new();
     for i in 0..num_inputs {
         let pad_name = format!("sink_{}", pad_base + i);
         let Some(pad) = find_pad(compositor, &pad_name) else {
@@ -354,7 +361,7 @@ pub(crate) fn apply_pip_layout_to_region(
                 underlay_shown = true;
             }
         } else {
-            pad.set_property("alpha", 0.0f64);
+            hidden.push(pad.clone());
         }
         if let Some(u) = underlay {
             if !underlay_shown {
@@ -367,5 +374,8 @@ pub(crate) fn apply_pip_layout_to_region(
         // themselves (apply_input_group_to_region, the classic-take reset).
         let crop = transforms.get(&i).copied().unwrap_or_default();
         set_pad_crop(&pad, &crop);
+    }
+    for pad in hidden {
+        pad.set_property("alpha", 0.0f64);
     }
 }

@@ -977,3 +977,83 @@ async fn a_take_to_a_pip_after_a_held_dip_shows_no_black() {
     );
     manager.stop().expect("stop");
 }
+
+/// A cut to a PiP and from a PiP to an input whose picture sits on a
+/// higher pad than the old one: the new picture is on before the old one
+/// goes off, so no frame between two writes is black.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cut_to_and_from_a_pip_shows_no_black() {
+    let mut flow = build_flow(false);
+    flow.blocks[0]
+        .properties
+        .insert("num_pips".to_string(), PV::String("1".into()));
+    let (mut manager, _registry) = build_manager(&flow);
+    manager.start().expect("start pipeline");
+    let mixer = manager
+        .pipeline()
+        .by_name(&format!("{BLOCK}:mixer"))
+        .expect("mixer");
+    let red = mixer.static_pad("sink_0").expect("red pad");
+    let blue = mixer.static_pad("sink_1").expect("blue pad");
+
+    // A cut and the swap after it, as the state layer does; each alpha
+    // write logs (red, blue), and some pad must be on in every one.
+    let cut = |what: &str| {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ids = Vec::new();
+        for pad in [&red, &blue] {
+            let (log, a, b) = (seen.clone(), red.downgrade(), blue.downgrade());
+            ids.push(pad.connect_notify(Some("alpha"), move |_, _| {
+                if let (Some(a), Some(b)) = (a.upgrade(), b.upgrade()) {
+                    log.lock()
+                        .unwrap()
+                        .push((a.property::<f64>("alpha"), b.property::<f64>("alpha")));
+                }
+            }));
+        }
+        let (_, old_pgm, new_pgm, _) = manager
+            .trigger_transition(BLOCK, 0, 0, "cut", 0)
+            .expect("cut");
+        for (pad, id) in [&red, &blue].into_iter().zip(ids) {
+            pad.disconnect(id);
+        }
+        manager
+            .update_vision_mixer_after_take(BLOCK, new_pgm, old_pgm, 2)
+            .expect("swap");
+        let states = seen.lock().unwrap().clone();
+        assert!(
+            states.iter().all(|&(r, b)| r > 0.0 || b > 0.0),
+            "{what}: both pads off at once: {states:?}"
+        );
+    };
+    let pip = |bg: usize| {
+        manager
+            .apply_vision_mixer_pip_config(
+                BLOCK,
+                0,
+                Some(bg),
+                Vec::new(),
+                strom_types::vision_mixer::PipTransforms::new(),
+            )
+            .expect("PiP config");
+    };
+
+    // Red on program, a PiP of blue alone on preview.
+    pip(1);
+    manager
+        .select_vision_mixer_pip_for_preview(BLOCK, 0)
+        .expect("PiP to preview");
+    cut("red to a PiP of blue");
+    assert_eq!(blue.property::<f64>("alpha"), 1.0);
+    cut("back to red");
+
+    // A PiP of red alone on program, blue on preview.
+    pip(0);
+    cut("red to a PiP of red");
+    manager
+        .select_vision_mixer_preview(BLOCK, 1, 2)
+        .expect("blue to preview");
+    cut("a PiP of red to blue");
+    assert_eq!(blue.property::<f64>("alpha"), 1.0);
+    manager.stop().expect("stop");
+}
