@@ -390,6 +390,28 @@ pub fn build_flow(tag: &str, backend: &str, clips: &[std::path::PathBuf]) -> Flo
     flow
 }
 
+/// For the CUDA mixer, whose program leaves in CUDA memory: download it in
+/// front of the test sink's convert.
+pub fn download_cuda_program(flow: &mut Flow) {
+    flow.elements.push(strom_types::Element {
+        id: "pgmdown".to_string(),
+        element_type: "cudadownload".to_string(),
+        properties: HashMap::new(),
+        position: [0.0, 0.0].into(),
+        pad_properties: HashMap::new(),
+    });
+    let link = flow
+        .links
+        .iter_mut()
+        .find(|l| l.to == "pgmconv:sink")
+        .expect("program link to the test sink");
+    link.to = "pgmdown:sink".to_string();
+    flow.links.push(Link {
+        from: "pgmdown:src".to_string(),
+        to: "pgmconv:sink".to_string(),
+    });
+}
+
 /// Also feed the stinger source to an ordinary mixer input, `video_in_2`, as
 /// an operator does to see it on the multiview: the source's output then goes
 /// through a tee to two consumers, and a format either refuses fails both.

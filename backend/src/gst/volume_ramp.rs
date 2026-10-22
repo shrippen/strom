@@ -351,7 +351,9 @@ fn lay_out_keyframes(
         // down to 0. Avoids a trailing inaudible tail.
         let amp = if target_is_zero && t >= 0.95 {
             let amp_at_95 = db_to_amp(start_db + 0.95 * (end_db - start_db));
-            let linear_t = (t - 0.95) / 0.05;
+            // (1.0 - 0.95) / 0.05 is a hair above 1.0: clamp, or the last
+            // keyframe goes below 0 and `volume` refuses it (CRITICAL).
+            let linear_t = ((t - 0.95) / 0.05).clamp(0.0, 1.0);
             amp_at_95 * (1.0 - linear_t)
         } else {
             db_to_amp(start_db + t * (end_db - start_db))
@@ -400,6 +402,20 @@ mod unit_tests {
                 back
             );
         }
+    }
+
+    /// A long ramp to silence ends at exactly 0, never below: `volume`
+    /// refuses negative values with a GLib CRITICAL.
+    #[test]
+    fn long_ramp_to_zero_ends_at_zero() {
+        gst::init().unwrap();
+        let cs = InterpolationControlSource::new();
+        cs.set_mode(InterpolationMode::Linear);
+        let now = gst::ClockTime::from_seconds(1);
+        let duration = gst::ClockTime::from_mseconds(2000);
+        assert!(lay_out_keyframes(&cs, now, duration, 1.0, 0.0, 2000));
+        let end = gstreamer::prelude::ControlSourceExt::value(&cs, now + duration).unwrap();
+        assert_eq!(end, 0.0, "last keyframe {end}");
     }
 
     #[test]

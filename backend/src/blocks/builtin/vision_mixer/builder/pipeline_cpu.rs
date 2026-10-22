@@ -199,20 +199,56 @@ pub(super) fn build_cpu_pipeline(
             crop_id.clone(),
             elements::make_element("videocrop", &crop_id)?,
         ));
-        links.push((
-            ElementPadRef::pad(&q_id, "src"),
-            ElementPadRef::pad(&vc_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&vc_id, "src"),
-            ElementPadRef::pad(&crop_id, "sink"),
-        ));
         if p.backend == CompositorBackend::Cuda {
+            // Crop before the last convert: videocrop takes the clip's
+            // alpha formats (A420 from VP9, A444_10LE from ProRes), so a
+            // convert in front of it would pass them through, and
+            // cudaupload has no caps for them (not-negotiated, no stinger
+            // on air). A first convert, held to what videocrop takes, only
+            // changes the formats it does not (A444_16LE, RGBA64); videocrop
+            // would accept those at the caps query and fail in set_info.
+            let pre_id = p.id("videoconvert_stinger_in");
+            let caps_id = p.id("capsfilter_stinger_in");
+            elems.push((
+                pre_id.clone(),
+                elements::make_element(CPU_CONVERT, &pre_id)?,
+            ));
+            let capsfilter = gst::ElementFactory::make("capsfilter")
+                .name(&caps_id)
+                .property("caps", videocrop_sink_caps()?)
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", caps_id, e)))?;
+            elems.push((caps_id.clone(), capsfilter));
             let up_id = p.id("cudaupload_stinger");
             elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
             links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&pre_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&pre_id, "src"),
+                ElementPadRef::pad(&caps_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&caps_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
+            ));
+            links.push((
                 ElementPadRef::pad(&crop_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
                 ElementPadRef::pad(&up_id, "sink"),
+            ));
+        } else {
+            links.push((
+                ElementPadRef::pad(&q_id, "src"),
+                ElementPadRef::pad(&vc_id, "sink"),
+            ));
+            links.push((
+                ElementPadRef::pad(&vc_id, "src"),
+                ElementPadRef::pad(&crop_id, "sink"),
             ));
         }
     }

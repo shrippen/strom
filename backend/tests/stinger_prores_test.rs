@@ -38,6 +38,33 @@ async fn prores_4444_keeps_its_alpha() {
     r.state.stop_flow(&r.flow_id).await.unwrap();
 }
 
+/// The same on the CUDA mixer: the clip's alpha format is cropped, then
+/// converted for `cudaupload` (in the other order it reached the upload as
+/// it was and did not negotiate). Run with
+/// `cargo test --test stinger_prores_test -- --ignored` on a host with
+/// NVIDIA CUDA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(stinger)]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+async fn prores_4444_keeps_its_alpha_on_cuda() {
+    if !common::plugins_available(&["avenc_prores_ks", "avdec_prores", "qtmux", "qtdemux"]) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("classic.mov");
+    prores_classic_clip(&clip);
+    let r = start_edited(
+        "prores-cuda",
+        "cuda",
+        dir,
+        vec![clip],
+        download_cuda_program,
+    )
+    .await;
+    classic_take(&r).await;
+    r.state.stop_flow(&r.flow_id).await.unwrap();
+}
+
 /// The stinger source moves between formats from clip to clip: a PNG clip
 /// (RGBA), then ProRes 4444 (10- or 16-bit 4:4:4 with alpha), then the PNG
 /// clip again. The source also feeds an ordinary mixer input, whose GL upload

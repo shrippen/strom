@@ -1385,7 +1385,7 @@
             <span class="conn-dot" id="wsDot" title="WebSocket control">WS</span>
         </div>
         <span class="status-text" id="statusText">Connecting...</span>
-        <span class="shortcut-hint">v2.46-stinger | 1-9,0 = PVW | Space = AUTO | X = CUT | F = FTB | M = Hide</span>
+        <span class="shortcut-hint">v2.47-stinger-cuda | 1-9,0 = PVW | Space = AUTO | X = CUT | F = FTB | M = Hide</span>
     </div>
 
     <!-- Server-injected configuration (safe JSON encoding) -->
@@ -1945,7 +1945,7 @@
                 html += ' <span class="badge down" title="The graphic has no alpha channel: it covers the whole picture. Use WebM VP9 with alpha, ProRes 4444 or FFV1.">NO ALPHA</span>';
             }
             if (c.downgraded_from) {
-                html += ' <span class="badge down" title="Needs the GPU mixer; plays as classic here">CPU</span>';
+                html += ' <span class="badge down" title="Needs the OpenGL mixer; plays as classic here">CPU</span>';
             }
             return html;
         }
@@ -2033,7 +2033,7 @@
                     + ', on air ' + Math.round(t.take_to_air_ms) + ' ms after the take';
             }
             if (!s.matte_supported && s.source_block_id) {
-                html += '<br><span class="warn">Software mixer: matte stingers play as classic.</span>';
+                html += '<br><span class="warn">This mixer has no matte stage: matte stingers play as classic.</span>';
             }
             status.innerHTML = html;
             if (stingerSettingsOpen) renderStingerSettings();
