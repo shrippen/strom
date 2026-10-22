@@ -105,6 +105,14 @@ pub struct DeviceResponse {
     pub provider: String,
     /// Additional properties from the device.
     pub properties: HashMap<String, String>,
+    /// Speaker position of each channel of an audio device, in the
+    /// device's channel order: PipeWire's names (`FL`, `FR`, `FC`, `LFE`,
+    /// `RL`, `SL`, ..., `AUX0`... on pro-audio profiles). A sound server
+    /// routes a stream to a device by position, not by index, so a client
+    /// that addresses one device channel needs them. Empty when the device
+    /// does not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_positions: Vec<String>,
     /// Seconds since first discovery.
     pub first_seen_secs_ago: u64,
     /// Seconds since last seen.
@@ -219,6 +227,7 @@ mod tests {
             category: DeviceCategory::AudioSource,
             provider: provider.to_string(),
             properties,
+            channel_positions: vec![],
             first_seen_secs_ago: 0,
             last_seen_secs_ago: 0,
         }
