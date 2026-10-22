@@ -811,6 +811,23 @@ fn splice_when_idle(
     }
 }
 
+/// Where `glupload`'s udmabuf path is broken (see
+/// `gpu::udmabuf_upload_broken`), hide its allocation proposal from
+/// everything upstream of `pad`, so the source keeps its own memory and
+/// `glupload` does a plain texture upload.
+pub(crate) fn keep_own_memory(pad: &gst::Pad) {
+    if crate::gpu::udmabuf_upload_broken() {
+        // Per allocation query (each negotiation), not per buffer.
+        pad.add_probe(
+            gst::PadProbeType::QUERY_DOWNSTREAM,
+            |_pad, info| match info.query() {
+                Some(q) if q.type_() == gst::QueryType::Allocation => gst::PadProbeReturn::Drop,
+                _ => gst::PadProbeReturn::Ok,
+            },
+        );
+    }
+}
+
 /// Insert an `adapter_factory` element between `upload`'s sink pad and its peer,
 /// linking with `check`. The caller makes sure no buffer moves across that
 /// link meanwhile.
@@ -843,6 +860,9 @@ fn splice_adapter(
     };
     bin.add(&adapter)
         .map_err(|e| format!("{} could not be added to {}: {}", name, bin.name(), e))?;
+    // The adapter feeds `upload` directly: it must not get the udmabuf
+    // allocator either (black input on NVIDIA).
+    keep_own_memory(&src);
 
     // Unlink before linking: `glupload` accepts one upstream link only.
     if let Err(e) = feeder.unlink(&upload_sink) {

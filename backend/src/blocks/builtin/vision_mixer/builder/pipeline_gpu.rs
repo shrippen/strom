@@ -409,7 +409,7 @@ pub(super) fn build_gpu_pipeline(
             // The underlay feeds glupload without a queue in between: without
             // this, borders are empty textures on NVIDIA (no frame around boxes).
             if let Some(src_pad) = cf.static_pad("src") {
-                keep_own_memory(&src_pad);
+                crate::gst::gl_input_front::keep_own_memory(&src_pad);
             }
             elems.push((src_id.clone(), src));
             elems.push((cf_id.clone(), cf));
@@ -717,26 +717,9 @@ pub(super) fn build_gpu_pipeline(
 /// `glupload` does a plain texture upload.
 fn install_input_front(queue: &gst::Element, glupload: &gst::Element, label: &str) {
     if let Some(src) = queue.static_pad("src") {
-        keep_own_memory(&src);
+        crate::gst::gl_input_front::keep_own_memory(&src);
     }
     if let Some(sink) = queue.static_pad("sink") {
         crate::gst::gl_input_front::install(&sink, glupload, label);
-    }
-}
-
-/// Where `glupload`'s udmabuf path is broken (see
-/// `gpu::udmabuf_upload_broken`), hide its allocation proposal from
-/// everything upstream of `pad`, so the source keeps its own memory and
-/// `glupload` does a plain texture upload.
-fn keep_own_memory(pad: &gst::Pad) {
-    if crate::gpu::udmabuf_upload_broken() {
-        // Per allocation query (each negotiation), not per buffer.
-        pad.add_probe(
-            gst::PadProbeType::QUERY_DOWNSTREAM,
-            |_pad, info| match info.query() {
-                Some(q) if q.type_() == gst::QueryType::Allocation => gst::PadProbeReturn::Drop,
-                _ => gst::PadProbeReturn::Ok,
-            },
-        );
     }
 }
