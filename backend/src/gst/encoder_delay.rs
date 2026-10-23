@@ -10,18 +10,20 @@
 //! Muxers place buffers by running time, so moving the encoder's output one
 //! delay earlier (a negative pad offset) puts the sound back where it was
 //! heard. The rate is read from the encoder's caps event, not per buffer.
-//! Every flow pipeline does this for each AAC encoder in it, standalone or
+//! Every flow pipeline does this for each of these encoders in it, standalone or
 //! inside a block, also those a block adds while it runs.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use tracing::debug;
 
-/// Samples an encoder puts before the sound, by factory name (AAC-LC).
+/// Samples an encoder puts before the sound, by factory name (AAC-LC),
+/// each measured. `voaacenc` is not measured and stays as it is.
 fn delay_samples(factory: &str) -> Option<u64> {
     match factory {
         "avenc_aac" => Some(1024),
         "fdkaacenc" => Some(2048),
+        "faac" => Some(1024),
         _ => None,
     }
 }
@@ -58,9 +60,8 @@ fn compensate(encoder: &gst::Element) {
             let gst::QueryViewMut::Latency(latency) = query.view_mut() else {
                 return gst::PadProbeReturn::Ok;
             };
-            let extra = gst::ClockTime::from_nseconds(
-                reported.load(std::sync::atomic::Ordering::Relaxed),
-            );
+            let extra =
+                gst::ClockTime::from_nseconds(reported.load(std::sync::atomic::Ordering::Relaxed));
             let (live, min, max) = latency.result();
             latency.set(live, min + extra, max.map(|m| m + extra));
             gst::PadProbeReturn::Ok
