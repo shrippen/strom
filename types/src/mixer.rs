@@ -236,14 +236,9 @@ pub fn keep_dynamic_aux_buses(
         return;
     };
     // A bus whose number the flow now builds itself is the editor's.
-    let num_static = match new
-        .get("num_aux_buses")
-        .or_else(|| old.get("num_aux_buses"))
-    {
-        Some(crate::PropertyValue::Int(n)) => usize::try_from(*n).unwrap_or(0),
-        Some(crate::PropertyValue::UInt(n)) => usize::try_from(*n).unwrap_or(0),
-        _ => 0,
-    };
+    let num_static = num_static_aux_buses(new)
+        .or_else(|| num_static_aux_buses(old))
+        .unwrap_or(0);
     for (name, value) in old {
         if buses
             .iter()
@@ -252,6 +247,39 @@ pub fn keep_dynamic_aux_buses(
             new.entry(name.clone()).or_insert_with(|| value.clone());
         }
     }
+}
+
+/// The `num_aux_buses` property, as the backend reads it (integer or a
+/// number in a string).
+fn num_static_aux_buses(
+    properties: &std::collections::HashMap<String, crate::PropertyValue>,
+) -> Option<usize> {
+    match properties.get("num_aux_buses")? {
+        crate::PropertyValue::Int(n) => Some(usize::try_from(*n).unwrap_or(0)),
+        crate::PropertyValue::UInt(n) => Some(usize::try_from(*n).unwrap_or(usize::MAX)),
+        crate::PropertyValue::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Drop a mixer's dynamic aux buses from its properties, with the settings
+/// of each (a copy or an import of a flow: it would publish on the same
+/// channels). A bus added there later starts from the defaults. A list that
+/// does not parse goes alone: which numbers it named is not known.
+pub fn drop_dynamic_aux_buses(
+    properties: &mut std::collections::HashMap<String, crate::PropertyValue>,
+) {
+    let Some(crate::PropertyValue::String(json)) = properties.remove(DYNAMIC_AUX_BUSES_PROPERTY)
+    else {
+        return;
+    };
+    let buses = parse_dynamic_aux_buses(&json).unwrap_or_default();
+    let num_static = num_static_aux_buses(properties).unwrap_or(0);
+    properties.retain(|name, _| {
+        !buses
+            .iter()
+            .any(|bus| bus.aux > num_static && is_aux_bus_property(name, bus.aux))
+    });
 }
 
 #[cfg(test)]
@@ -355,5 +383,36 @@ mod tests {
             [("num_aux_buses".to_string(), PropertyValue::Int(2))].into();
         keep_dynamic_aux_buses(&old, &mut saved, true);
         assert!(!saved.contains_key("aux2_fader"));
+    }
+
+    #[test]
+    fn a_copy_drops_the_dynamic_buses_with_their_settings() {
+        use crate::PropertyValue;
+        use std::collections::HashMap;
+        let json = serde_json::to_string(&[bus(2, "a"), bus(3, "b")]).unwrap();
+        for num_static in [
+            PropertyValue::Int(2),
+            PropertyValue::UInt(2),
+            PropertyValue::String("2".into()),
+        ] {
+            let mut props: HashMap<String, PropertyValue> = [
+                ("num_aux_buses", num_static),
+                (
+                    DYNAMIC_AUX_BUSES_PROPERTY,
+                    PropertyValue::String(json.clone()),
+                ),
+                ("aux2_fader", PropertyValue::Float(0.5)),
+                ("aux3_fader", PropertyValue::Float(0.5)),
+                ("ch1_aux3_level", PropertyValue::Float(0.5)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+            drop_dynamic_aux_buses(&mut props);
+            let mut left: Vec<&str> = props.keys().map(String::as_str).collect();
+            left.sort();
+            // Bus 2 is static now: its settings stay.
+            assert_eq!(left, ["aux2_fader", "num_aux_buses"]);
+        }
     }
 }

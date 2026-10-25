@@ -281,26 +281,8 @@ impl StromApp {
 
         // A mixer's dynamic aux buses publish on their inter channels; a copy
         // or an import would take the same ones next to the original.
-        // Their settings go with them, so a bus added there starts from the
-        // defaults.
         for block in &mut flow.blocks {
-            let Some(strom_types::PropertyValue::String(json)) = block
-                .properties
-                .remove(strom_types::mixer::DYNAMIC_AUX_BUSES_PROPERTY)
-            else {
-                continue;
-            };
-            let buses = strom_types::mixer::parse_dynamic_aux_buses(&json).unwrap_or_default();
-            let num_static = match block.properties.get("num_aux_buses") {
-                Some(strom_types::PropertyValue::Int(n)) => usize::try_from(*n).unwrap_or(0),
-                Some(strom_types::PropertyValue::UInt(n)) => usize::try_from(*n).unwrap_or(0),
-                _ => 0,
-            };
-            block.properties.retain(|name, _| {
-                !buses.iter().any(|bus| {
-                    bus.aux > num_static && strom_types::mixer::is_aux_bus_property(name, bus.aux)
-                })
-            });
+            strom_types::mixer::drop_dynamic_aux_buses(&mut block.properties);
         }
 
         // Reset state to Null
