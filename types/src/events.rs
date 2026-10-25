@@ -383,6 +383,14 @@ pub enum StromEvent {
         block_id: String,
         active: bool,
     },
+    /// Inputs were added to or removed from a running vision mixer.
+    VisionMixerInputsChanged {
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+        flow_id: FlowId,
+        block_id: String,
+        /// The inputs the mixer has now, by index, ascending.
+        active_inputs: Vec<usize>,
+    },
     /// Vision mixer video effect changed (shader FX engine)
     VisionMixerEffectChanged {
         #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
@@ -898,6 +906,16 @@ impl StromEvent {
                     if *active { "ON" } else { "OFF" }
                 )
             }
+            StromEvent::VisionMixerInputsChanged {
+                flow_id,
+                block_id,
+                active_inputs,
+            } => {
+                format!(
+                    "Vision mixer {} in flow {}: inputs {:?}",
+                    block_id, flow_id, active_inputs
+                )
+            }
             StromEvent::VisionMixerEffectChanged {
                 flow_id,
                 block_id,
@@ -1038,6 +1056,7 @@ impl StromEvent {
             StromEvent::VisionMixerDskChanged { .. } => "VisionMixerDskChanged",
             StromEvent::VisionMixerOverlayAlphaChanged { .. } => "VisionMixerOverlayAlphaChanged",
             StromEvent::VisionMixerFtbChanged { .. } => "VisionMixerFtbChanged",
+            StromEvent::VisionMixerInputsChanged { .. } => "VisionMixerInputsChanged",
             StromEvent::VisionMixerEffectChanged { .. } => "VisionMixerEffectChanged",
             StromEvent::MediaDownloadProgress(_) => "MediaDownloadProgress",
             StromEvent::StingerCued { .. } => "StingerCued",
@@ -1088,6 +1107,7 @@ impl StromEvent {
             | StromEvent::VisionMixerDskChanged { flow_id, .. }
             | StromEvent::VisionMixerOverlayAlphaChanged { flow_id, .. }
             | StromEvent::VisionMixerFtbChanged { flow_id, .. }
+            | StromEvent::VisionMixerInputsChanged { flow_id, .. }
             | StromEvent::VisionMixerEffectChanged { flow_id, .. }
             | StromEvent::StingerCued { flow_id, .. }
             | StromEvent::StingerStarted { flow_id, .. }
@@ -1171,6 +1191,7 @@ impl StromEvent {
             | StromEvent::VisionMixerDskChanged { .. }
             | StromEvent::VisionMixerOverlayAlphaChanged { .. }
             | StromEvent::VisionMixerFtbChanged { .. }
+            | StromEvent::VisionMixerInputsChanged { .. }
             | StromEvent::VisionMixerEffectChanged { .. }
             | StromEvent::StingerCued { .. }
             | StromEvent::StingerStarted { .. }
@@ -1515,6 +1536,11 @@ mod event_accessor_tests {
                 block_id: "mix0".to_string(),
                 active: false,
             },
+            StromEvent::VisionMixerInputsChanged {
+                flow_id: id,
+                block_id: "mix0".to_string(),
+                active_inputs: vec![0, 1, 5],
+            },
             StromEvent::VisionMixerEffectChanged {
                 flow_id: id,
                 block_id: "mix0".to_string(),
@@ -1577,7 +1603,7 @@ mod event_accessor_tests {
     fn every_variant_event_type_matches_its_serde_wire_tag() {
         let events = one_of_each_variant();
 
-        let variant_count = 48;
+        let variant_count = 49;
         assert_eq!(
             events.len(),
             variant_count,

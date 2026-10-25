@@ -7,7 +7,13 @@ use std::str::FromStr;
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
 
+mod dynamic;
 mod pad_map;
+pub use dynamic::{
+    parse_dynamic_inputs, validate_dynamic_inputs, AddVisionMixerInputRequest, DynamicInput,
+    DynamicInputSource, VisionMixerInputInfo, VisionMixerInputs, DYNAMIC_INPUTS_PROPERTY,
+    MAX_INPUTS_PROPERTY, MAX_INPUT_CAPACITY,
+};
 pub use pad_map::PadMap;
 
 /// A source that can be assigned to PGM or PVW.
