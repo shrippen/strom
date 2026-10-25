@@ -36,6 +36,19 @@ pub(super) fn parse_num_aux_buses(properties: &HashMap<String, PropertyValue>) -
         .clamp(0, MAX_AUX_BUSES)
 }
 
+/// Parse the monitor's source from properties: the 0-based aux bus it
+/// follows instead of Main, `None` for Main (also for a bus not built).
+pub(super) fn parse_monitor_source(
+    properties: &HashMap<String, PropertyValue>,
+    num_aux_buses: usize,
+) -> Option<usize> {
+    properties
+        .get("monitor_source")
+        .and_then(parse_count)
+        .filter(|bus| (1..=num_aux_buses).contains(bus))
+        .map(|bus| bus - 1)
+}
+
 /// Parse number of groups from properties.
 pub(super) fn parse_num_groups(properties: &HashMap<String, PropertyValue>) -> usize {
     properties

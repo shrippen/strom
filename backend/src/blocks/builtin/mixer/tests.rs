@@ -284,7 +284,13 @@ fn test_mixer_config_properties_not_live() {
     // depends on this flag to give a meaningful error message instead of
     // silently failing in the `_block` branch.
     let def = mixer_definition();
-    for name in ["num_channels", "dsp_backend", "num_aux_buses", "num_groups"] {
+    for name in [
+        "num_channels",
+        "dsp_backend",
+        "num_aux_buses",
+        "num_groups",
+        "monitor_source",
+    ] {
         assert!(
             !exposed(&def, name).live,
             "{} must NOT be marked live: true",
@@ -683,6 +689,48 @@ fn test_build_wires_channels_aux_group_and_monitor() {
             pad.internal_pad_name
         );
     }
+}
+
+#[test]
+fn test_monitor_source_is_an_aux_bus_instead_of_main() {
+    // Without it the monitor follows Main (see above).
+    let m = assemble(&small_mixer_props(&[(
+        "monitor_source",
+        PropertyValue::UInt(1),
+    )]));
+    assert!(m.downstream("aux0_out_tee").contains("monitor_out_tee"));
+    assert!(
+        !m.downstream("main_out_tee").contains("monitor_out_tee"),
+        "Main no longer reaches the monitor"
+    );
+    // Solo still does, through its own gate.
+    assert!(m.downstream("solo_mixer").contains("monitor_out_tee"));
+
+    // Bus 2 of two is aux1, not aux0, that feeds the monitor's gate (aux0
+    // still reaches the monitor through its AFL tap and the solos).
+    let m = assemble(&small_mixer_props(&[
+        ("num_aux_buses", PropertyValue::UInt(2)),
+        ("monitor_source", PropertyValue::UInt(2)),
+    ]));
+    assert!(m.downstream("aux1_out_tee").contains("main_to_mon"));
+    assert!(!m.downstream("aux0_out_tee").contains("main_to_mon"));
+}
+
+#[test]
+fn test_monitor_source_parsing() {
+    let source = |value: Option<PropertyValue>, aux: usize| {
+        let map = match value {
+            Some(v) => props(&[("monitor_source", v)]),
+            None => HashMap::new(),
+        };
+        parse_monitor_source(&map, aux)
+    };
+    assert_eq!(source(None, 2), None);
+    assert_eq!(source(Some(PropertyValue::UInt(0)), 2), None);
+    assert_eq!(source(Some(PropertyValue::UInt(2)), 2), Some(1));
+    assert_eq!(source(Some(PropertyValue::String("1".into())), 2), Some(0));
+    // A bus that is not built leaves the monitor on Main.
+    assert_eq!(source(Some(PropertyValue::UInt(3)), 2), None);
 }
 
 /// Whether every `chN` / `auxN` / `groupN` / `grpN` index in a property name

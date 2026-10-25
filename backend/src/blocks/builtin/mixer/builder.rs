@@ -111,6 +111,7 @@ impl BlockBuilder for MixerBuilder {
         let num_channels = parse_num_channels(properties);
         let num_aux_buses = parse_num_aux_buses(properties);
         let num_groups = parse_num_groups(properties);
+        let monitor_source = parse_monitor_source(properties, num_aux_buses);
         let sample_rate = parse_sample_rate(properties);
         // All buses of this block start alike (see `start_time`).
         let start = crate::blocks::builtin::start_time::parse_start_time(properties);
@@ -439,10 +440,15 @@ impl BlockBuilder for MixerBuilder {
             .map_err(|e| BlockBuildError::ElementCreation(format!("monitor_out_tee: {}", e)))?;
         elements.push((monitor_out_tee_id.clone(), monitor_out_tee));
 
-        // Wiring:
+        // Wiring (`monitor_source` puts an aux bus's tee in place of Main's,
+        // e.g. a headphone mix; the gate keeps its name and its rule):
         //   solo_mixer  → solo_to_mon  → solo_to_mon_queue ─┐
         //                                                   ├→ monitor_mixer → monitor_master_vol → monitor_level → monitor_out_tee
         //   main_out_tee→ main_to_mon  → main_to_mon_queue ─┘
+        let monitor_source_tee_id = match monitor_source {
+            Some(aux) => format!("{}:aux{}_out_tee", instance_id, aux),
+            None => main_out_tee_id.clone(),
+        };
         internal_links.push((
             ElementPadRef::pad(&solo_out_id, "src"),
             ElementPadRef::pad(&solo_to_mon_id, "sink"),
@@ -456,7 +462,7 @@ impl BlockBuilder for MixerBuilder {
             ElementPadRef::element(&monitor_mixer_id),
         ));
         internal_links.push((
-            ElementPadRef::element(&main_out_tee_id),
+            ElementPadRef::element(&monitor_source_tee_id),
             ElementPadRef::pad(&main_to_mon_id, "sink"),
         ));
         internal_links.push((

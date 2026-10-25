@@ -115,6 +115,21 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // What the monitor hears while nothing is soloed — construction-time only.
+        ExposedProperty {
+            name: "monitor_source".to_string(),
+            label: "Monitor Source".to_string(),
+            description: "Bus the Monitor follows while no PFL/AFL is on: 0 = Main, 1 to num_aux_buses = that aux bus (a headphone mix). Construction-time only.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: "monitor_source".to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Monitor master level — drives the Monitor bus output. The Monitor
         // bus follows Main when no channel has PFL or AFL active, and
         // switches to the solo mix as soon as any PFL/AFL is engaged.
