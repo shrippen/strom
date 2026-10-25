@@ -97,13 +97,31 @@ pub struct VisionMixerOverlayState {
     input_dims: Vec<AtomicU64>,
     /// Number of configured PiP tiles (also `pip_bg.len()` / `pip_zones.len()`).
     pub num_pips: usize,
-    /// Number of inputs.
-    pub num_inputs: usize,
+    /// Number of input slots (`max_inputs`, the pad capacity). Per-input
+    /// vectors are indexed by input and have this length.
+    pub capacity: usize,
+    /// Number of static inputs (`num_inputs`): `0..num_static`, always
+    /// present. The slots above them hold the dynamic inputs.
+    pub num_static: usize,
+    /// Whether slot `i` holds an input right now. Static inputs always do;
+    /// a dynamic one from its add until its removal.
+    active: Vec<AtomicBool>,
+    /// The dynamic inputs and what building one needs. Its lock also
+    /// serialises adding and removing inputs.
+    pub(crate) dynamic: std::sync::Mutex<super::dynamic::DynamicInputs>,
+    /// Held from checking an input until it is stored on preview or in a
+    /// PiP, and by a removal from freeing the slot until it has checked
+    /// that nothing uses the input: a removal cannot slip in between.
+    pub(crate) selection_lock: std::sync::Mutex<()>,
     /// Whether Fade to Black is active.
     pub ftb_active: AtomicBool,
     /// An input changed size while a take or FTB was animating the layout,
     /// so the layout still has to be re-fitted once the animation is over.
     pub layout_refit_pending: AtomicBool,
+    /// The set of inputs changed (a dynamic input came or went), so the
+    /// multiview has to re-fit its thumbnails. The dist mixer does not: an
+    /// added input starts hidden there and a removed one was off air.
+    pub mv_relayout_pending: AtomicBool,
     /// The effect a held T-bar last showed (strom remembers no more of the
     /// hold than this): a different one rests the pads first.
     pub tbar_effect: std::sync::Mutex<Option<String>>,
@@ -120,8 +138,9 @@ pub struct VisionMixerOverlayState {
     pub master_effect: std::sync::Mutex<strom_types::effects::VideoEffect>,
     /// Number of DSK inputs.
     pub num_dsk_inputs: usize,
-    /// Pre-computed layout (immutable after construction).
-    pub layout: OverlayLayout,
+    /// Multiview layout. Replaced when a dynamic input comes or goes (see
+    /// [`Self::set_layout`]); read with [`Self::layout`].
+    layout: std::sync::RwLock<Arc<OverlayLayout>>,
     /// PGM (distribution) canvas size — the reference for resolution-
     /// normalized units like zone-border width (set at build, immutable).
     pub pgm_w: u32,
@@ -129,8 +148,8 @@ pub struct VisionMixerOverlayState {
     /// Input labels. Set at build time and changed live through the
     /// `input_N_label` block properties.
     labels: std::sync::Mutex<Vec<String>>,
-    /// Bumped on every label change so the renderer can dirty-check labels
-    /// without comparing strings.
+    /// Bumped on every label or layout change so the renderer can
+    /// dirty-check them without comparing strings.
     labels_generation: AtomicU64,
     /// Monotonic instant captured at construction for wall-clock derivation.
     instant_base: Instant,
@@ -177,6 +196,7 @@ pub const NO_PIP: u64 = u64::MAX;
 pub const NO_SOURCE: u64 = u64::MAX;
 
 impl VisionMixerOverlayState {
+    /// State of a mixer whose inputs are all static (no free slots).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_inputs: usize,
@@ -190,6 +210,44 @@ impl VisionMixerOverlayState {
         show_vu_meters: bool,
         pip: PipInitialState,
     ) -> Self {
+        Self::with_slots(
+            num_inputs,
+            num_inputs,
+            num_dsk_inputs,
+            pgm_input,
+            pvw_input,
+            labels,
+            layout,
+            pgm_w,
+            pgm_h,
+            show_vu_meters,
+            pip,
+        )
+    }
+
+    /// State of a mixer with `num_static` static inputs and `capacity`
+    /// input slots; the slots above the static inputs start empty. `labels`
+    /// may be shorter than `capacity`: the rest get "In N".
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_slots(
+        num_static: usize,
+        capacity: usize,
+        num_dsk_inputs: usize,
+        pgm_input: usize,
+        pvw_input: usize,
+        labels: Vec<String>,
+        layout: OverlayLayout,
+        pgm_w: u32,
+        pgm_h: u32,
+        show_vu_meters: bool,
+        pip: PipInitialState,
+    ) -> Self {
+        let capacity = capacity.max(num_static);
+        let mut labels = labels;
+        labels.truncate(capacity);
+        while labels.len() < capacity {
+            labels.push(format!("In {}", labels.len() + 1));
+        }
         let now_sys = SystemTime::now();
         let now_instant = Instant::now();
         let utc_secs = now_sys
@@ -226,20 +284,27 @@ impl VisionMixerOverlayState {
             pip_zones,
             pip_transforms,
             num_pips: pip.num_pips,
-            num_inputs,
+            capacity,
+            num_static,
+            active: (0..capacity)
+                .map(|i| AtomicBool::new(i < num_static))
+                .collect(),
+            selection_lock: std::sync::Mutex::new(()),
+            dynamic: std::sync::Mutex::new(Default::default()),
             ftb_active: AtomicBool::new(false),
             layout_refit_pending: AtomicBool::new(false),
+            mv_relayout_pending: AtomicBool::new(false),
             tbar_effect: std::sync::Mutex::new(None),
             overlay_alpha: AtomicU64::new(1.0f64.to_bits()),
             dsk_enabled: (0..num_dsk_inputs)
                 .map(|_| AtomicBool::new(false))
                 .collect(),
-            input_effects: (0..num_inputs)
+            input_effects: (0..capacity)
                 .map(|_| std::sync::Mutex::new(strom_types::effects::VideoEffect::None))
                 .collect(),
             master_effect: std::sync::Mutex::new(strom_types::effects::VideoEffect::None),
             num_dsk_inputs,
-            layout,
+            layout: std::sync::RwLock::new(Arc::new(layout)),
             pgm_w,
             pgm_h,
             labels: std::sync::Mutex::new(labels),
@@ -250,9 +315,9 @@ impl VisionMixerOverlayState {
             tz_abbr_packed: AtomicU64::new(pack_tz_abbr(&tz_abbr)),
             tz_next_refresh: AtomicU64::new(TIMEZONE_REFRESH_SECS),
             show_vu_meters: AtomicBool::new(show_vu_meters),
-            input_dims: (0..num_inputs).map(|_| AtomicU64::new(0)).collect(),
-            input_peak: (0..num_inputs).map(|_| AtomicU8::new(0)).collect(),
-            input_decay: (0..num_inputs).map(|_| AtomicU8::new(0)).collect(),
+            input_dims: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
+            input_peak: (0..capacity).map(|_| AtomicU8::new(0)).collect(),
+            input_decay: (0..capacity).map(|_| AtomicU8::new(0)).collect(),
             pgm_peak: AtomicU8::new(0),
             pgm_decay: AtomicU8::new(0),
         }
@@ -367,21 +432,85 @@ impl VisionMixerOverlayState {
     /// input; `None` (caps not negotiated) is treated as "no news" rather
     /// than a change, so a not-yet-connected input doesn't suppress or force
     /// refreshes.
-    pub fn update_input_dims(&self, dims: &[Option<(i32, i32)>]) -> bool {
-        let mut changed = false;
-        for (slot, d) in self.input_dims.iter().zip(dims) {
+    pub fn update_input_dims(&self, dims: &[Option<(i32, i32)>]) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, (slot, d)) in self.input_dims.iter().zip(dims).enumerate() {
             let Some((w, h)) = d else { continue };
             let packed = ((*w as u64) << 32) | (*h as u64 & 0xFFFF_FFFF);
             if slot.swap(packed, Ordering::Relaxed) != packed {
-                changed = true;
+                changed.push(i);
             }
         }
         changed
     }
 
+    /// Whether input `i` is part of what program shows: the program input,
+    /// or the background or a zone source of the PiP on program.
+    pub fn on_program(&self, i: usize) -> bool {
+        match self.pgm_pip() {
+            Some(p) => {
+                self.pip_bg_input(p) == Some(i)
+                    || self.pip_zones(p).iter().any(|z| z.sources.contains(&i))
+            }
+            None => self.pgm_input() == Some(i),
+        }
+    }
+
     /// Sink pad indices of this mixer's compositors.
     pub fn pad_map(&self) -> vision_mixer::PadMap {
-        vision_mixer::PadMap::new(self.num_inputs, self.num_dsk_inputs, self.num_pips)
+        vision_mixer::PadMap::new(self.capacity, self.num_dsk_inputs, self.num_pips)
+    }
+
+    /// Take [`Self::selection_lock`].
+    pub fn lock_selection(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.selection_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether slot `input` holds an input (static, or a dynamic one that
+    /// has been added).
+    pub fn is_active(&self, input: usize) -> bool {
+        self.active
+            .get(input)
+            .is_some_and(|a| a.load(Ordering::Acquire))
+    }
+
+    /// The inputs the mixer has, ascending.
+    pub fn active_inputs(&self) -> Vec<usize> {
+        (0..self.capacity).filter(|&i| self.is_active(i)).collect()
+    }
+
+    /// Mark slot `input` as holding an input or as free. Static inputs
+    /// cannot be freed.
+    pub(crate) fn set_active(&self, input: usize, active: bool) {
+        if input < self.num_static && !active {
+            return;
+        }
+        if let Some(a) = self.active.get(input) {
+            a.store(active, Ordering::Release);
+        }
+        if let Some(d) = self.input_dims.get(input) {
+            d.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The current multiview layout.
+    pub fn layout(&self) -> Arc<OverlayLayout> {
+        match self.layout.read() {
+            Ok(l) => Arc::clone(&l),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Replace the multiview layout (a dynamic input came or went); the
+    /// renderer redraws on its next tick.
+    pub(crate) fn set_layout(&self, layout: OverlayLayout) {
+        match self.layout.write() {
+            Ok(mut l) => *l = Arc::new(layout),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(layout),
+        }
+        self.labels_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sink index of input 0's border underlay pad on the dist compositor
@@ -1589,7 +1718,8 @@ fn render_overlay(
     m: u32,
     s: u32,
 ) {
-    let layout = &state.layout;
+    let layout_arc = state.layout();
+    let layout = &*layout_arc;
 
     // --- PVW large border ---
     cr.set_source_rgb(PVW_R, PVW_G, PVW_B);
@@ -1617,6 +1747,9 @@ fn render_overlay(
     // (dark red), direct-PVW (green), direct-PGM (red). PGM ends up innermost.
     let mut colors: Vec<(f64, f64, f64)> = Vec::with_capacity(4);
     for i in 0..layout.num_inputs.min(layout.thumbnail_slot_rects.len()) {
+        if !layout.visible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         colors.clear();
         if via_pvw_pip.contains(&i) {
             colors.push((PVW_VIA_PIP_R, PVW_VIA_PIP_G, PVW_VIA_PIP_B));
@@ -1666,6 +1799,9 @@ fn render_overlay(
     if state.show_vu_meters() {
         // Per-input meters: bottom-left of each thumbnail video rect.
         for i in 0..layout.num_inputs.min(layout.thumbnail_rects.len()) {
+            if !layout.visible.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             let r = &layout.thumbnail_rects[i];
             let peak = state
                 .input_peak
@@ -1705,6 +1841,9 @@ fn render_overlay(
     let sc = layout.scale;
     let labels = state.labels();
     for i in 0..layout.num_inputs.min(layout.label_positions.len()) {
+        if !layout.visible.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let pos = &layout.label_positions[i];
         let label = labels.get(i).map_or("", String::as_str);
         draw_label_centered(

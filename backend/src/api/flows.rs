@@ -2190,7 +2190,7 @@ pub async fn get_vision_mixer_state(
         .collect();
 
     let input_resolutions = state
-        .vision_mixer_input_resolutions(&flow_id, &block_id, overlay.num_inputs)
+        .vision_mixer_input_resolutions(&flow_id, &block_id, overlay.capacity)
         .await;
 
     let fx_available = state.vision_mixer_fx_available(&flow_id, &block_id).await;
@@ -2224,6 +2224,7 @@ pub async fn get_vision_mixer_state(
         fx_available,
         input_effects,
         master_effect,
+        active_inputs: overlay.active_inputs(),
     }))
 }
 

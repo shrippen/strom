@@ -407,3 +407,101 @@ pub(super) fn build_pad_properties(
 
     pad_props
 }
+
+/// Pad properties of a dynamic input `i` joining a running mixer, as
+/// (compositor element id, pad name, properties). The input is on neither
+/// bus nor in any PiP yet, so every pad but its thumbnail starts hidden;
+/// the geometry refresh after the add fits the rects to its caps. The
+/// preview output's pads start hidden too, until they mirror the
+/// multiview's PVW pads (see `preview_out::mirror`).
+pub(crate) fn dynamic_input_pad_properties(
+    spec: &super::InputSpec,
+    mv_layout: &layout::OverlayLayout,
+    i: usize,
+) -> Vec<(String, String, HashMap<String, PropertyValue>)> {
+    let pm = spec.pm;
+    let mixer_id = spec.id("mixer");
+    let mv_comp_id = spec.id("mv_comp");
+    let rect = |(x, y, w, h): (i32, i32, i32, i32), alpha: f64, zorder: u32| {
+        let mut props = HashMap::new();
+        props.insert("xpos".to_string(), PropertyValue::Int(x as i64));
+        props.insert("ypos".to_string(), PropertyValue::Int(y as i64));
+        props.insert("width".to_string(), PropertyValue::Int(w as i64));
+        props.insert("height".to_string(), PropertyValue::Int(h as i64));
+        props.insert("alpha".to_string(), PropertyValue::Float(alpha));
+        props.insert("zorder".to_string(), PropertyValue::UInt(zorder as u64));
+        props.insert(
+            "sizing-policy".to_string(),
+            PropertyValue::String("none".to_string()),
+        );
+        props
+    };
+    let hidden = (0, 0, 1, 1);
+    let mut pads = vec![
+        (
+            mixer_id.clone(),
+            PadMap::sink(pm.dist_input(i)),
+            rect(
+                (0, 0, spec.pgm_w as i32, spec.pgm_h as i32),
+                0.0,
+                vision_mixer::DIST_PGM_ZORDER,
+            ),
+        ),
+        (
+            mv_comp_id.clone(),
+            PadMap::sink(pm.mv_thumb(i)),
+            rect(
+                layout::thumbnail_pad_position(mv_layout, i),
+                1.0,
+                vision_mixer::MV_THUMBNAIL_ZORDER,
+            ),
+        ),
+        (
+            mv_comp_id.clone(),
+            PadMap::sink(pm.mv_pvw(i)),
+            rect(hidden, 0.0, vision_mixer::MV_BIG_DISPLAY_ZORDER),
+        ),
+    ];
+    for pip in 0..spec.num_pips {
+        pads.push((
+            mv_comp_id.clone(),
+            PadMap::sink(pm.mv_pip(pip, i)),
+            rect(hidden, 0.0, vision_mixer::MV_PIP_BG_ZORDER),
+        ));
+    }
+    if spec.preview_out {
+        pads.push((
+            spec.id("pvw_comp"),
+            PadMap::sink(pm.pvw_out_input(i)),
+            rect(hidden, 0.0, vision_mixer::MV_BIG_DISPLAY_ZORDER),
+        ));
+    }
+    let mut underlay = |comp: &str, idx: usize, zorder: u32| {
+        let mut props = HashMap::new();
+        underlay_initial_props(&mut props, zorder);
+        pads.push((comp.to_string(), PadMap::sink(idx), props));
+    };
+    if let Some(base) = pm.dist_underlay_base() {
+        underlay(&mixer_id, base + i, vision_mixer::DIST_PIP_OVERLAY_ZORDER);
+    }
+    if let Some(base) = pm.mv_pvw_underlay_base() {
+        underlay(
+            &mv_comp_id,
+            base + i,
+            vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
+        );
+    }
+    for pip in 0..spec.num_pips {
+        if let Some(base) = pm.mv_pip_underlay_base(pip) {
+            underlay(&mv_comp_id, base + i, vision_mixer::MV_PIP_OVERLAY_ZORDER);
+        }
+    }
+    if let (true, Some(base)) = (spec.preview_out, pm.pvw_out_underlay_base()) {
+        underlay(
+            &spec.id("pvw_comp"),
+            base + i,
+            vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
+        );
+    }
+    pads
+}

@@ -12,9 +12,9 @@ use strom_types::element::ElementPadRef;
 use strom_types::vision_mixer::PadMap;
 use tracing::info;
 
+use super::super::elements;
 use super::super::elements::CompositorBackend;
-use super::super::{elements, layout};
-use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
+use super::{audio_meter, pad_layout, setup_overlay_renderer, InputSpec, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
 
 pub(super) fn build_cpu_pipeline(
@@ -42,19 +42,7 @@ pub(super) fn build_cpu_pipeline(
     elems.push((mixer_id.clone(), dist_comp));
     elems.push((mv_comp_id.clone(), mv_comp));
 
-    let source_aspect = if p.pgm_h > 0 {
-        p.pgm_w as f64 / p.pgm_h as f64
-    } else {
-        16.0 / 9.0
-    };
-    let mv_layout = layout::compute_layout(
-        p.mv_w,
-        p.mv_h,
-        p.num_inputs,
-        p.num_pips,
-        source_aspect,
-        p.swap_pvw_pgm,
-    );
+    let mv_layout = p.mv_layout();
 
     // --- Distribution output chain: mixer → capsfilter_dist → tee_pgm → queue_dist_out ---
     // DSK inputs are composited on the main mixer (same as GPU path).
@@ -167,7 +155,7 @@ pub(super) fn build_cpu_pipeline(
         let queue = elements::make_queue(&q_id)?;
         // GPU-memory sources (e.g. nvh264dec from efpsrt_input) are
         // downloaded by a bridge on the queue, see install_cpu_bridge.
-        install_cpu_bridge(p, &queue, &q_id);
+        install_cpu_bridge(p.backend, &queue, &q_id);
         let videoconvert = make_input_convert(p.backend, vc_factory, &vc_id_dsk)?;
 
         elems.push((q_id.clone(), queue));
@@ -363,147 +351,10 @@ pub(super) fn build_cpu_pipeline(
     let overlay_last_id = vc_overlay_id;
     // Link to mv_comp is added AFTER all other mv_comp links (pad ordering matters)
 
-    // --- Border underlay sources ---
-    // Zone borders render as solid-color compositor pads directly beneath
-    // their content pads (see `gst::underlay`). One tiny videotestsrc per
-    // (region, input) pushes one frame, which the mixer pad holds while the
-    // border is configured or visible. The border color is set at runtime
-    // via `foreground-color` and a restart (`set_underlay_color`). Non-live,
-    // so it adds no latency. Only built when PiPs are configured: zones (and
-    // thus borders) cannot exist without them.
-    if p.num_pips > 0 {
-        let underlay_chains: Vec<String> = (0..p.num_inputs)
-            .map(|i| format!("underlay_dist_{}", i))
-            .chain((0..p.num_inputs).map(|i| format!("underlay_pvw_{}", i)))
-            .chain((0..p.num_pips).flat_map(|pip| {
-                (0..p.num_inputs)
-                    .map(move |i| format!("underlay_pip_{}_{}", pip, i))
-                    .collect::<Vec<_>>()
-            }))
-            .collect();
-        // Always RGBA — the compositor's convert pads handle per-pad format
-        // conversion, and an alpha-less forced output_format (I420/NV12)
-        // would silently drop the alpha of #RRGGBBAA border colors. Each
-        // source pushes a single frame; the compositor pad repeats it
-        // (`repeat-after-eos`) while the border is configured or visible.
-        let (underlay_live, underlay_caps_str) = p.underlay_source();
-        let underlay_caps: gst::Caps = underlay_caps_str
-            .parse()
-            .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
-        for name in &underlay_chains {
-            let src_id = p.id(&format!("{}_src", name));
-            let cf_id = p.id(&format!("{}_caps", name));
-            let src = crate::gst::underlay::make_underlay_src(&src_id, underlay_live)
-                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", src_id, e)))?;
-            let cf = gst::ElementFactory::make("capsfilter")
-                .name(&cf_id)
-                .property("caps", &underlay_caps)
-                .build()
-                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", cf_id, e)))?;
-            elems.push((src_id.clone(), src));
-            elems.push((cf_id.clone(), cf));
-            links.push((
-                ElementPadRef::pad(&src_id, "src"),
-                ElementPadRef::pad(&cf_id, "sink"),
-            ));
-            if p.backend == CompositorBackend::Cuda {
-                let up_id = p.id(&format!("{}_upload", name));
-                elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
-                links.push((
-                    ElementPadRef::pad(&cf_id, "src"),
-                    ElementPadRef::pad(&up_id, "sink"),
-                ));
-            }
-        }
-    }
-    // Links to the compositor pads are added below in pad-index order.
-
-    // --- Per-input elements ---
+    // --- Per-input elements (and their border underlay sources) ---
+    let spec = p.input_spec();
     for i in 0..p.num_inputs {
-        let q_id = p.id(&format!("queue_{}", i));
-        let vc_in_id = p.id(&format!("videoconvert_{}", i));
-        let tee_id = p.id(&format!("tee_{}", i));
-
-        let queue = elements::make_queue(&q_id)?;
-        install_cpu_bridge(p, &queue, &q_id);
-        let videoconvert = make_input_convert(p.backend, vc_factory, &vc_in_id)?;
-        let tee = elements::make_tee(&tee_id)?;
-
-        elems.push((q_id.clone(), queue));
-        elems.push((vc_in_id.clone(), videoconvert));
-
-        // Capsfilter after videoconvert forces all inputs to the same format before tee split.
-        // Without this, the two compositors negotiate independently and tee can't satisfy both.
-        //
-        // With no output_format, the filter still limits the tee to formats
-        // videocrop takes: the dist and PVW branches run through it, the
-        // thumbnail branch does not. Left open, the input can settle on a
-        // format only the compositors accept (A444_16LE on GStreamer 1.26),
-        // and the videocrop branches then fail with not-negotiated.
-        //
-        // On CUDA the frames stay in CUDA memory, where videocrop crops by
-        // meta: the filter only pins the memory there.
-        let in_caps = match (&p.output_format, p.backend) {
-            (Some(fmt), _) => p.format_caps(fmt),
-            (None, CompositorBackend::Cuda) => p.memory_caps(),
-            (None, _) => videocrop_sink_caps()?,
-        };
-        let cf_in_id = p.id(&format!("capsfilter_in_{}", i));
-        let capsfilter_in = gst::ElementFactory::make("capsfilter")
-            .name(&cf_in_id)
-            .property("caps", &in_caps)
-            .build()
-            .map_err(|e| BlockBuildError::ElementCreation(format!("capsfilter_in_{}: {}", i, e)))?;
-        elems.push((cf_in_id.clone(), capsfilter_in));
-        elems.push((tee_id.clone(), tee));
-
-        links.push((
-            ElementPadRef::pad(&q_id, "src"),
-            ElementPadRef::pad(&vc_in_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&vc_in_id, "src"),
-            ElementPadRef::pad(&cf_in_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&cf_in_id, "src"),
-            ElementPadRef::pad(&tee_id, "sink"),
-        ));
-
-        // Queues after tee decouple input processing from compositor backpressure
-        let q_dist_id = p.id(&format!("queue_to_dist_{}", i));
-        let q_thumb_id = p.id(&format!("queue_to_mv_thumb_{}", i));
-        let q_pvw_id = p.id(&format!("queue_to_mv_pvw_{}", i));
-        elems.push((q_dist_id.clone(), elements::make_queue(&q_dist_id)?));
-        elems.push((q_thumb_id.clone(), elements::make_queue(&q_thumb_id)?));
-        elems.push((q_pvw_id.clone(), elements::make_queue(&q_pvw_id)?));
-
-        // The CPU `compositor` has no crop pad properties, so every croppable
-        // branch (dist, PVW, PiP — not thumbnails, which never crop) gets a
-        // videocrop element directly upstream of its compositor sink pad.
-        // Zero crop = passthrough. `set_pad_crop` finds it via pad.peer().
-        let crop_dist_id = p.id(&format!("videocrop_dist_{}", i));
-        let crop_pvw_id = p.id(&format!("videocrop_pvw_{}", i));
-        elems.push((
-            crop_dist_id.clone(),
-            elements::make_element("videocrop", &crop_dist_id)?,
-        ));
-        elems.push((
-            crop_pvw_id.clone(),
-            elements::make_element("videocrop", &crop_pvw_id)?,
-        ));
-
-        // One queue (+ videocrop) per PiP tile per input — feeds the virtual
-        // PiP thumbnail pads on mv_comp.
-        for pip_idx in 0..p.num_pips {
-            let q_pip_id = p.id(&format!("queue_to_mv_pip_{}_{}", pip_idx, i));
-            elems.push((q_pip_id.clone(), elements::make_queue(&q_pip_id)?));
-            let crop_pip_id = p.id(&format!("videocrop_pip_{}_{}", pip_idx, i));
-            elems.push((
-                crop_pip_id.clone(),
-                elements::make_element("videocrop", &crop_pip_id)?,
-            ));
-        }
+        append_input_elements(&spec, i, &mut elems, &mut links)?;
     }
 
     // --- Compositor links (grouped by compositor, order matters) ---
@@ -511,21 +362,7 @@ pub(super) fn build_cpu_pipeline(
     let pm = p.pad_map();
     // Distribution compositor: video inputs first, then DSK
     for i in 0..p.num_inputs {
-        let tee_id = p.id(&format!("tee_{}", i));
-        let q_dist_id = p.id(&format!("queue_to_dist_{}", i));
-        let crop_dist_id = p.id(&format!("videocrop_dist_{}", i));
-        links.push((
-            ElementPadRef::pad(&tee_id, "src_0"),
-            ElementPadRef::pad(&q_dist_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&q_dist_id, "src"),
-            ElementPadRef::pad(&crop_dist_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&crop_dist_id, "src"),
-            ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_input(i))),
-        ));
+        link_dist(&spec, i, &mut links);
     }
     for i in 0..p.num_dsk_inputs {
         let last_dsk_elem = p.id(&format!("videoconvert_dsk_{}", i));
@@ -536,14 +373,8 @@ pub(super) fn build_cpu_pipeline(
     }
 
     // Dist border underlays — after the DSK links.
-    if let Some(base) = pm.dist_underlay_base() {
-        for i in 0..p.num_inputs {
-            let cf_id = underlay_out(p, &format!("underlay_dist_{}", i));
-            links.push((
-                ElementPadRef::pad(&cf_id, "src"),
-                ElementPadRef::pad(&mixer_id, PadMap::sink(base + i)),
-            ));
-        }
+    for i in 0..p.num_inputs {
+        link_dist_underlay(&spec, i, &mut links);
     }
 
     // Stinger graphic pad — after the underlays.
@@ -556,35 +387,12 @@ pub(super) fn build_cpu_pipeline(
 
     // Multiview compositor thumbnails: tee_i.src_1 → queue → mv_comp
     for i in 0..p.num_inputs {
-        let tee_id = p.id(&format!("tee_{}", i));
-        let q_thumb_id = p.id(&format!("queue_to_mv_thumb_{}", i));
-        links.push((
-            ElementPadRef::pad(&tee_id, "src_1"),
-            ElementPadRef::pad(&q_thumb_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&q_thumb_id, "src"),
-            ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_thumb(i))),
-        ));
+        link_thumb(&spec, i, &mut links);
     }
 
     // Multiview PVW big candidates: tee_i.src_2 → queue → videocrop → mv_comp
     for i in 0..p.num_inputs {
-        let tee_id = p.id(&format!("tee_{}", i));
-        let q_pvw_id = p.id(&format!("queue_to_mv_pvw_{}", i));
-        let crop_pvw_id = p.id(&format!("videocrop_pvw_{}", i));
-        links.push((
-            ElementPadRef::pad(&tee_id, "src_2"),
-            ElementPadRef::pad(&q_pvw_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&q_pvw_id, "src"),
-            ElementPadRef::pad(&crop_pvw_id, "sink"),
-        ));
-        links.push((
-            ElementPadRef::pad(&crop_pvw_id, "src"),
-            ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_pvw(i))),
-        ));
+        link_pvw(&spec, i, &mut links);
     }
 
     // PiP candidates: for each PiP tile p_idx, each input i gets one mv_comp
@@ -592,23 +400,7 @@ pub(super) fn build_cpu_pipeline(
     // alpha+geometry in build_pad_properties.
     for pip_idx in 0..p.num_pips {
         for i in 0..p.num_inputs {
-            let tee_id = p.id(&format!("tee_{}", i));
-            let q_pip_id = p.id(&format!("queue_to_mv_pip_{}_{}", pip_idx, i));
-            let crop_pip_id = p.id(&format!("videocrop_pip_{}_{}", pip_idx, i));
-            let tee_src = format!("src_{}", 3 + pip_idx);
-            let sink_idx = pm.mv_pip(pip_idx, i);
-            links.push((
-                ElementPadRef::pad(&tee_id, &tee_src),
-                ElementPadRef::pad(&q_pip_id, "sink"),
-            ));
-            links.push((
-                ElementPadRef::pad(&q_pip_id, "src"),
-                ElementPadRef::pad(&crop_pip_id, "sink"),
-            ));
-            links.push((
-                ElementPadRef::pad(&crop_pip_id, "src"),
-                ElementPadRef::pad(&mv_comp_id, PadMap::sink(sink_idx)),
-            ));
+            link_pip(&spec, pip_idx, i, &mut links);
         }
     }
 
@@ -620,25 +412,12 @@ pub(super) fn build_cpu_pipeline(
 
     // Multiview border underlays — after the overlay pad: PVW underlays,
     // then the PiP tile underlays.
-    if let Some(mv_underlay_base) = pm.mv_pvw_underlay_base() {
+    for i in 0..p.num_inputs {
+        link_mv_pvw_underlay(&spec, i, &mut links);
+    }
+    for pip_idx in 0..p.num_pips {
         for i in 0..p.num_inputs {
-            let cf_id = underlay_out(p, &format!("underlay_pvw_{}", i));
-            links.push((
-                ElementPadRef::pad(&cf_id, "src"),
-                ElementPadRef::pad(&mv_comp_id, PadMap::sink(mv_underlay_base + i)),
-            ));
-        }
-        for pip_idx in 0..p.num_pips {
-            let Some(base) = pm.mv_pip_underlay_base(pip_idx) else {
-                continue;
-            };
-            for i in 0..p.num_inputs {
-                let cf_id = underlay_out(p, &format!("underlay_pip_{}_{}", pip_idx, i));
-                links.push((
-                    ElementPadRef::pad(&cf_id, "src"),
-                    ElementPadRef::pad(&mv_comp_id, PadMap::sink(base + i)),
-                ));
-            }
+            link_mv_pip_underlay(&spec, pip_idx, i, &mut links);
         }
     }
 
@@ -710,7 +489,7 @@ pub(super) fn build_cpu_pipeline(
             // Border underlays hold a frame only while their border is
             // configured or still visible.
             if num_pips > 0 {
-                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp);
+                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp, 0..num_inputs);
             }
         }));
     }
@@ -730,6 +509,292 @@ pub(super) fn build_cpu_pipeline(
         bus_message_handler,
         pad_properties,
     })
+}
+
+/// The elements of input `i` up to its compositor pads, and their links:
+///
+/// ```text
+/// queue_i → videoconvert_i → capsfilter_in_i → tee_i
+///   tee_i.src_0 → queue_to_dist_i → videocrop_dist_i        (→ mixer)
+///   tee_i.src_1 → queue_to_mv_thumb_i                       (→ mv_comp)
+///   tee_i.src_2 → queue_to_mv_pvw_i → videocrop_pvw_i        (→ mv_comp)
+///   tee_i.src_{3+k} → queue_to_mv_pip_k_i → videocrop_pip_k_i (→ mv_comp)
+/// ```
+///
+/// With PiPs also the input's border underlay sources (dist, PVW, one per
+/// PiP). Static inputs and dynamic ones (`vision_mixer::dynamic`) are built
+/// by this one function; the links to the compositors come from the
+/// `link_*` functions below, the preview output's branch from
+/// `preview_out`.
+pub(crate) fn append_input_elements(
+    spec: &InputSpec,
+    i: usize,
+    elems: &mut Vec<(String, gst::Element)>,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) -> Result<(), BlockBuildError> {
+    let vc_factory = match spec.backend {
+        CompositorBackend::Cuda => CUDA_UPLOAD,
+        CompositorBackend::OpenGL | CompositorBackend::Software => CPU_CONVERT,
+    };
+    let q_id = spec.id(&format!("queue_{}", i));
+    let vc_in_id = spec.id(&format!("videoconvert_{}", i));
+    let tee_id = spec.id(&format!("tee_{}", i));
+
+    let queue = elements::make_queue(&q_id)?;
+    install_cpu_bridge(spec.backend, &queue, &q_id);
+    let videoconvert = make_input_convert(spec.backend, vc_factory, &vc_in_id)?;
+    let tee = elements::make_tee(&tee_id)?;
+
+    elems.push((q_id.clone(), queue));
+    elems.push((vc_in_id.clone(), videoconvert));
+
+    // Capsfilter after videoconvert forces all inputs to the same format before tee split.
+    // Without this, the two compositors negotiate independently and tee can't satisfy both.
+    //
+    // With no output_format, the filter still limits the tee to formats
+    // videocrop takes: the dist and PVW branches run through it, the
+    // thumbnail branch does not. Left open, the input can settle on a
+    // format only the compositors accept (A444_16LE on GStreamer 1.26),
+    // and the videocrop branches then fail with not-negotiated.
+    //
+    // On CUDA the frames stay in CUDA memory, where videocrop crops by
+    // meta: the filter only pins the memory there.
+    let in_caps = match (&spec.output_format, spec.backend) {
+        (Some(fmt), _) => spec.format_caps(fmt),
+        (None, CompositorBackend::Cuda) => spec.memory_caps(),
+        (None, _) => videocrop_sink_caps()?,
+    };
+    let cf_in_id = spec.id(&format!("capsfilter_in_{}", i));
+    let capsfilter_in = gst::ElementFactory::make("capsfilter")
+        .name(&cf_in_id)
+        .property("caps", &in_caps)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("capsfilter_in_{}: {}", i, e)))?;
+    elems.push((cf_in_id.clone(), capsfilter_in));
+    elems.push((tee_id.clone(), tee));
+
+    links.push((
+        ElementPadRef::pad(&q_id, "src"),
+        ElementPadRef::pad(&vc_in_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&vc_in_id, "src"),
+        ElementPadRef::pad(&cf_in_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&cf_in_id, "src"),
+        ElementPadRef::pad(&tee_id, "sink"),
+    ));
+
+    // Queues after tee decouple input processing from compositor backpressure
+    let q_dist_id = spec.id(&format!("queue_to_dist_{}", i));
+    let q_thumb_id = spec.id(&format!("queue_to_mv_thumb_{}", i));
+    let q_pvw_id = spec.id(&format!("queue_to_mv_pvw_{}", i));
+    elems.push((q_dist_id.clone(), elements::make_queue(&q_dist_id)?));
+    elems.push((q_thumb_id.clone(), elements::make_queue(&q_thumb_id)?));
+    elems.push((q_pvw_id.clone(), elements::make_queue(&q_pvw_id)?));
+
+    // The CPU `compositor` has no crop pad properties, so every croppable
+    // branch (dist, PVW, PiP — not thumbnails, which never crop) gets a
+    // videocrop element directly upstream of its compositor sink pad.
+    // Zero crop = passthrough. `set_pad_crop` finds it via pad.peer().
+    let crop_dist_id = spec.id(&format!("videocrop_dist_{}", i));
+    let crop_pvw_id = spec.id(&format!("videocrop_pvw_{}", i));
+    elems.push((
+        crop_dist_id.clone(),
+        elements::make_element("videocrop", &crop_dist_id)?,
+    ));
+    elems.push((
+        crop_pvw_id.clone(),
+        elements::make_element("videocrop", &crop_pvw_id)?,
+    ));
+    links.push((
+        ElementPadRef::pad(&tee_id, "src_0"),
+        ElementPadRef::pad(&q_dist_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&q_dist_id, "src"),
+        ElementPadRef::pad(&crop_dist_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&tee_id, "src_1"),
+        ElementPadRef::pad(&q_thumb_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&tee_id, "src_2"),
+        ElementPadRef::pad(&q_pvw_id, "sink"),
+    ));
+    links.push((
+        ElementPadRef::pad(&q_pvw_id, "src"),
+        ElementPadRef::pad(&crop_pvw_id, "sink"),
+    ));
+
+    // One queue (+ videocrop) per PiP tile per input — feeds the virtual
+    // PiP thumbnail pads on mv_comp.
+    for pip_idx in 0..spec.num_pips {
+        let q_pip_id = spec.id(&format!("queue_to_mv_pip_{}_{}", pip_idx, i));
+        elems.push((q_pip_id.clone(), elements::make_queue(&q_pip_id)?));
+        let crop_pip_id = spec.id(&format!("videocrop_pip_{}_{}", pip_idx, i));
+        elems.push((
+            crop_pip_id.clone(),
+            elements::make_element("videocrop", &crop_pip_id)?,
+        ));
+        links.push((
+            ElementPadRef::pad(&tee_id, format!("src_{}", 3 + pip_idx)),
+            ElementPadRef::pad(&q_pip_id, "sink"),
+        ));
+        links.push((
+            ElementPadRef::pad(&q_pip_id, "src"),
+            ElementPadRef::pad(&crop_pip_id, "sink"),
+        ));
+    }
+
+    // --- Border underlay sources ---
+    // Zone borders render as solid-color compositor pads directly beneath
+    // their content pads (see `gst::underlay`). One tiny videotestsrc per
+    // (region, input) pushes one frame, which the mixer pad holds while the
+    // border is configured or visible. The border color is set at runtime
+    // via `foreground-color` and a restart (`set_underlay_color`). Only built
+    // when PiPs are configured: zones (and thus borders) cannot exist
+    // without them.
+    if let Some((underlay_live, underlay_caps_str)) = &spec.underlay {
+        // Always RGBA — the compositor's convert pads handle per-pad format
+        // conversion, and an alpha-less forced output_format (I420/NV12)
+        // would silently drop the alpha of #RRGGBBAA border colors. Each
+        // source pushes a single frame; the compositor pad repeats it
+        // (`repeat-after-eos`) while the border is configured or visible.
+        let underlay_caps: gst::Caps = underlay_caps_str
+            .parse()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
+        let names = [
+            format!("underlay_dist_{}", i),
+            format!("underlay_pvw_{}", i),
+        ]
+        .into_iter()
+        .chain((0..spec.num_pips).map(|pip| format!("underlay_pip_{}_{}", pip, i)));
+        for name in names {
+            let src_id = spec.id(&format!("{}_src", name));
+            let cf_id = spec.id(&format!("{}_caps", name));
+            let src = crate::gst::underlay::make_underlay_src(&src_id, *underlay_live)
+                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", src_id, e)))?;
+            let cf = gst::ElementFactory::make("capsfilter")
+                .name(&cf_id)
+                .property("caps", &underlay_caps)
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", cf_id, e)))?;
+            elems.push((src_id.clone(), src));
+            elems.push((cf_id.clone(), cf));
+            links.push((
+                ElementPadRef::pad(&src_id, "src"),
+                ElementPadRef::pad(&cf_id, "sink"),
+            ));
+            if spec.backend == CompositorBackend::Cuda {
+                let up_id = spec.id(&format!("{}_upload", name));
+                elems.push((up_id.clone(), elements::make_element(CUDA_UPLOAD, &up_id)?));
+                links.push((
+                    ElementPadRef::pad(&cf_id, "src"),
+                    ElementPadRef::pad(&up_id, "sink"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Input `i`'s program branch → its dist compositor pad.
+pub(crate) fn link_dist(
+    spec: &InputSpec,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    links.push((
+        ElementPadRef::pad(spec.id(&format!("videocrop_dist_{}", i)), "src"),
+        ElementPadRef::pad(spec.id("mixer"), PadMap::sink(spec.pm.dist_input(i))),
+    ));
+}
+
+/// Input `i`'s dist border underlay → its dist pad (with PiPs only).
+pub(crate) fn link_dist_underlay(
+    spec: &InputSpec,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    if let Some(base) = spec.pm.dist_underlay_base() {
+        links.push((
+            ElementPadRef::pad(underlay_out(spec, &format!("underlay_dist_{}", i)), "src"),
+            ElementPadRef::pad(spec.id("mixer"), PadMap::sink(base + i)),
+        ));
+    }
+}
+
+/// Input `i`'s thumbnail branch → its multiview thumbnail pad.
+pub(crate) fn link_thumb(
+    spec: &InputSpec,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    links.push((
+        ElementPadRef::pad(spec.id(&format!("queue_to_mv_thumb_{}", i)), "src"),
+        ElementPadRef::pad(spec.id("mv_comp"), PadMap::sink(spec.pm.mv_thumb(i))),
+    ));
+}
+
+/// Input `i`'s PVW branch → its multiview PVW pad.
+pub(crate) fn link_pvw(
+    spec: &InputSpec,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    links.push((
+        ElementPadRef::pad(spec.id(&format!("videocrop_pvw_{}", i)), "src"),
+        ElementPadRef::pad(spec.id("mv_comp"), PadMap::sink(spec.pm.mv_pvw(i))),
+    ));
+}
+
+/// Input `i`'s branch for PiP tile `pip` → its multiview PiP pad.
+pub(crate) fn link_pip(
+    spec: &InputSpec,
+    pip: usize,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    links.push((
+        ElementPadRef::pad(spec.id(&format!("videocrop_pip_{}_{}", pip, i)), "src"),
+        ElementPadRef::pad(spec.id("mv_comp"), PadMap::sink(spec.pm.mv_pip(pip, i))),
+    ));
+}
+
+/// Input `i`'s PVW border underlay → its multiview pad (with PiPs only).
+pub(crate) fn link_mv_pvw_underlay(
+    spec: &InputSpec,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    if let Some(base) = spec.pm.mv_pvw_underlay_base() {
+        links.push((
+            ElementPadRef::pad(underlay_out(spec, &format!("underlay_pvw_{}", i)), "src"),
+            ElementPadRef::pad(spec.id("mv_comp"), PadMap::sink(base + i)),
+        ));
+    }
+}
+
+/// Input `i`'s border underlay for PiP tile `pip` → its multiview pad
+/// (with PiPs only).
+pub(crate) fn link_mv_pip_underlay(
+    spec: &InputSpec,
+    pip: usize,
+    i: usize,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) {
+    if let Some(base) = spec.pm.mv_pip_underlay_base(pip) {
+        links.push((
+            ElementPadRef::pad(
+                underlay_out(spec, &format!("underlay_pip_{}_{}", pip, i)),
+                "src",
+            ),
+            ElementPadRef::pad(spec.id("mv_comp"), PadMap::sink(base + i)),
+        ));
+    }
 }
 
 /// Uploads system (and passes through CUDA) memory for `cudacompositor`.
@@ -774,8 +839,8 @@ pub(crate) fn make_input_convert(
 
 /// CPU backend only: download GPU-memory input (CUDA, VA, GL) on the queue
 /// in front of `videoconvert`, which takes system memory only.
-fn install_cpu_bridge(p: &PipelineParams, queue: &gst::Element, queue_id: &str) {
-    if p.backend != CompositorBackend::Software {
+fn install_cpu_bridge(backend: CompositorBackend, queue: &gst::Element, queue_id: &str) {
+    if backend != CompositorBackend::Software {
         return;
     }
     if let Some(src) = queue.static_pad("src") {
@@ -785,10 +850,12 @@ fn install_cpu_bridge(p: &PipelineParams, queue: &gst::Element, queue_id: &str) 
 
 /// Last element of a border underlay chain: the upload on CUDA, else the
 /// capsfilter.
-fn underlay_out(p: &PipelineParams, name: &str) -> String {
-    match p.backend {
-        CompositorBackend::Cuda => p.id(&format!("{}_upload", name)),
-        CompositorBackend::OpenGL | CompositorBackend::Software => p.id(&format!("{}_caps", name)),
+fn underlay_out(spec: &InputSpec, name: &str) -> String {
+    match spec.backend {
+        CompositorBackend::Cuda => spec.id(&format!("{}_upload", name)),
+        CompositorBackend::OpenGL | CompositorBackend::Software => {
+            spec.id(&format!("{}_caps", name))
+        }
     }
 }
 

@@ -20,7 +20,7 @@ pub enum CompositorBackend {
 
 /// Compositor factory per backend.
 const GL_COMPOSITOR: &str = "glvideomixerelement";
-const CUDA_COMPOSITOR: &str = "cudacompositor";
+pub(crate) const CUDA_COMPOSITOR: &str = "cudacompositor";
 const CPU_COMPOSITOR: &str = "compositor";
 
 impl CompositorBackend {

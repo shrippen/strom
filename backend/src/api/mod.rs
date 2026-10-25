@@ -19,6 +19,7 @@ pub mod show_playback;
 pub mod stinger;
 pub mod system_clock;
 pub mod version;
+pub mod vision_mixer_inputs;
 pub mod vision_mixer_page;
 pub mod websocket;
 pub mod whep_player;

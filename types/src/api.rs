@@ -1325,6 +1325,11 @@ pub struct VisionMixerState {
     /// Current master (PGM) video effect.
     #[serde(default)]
     pub master_effect: crate::effects::VideoEffect,
+    /// The inputs the mixer has, by index, ascending: the static ones and
+    /// the dynamic ones added at runtime. Per-input lists above are indexed
+    /// by input index and cover every slot (`max_inputs`).
+    #[serde(default)]
+    pub active_inputs: Vec<usize>,
 }
 
 /// Request to set the multiview overlay alpha on a vision mixer block.

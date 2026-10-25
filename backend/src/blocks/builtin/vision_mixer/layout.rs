@@ -47,8 +47,13 @@ pub struct OverlayLayout {
     pub canvas_width: f64,
     /// Canvas height in pixels.
     pub canvas_height: f64,
-    /// Number of active inputs.
+    /// Number of input slots (the pad capacity): every per-input vector
+    /// below is indexed by input and has this length.
     pub num_inputs: usize,
+    /// Whether input `i` has a tile. A free slot of a mixer with dynamic
+    /// inputs has none: its rects are a 1×1 placeholder and nothing is drawn
+    /// for it.
+    pub visible: Vec<bool>,
     /// Number of PiP tiles rendered virtually in the grid.
     pub num_pips: usize,
 
@@ -62,7 +67,7 @@ pub struct OverlayLayout {
     /// Full thumbnail slot rectangles (video + label area, used for borders).
     pub thumbnail_slot_rects: Vec<Rect>,
     /// PiP tile video rectangles. Placed in the grid after the input thumbnails
-    /// (slot index `num_inputs + pip_idx`).
+    /// (slot index `tiles + pip_idx`, `tiles` = the visible inputs).
     pub pip_tile_rects: Vec<Rect>,
     /// Full PiP tile slot rectangles (video + label area, used for borders).
     pub pip_tile_slot_rects: Vec<Rect>,
@@ -169,14 +174,9 @@ fn fit_to_aspect(box_w: f64, box_h: f64, source_aspect: f64) -> (f64, f64) {
     }
 }
 
-/// Compute the multiview layout for a given canvas size, slot counts, and
-/// source aspect. `source_aspect` is normally `pgm_w / pgm_h` (e.g. 16/9);
-/// every rect (PGM/PVW big, input thumbnails, PiP tiles) is sized to match
-/// it exactly, so `keep-aspect-ratio` compositor pads fill without
-/// letterbox bands.
-///
-/// PiP tiles share the thumbnail grid: slot indices `num_inputs..num_inputs +
-/// num_pips`. Grid dimensions come from [`pick_grid`].
+/// [`compute_layout_for`] with every input present (`0..num_inputs`, no free
+/// slots).
+#[cfg(test)]
 pub fn compute_layout(
     canvas_width: u32,
     canvas_height: u32,
@@ -185,6 +185,38 @@ pub fn compute_layout(
     source_aspect: f64,
     swap_pvw_pgm: bool,
 ) -> OverlayLayout {
+    let inputs: Vec<usize> = (0..num_inputs).collect();
+    compute_layout_for(
+        canvas_width,
+        canvas_height,
+        &inputs,
+        num_inputs,
+        num_pips,
+        source_aspect,
+        swap_pvw_pgm,
+    )
+}
+
+/// Compute the multiview layout for a given canvas size, inputs and source
+/// aspect. `source_aspect` is normally `pgm_w / pgm_h` (e.g. 16/9); every
+/// rect (PGM/PVW big, input thumbnails, PiP tiles) is sized to match it
+/// exactly, so `keep-aspect-ratio` compositor pads fill without letterbox
+/// bands.
+///
+/// Of the mixer's `capacity` input slots only `inputs` (ascending) are
+/// present: they get the thumbnail tiles in index order, the free slots get
+/// none. PiP tiles share the thumbnail grid after the inputs' tiles. Grid
+/// dimensions come from [`pick_grid`].
+pub fn compute_layout_for(
+    canvas_width: u32,
+    canvas_height: u32,
+    inputs: &[usize],
+    capacity: usize,
+    num_pips: usize,
+    source_aspect: f64,
+    swap_pvw_pgm: bool,
+) -> OverlayLayout {
+    let tiles = inputs.len();
     let cw = canvas_width as f64;
     let ch = canvas_height as f64;
     let scale = ch / 720.0;
@@ -223,7 +255,7 @@ pub fn compute_layout(
     let thumb_y_start = gap + top_h_box + gap;
     let grid_area_w = (cw - gap * 2.0).max(0.0);
     let grid_area_h = (ch - thumb_y_start - gap).max(0.0);
-    let total_slots = num_inputs + num_pips;
+    let total_slots = tiles + num_pips;
     let (cols, rows) = pick_grid(total_slots, grid_area_w, grid_area_h, source_aspect);
 
     // Column/row box that holds one cell incl. its label area. Clamped by
@@ -247,9 +279,12 @@ pub fn compute_layout(
     let row_total_w = slot_w * cols as f64 + gap * (cols as f64 - 1.0);
     let row_x_start = gap + ((grid_area_w - row_total_w) / 2.0).max(0.0);
 
-    let mut thumbnail_rects = Vec::with_capacity(num_inputs);
-    let mut thumbnail_slot_rects = Vec::with_capacity(num_inputs);
-    let mut label_positions = Vec::with_capacity(num_inputs);
+    // Free slots keep a 1×1 placeholder; their entries are never drawn.
+    let placeholder = Rect::new(0.0, 0.0, 1.0, 1.0);
+    let mut visible = vec![false; capacity];
+    let mut thumbnail_rects = vec![placeholder; capacity];
+    let mut thumbnail_slot_rects = vec![placeholder; capacity];
+    let mut label_positions = vec![Point { x: 0.0, y: 0.0 }; capacity];
     let mut pip_tile_rects = Vec::with_capacity(num_pips);
     let mut pip_tile_slot_rects = Vec::with_capacity(num_pips);
     let mut pip_label_positions = Vec::with_capacity(num_pips);
@@ -262,18 +297,22 @@ pub fn compute_layout(
         (x, y)
     };
 
-    for i in 0..num_inputs {
-        let (x, y) = slot_xy(i);
-        thumbnail_rects.push(Rect::new(x, y, video_w, video_h));
-        thumbnail_slot_rects.push(Rect::new(x, y, slot_w, slot_h));
-        label_positions.push(Point {
+    for (tile, &i) in inputs.iter().enumerate() {
+        if i >= capacity {
+            continue;
+        }
+        let (x, y) = slot_xy(tile);
+        visible[i] = true;
+        thumbnail_rects[i] = Rect::new(x, y, video_w, video_h);
+        thumbnail_slot_rects[i] = Rect::new(x, y, slot_w, slot_h);
+        label_positions[i] = Point {
             x: x + slot_w / 2.0,
             y: y + video_h + label_area_h / 2.0 + label_font_size * 0.35,
-        });
+        };
     }
 
     for i in 0..num_pips {
-        let (x, y) = slot_xy(num_inputs + i);
+        let (x, y) = slot_xy(tiles + i);
         pip_tile_rects.push(Rect::new(x, y, video_w, video_h));
         pip_tile_slot_rects.push(Rect::new(x, y, slot_w, slot_h));
         pip_label_positions.push(Point {
@@ -287,7 +326,8 @@ pub fn compute_layout(
     OverlayLayout {
         canvas_width: cw,
         canvas_height: ch,
-        num_inputs,
+        num_inputs: capacity,
+        visible,
         num_pips,
         pvw_rect,
         pgm_rect,

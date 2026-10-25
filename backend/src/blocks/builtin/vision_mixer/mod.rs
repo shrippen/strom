@@ -3,7 +3,8 @@
 //! A source selector with PVW/PGM workflow and transition support.
 //! Takes configurable video inputs (`MIN_NUM_INPUTS` to `MAX_NUM_INPUTS`,
 //! see strom-types), outputs a high-res PGM stream and a broadcast multiview
-//! with cairo-drawn overlays.
+//! with cairo-drawn overlays. With `max_inputs` above `num_inputs`, inputs
+//! can also be added and removed while it runs (see [`dynamic`]).
 //!
 //! Internally tees each input to two compositors:
 //! - **Distribution compositor** ("mixer"): full-res PGM output with transitions
@@ -29,6 +30,7 @@
 
 mod builder;
 mod definition;
+pub mod dynamic;
 mod elements;
 pub(crate) mod geometry;
 pub(crate) mod layout;

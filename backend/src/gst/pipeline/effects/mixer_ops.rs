@@ -50,12 +50,18 @@ impl PipelineManager {
 
         let pm = state.pad_map();
 
+        // Until the input is stored on preview, it cannot be removed.
+        let _selection = state.lock_selection();
         // Validate first — don't mutate any state until we know we can complete.
-        if input >= num_inputs {
+        if input >= num_inputs || !state.is_active(input) {
             return Err(PipelineError::InvalidProperty {
                 element: block_instance_id.to_string(),
                 property: "preview_input".to_string(),
-                reason: format!("Input {} out of range (max {})", input, num_inputs - 1),
+                reason: format!(
+                    "Input {} is not an input of the mixer (inputs: {:?})",
+                    input,
+                    state.active_inputs()
+                ),
             });
         }
 
@@ -105,7 +111,7 @@ impl PipelineManager {
         if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(input))) {
             // Plain-input PVW never crops — wipe any crop from a PiP render.
             set_pad_crop(&pad, &Default::default());
-            let r = &state.layout.pvw_rect;
+            let r = &state.layout().pvw_rect;
             let aspect = self
                 .vision_mixer_source_aspects(block_instance_id, pm.capacity)
                 .get(&input)
@@ -196,7 +202,7 @@ impl PipelineManager {
             if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(active))) {
                 // Plain-input PVW never crops — wipe any crop from a PiP render.
                 set_pad_crop(&pad, &Default::default());
-                let r = &state.layout.pvw_rect;
+                let r = &state.layout().pvw_rect;
                 let aspect = self
                     .vision_mixer_source_aspects(block_instance_id, pm.capacity)
                     .get(&active)
@@ -564,6 +570,8 @@ impl PipelineManager {
                 ),
             });
         }
+        // Until the sources are stored in the PiP, none can be removed.
+        let _selection = state.lock_selection();
 
         // Validate bg + zone sources: indices must be in range, must not
         // overlap each other, must not equal bg, and must fit the zone's
@@ -571,13 +579,14 @@ impl PipelineManager {
         // rect/capacity config. Rects are clamped to [0,1] (silent — clamping
         // is a layout concern, not semantic state).
         if let Some(b) = bg {
-            if b >= state.num_inputs {
+            if !state.is_active(b) {
                 return Err(PipelineError::InvalidProperty {
                     element: block_instance_id.to_string(),
                     property: "bg".to_string(),
                     reason: format!(
-                        "Background input {} out of range (num_inputs={})",
-                        b, state.num_inputs
+                        "Background input {} is not an input of the mixer (inputs: {:?})",
+                        b,
+                        state.active_inputs()
                     ),
                 });
             }
@@ -588,13 +597,14 @@ impl PipelineManager {
             .enumerate()
             .map(|(zone_idx, z)| {
                 for &input in &z.sources {
-                    if input >= state.num_inputs {
+                    if !state.is_active(input) {
                         return Err(PipelineError::InvalidProperty {
                             element: block_instance_id.to_string(),
                             property: "zones".to_string(),
                             reason: format!(
-                                "Zone source {} out of range (num_inputs={})",
-                                input, state.num_inputs
+                                "Zone source {} is not an input of the mixer (inputs: {:?})",
+                                input,
+                                state.active_inputs()
                             ),
                         });
                     }
@@ -689,13 +699,14 @@ impl PipelineManager {
         let transforms: strom_types::vision_mixer::PipTransforms = transforms
             .into_iter()
             .map(|(input, crop)| {
-                if input >= state.num_inputs {
+                if !state.is_active(input) {
                     return Err(PipelineError::InvalidProperty {
                         element: block_instance_id.to_string(),
                         property: "transforms".to_string(),
                         reason: format!(
-                            "Transform input {} out of range (num_inputs={})",
-                            input, state.num_inputs
+                            "Transform input {} is not an input of the mixer (inputs: {:?})",
+                            input,
+                            state.active_inputs()
                         ),
                     });
                 }
@@ -725,12 +736,12 @@ impl PipelineManager {
 
         // ---- 1) Capture OLD pad targets (from current state, before mutation).
         let pip_tile_rect = state
-            .layout
+            .layout()
             .pip_tile_rects
             .get(pip_idx)
             .map(|t| (t.x as i32, t.y as i32, t.w as i32, t.h as i32));
         let pvw_rect = {
-            let r = &state.layout.pvw_rect;
+            let r = &state.layout().pvw_rect;
             (r.x as i32, r.y as i32, r.w as i32, r.h as i32)
         };
         let pip_tile_base = state.pad_map().mv_pip_base(pip_idx);
@@ -746,7 +757,7 @@ impl PipelineManager {
         });
         let pvw_underlay = state.mv_pvw_underlay_base().map(|base| UnderlayCtx {
             base,
-            scale: state.layout.pvw_rect.w / pgm_w,
+            scale: state.layout().pvw_rect.w / pgm_w,
         });
 
         let old_tile = pip_tile_rect.map(|reg| {
@@ -861,8 +872,8 @@ impl PipelineManager {
         if let (Some(old_t), Some(new_t)) = (old_tile, new_tile) {
             let ctrl = TransitionController::new(
                 mv_comp.clone(),
-                state.layout.canvas_width as i32,
-                state.layout.canvas_height as i32,
+                state.layout().canvas_width as i32,
+                state.layout().canvas_height as i32,
             );
             if let Err(e) =
                 ctrl.animate_pad_transition(&old_t, &new_t, ZONE_MORPH_MS, &self.pipeline)
@@ -903,8 +914,8 @@ impl PipelineManager {
         if let (Some(old_p), Some(new_p)) = (old_pvw, new_pvw) {
             let ctrl = TransitionController::new(
                 mv_comp.clone(),
-                state.layout.canvas_width as i32,
-                state.layout.canvas_height as i32,
+                state.layout().canvas_width as i32,
+                state.layout().canvas_height as i32,
             );
             if let Err(e) =
                 ctrl.animate_pad_transition(&old_p, &new_p, ZONE_MORPH_MS, &self.pipeline)
@@ -1038,7 +1049,7 @@ impl PipelineManager {
         }
 
         // Render PiP layout into the PVW big rectangle.
-        let r = &state.layout.pvw_rect;
+        let r = &state.layout().pvw_rect;
         let (cw, ch) = self.dist_canvas_size(block_instance_id);
         let src_aspect = if ch > 0 {
             cw as f64 / ch as f64

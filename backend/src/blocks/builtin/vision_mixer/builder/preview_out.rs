@@ -29,7 +29,7 @@ use tracing::{debug, info};
 
 use super::super::elements::{self, CompositorBackend};
 use super::super::layout::Rect;
-use super::PipelineParams;
+use super::{InputSpec, PipelineParams};
 use crate::blocks::BlockBuildError;
 
 /// Pad geometry, scaled from `pvw_rect` to the output.
@@ -64,37 +64,14 @@ pub(super) fn append(
     pvw_comp.set_property("name", &comp_id);
     elems.push((comp_id.clone(), pvw_comp.clone()));
 
-    let pm = p.pad_map();
+    // All input branches first, then all underlays: the GL mixer names its
+    // pads in link order (see `PadMap`).
+    let spec = p.input_spec();
     for i in 0..p.num_inputs {
-        let q_id = p.id(&format!("queue_to_pvw_out_{}", i));
-        elems.push((q_id.clone(), elements::make_queue(&q_id)?));
-        links.push((
-            ElementPadRef::pad(p.id(&format!("tee_{}", i)), format!("src_{}", tee_src)),
-            ElementPadRef::pad(&q_id, "sink"),
-        ));
-        let last = if p.backend == CompositorBackend::OpenGL {
-            // GL crops with pad properties, which the mirror copies.
-            q_id
-        } else {
-            let crop_id = p.id(&format!("videocrop_pvw_out_{}", i));
-            elems.push((
-                crop_id.clone(),
-                elements::make_element("videocrop", &crop_id)?,
-            ));
-            links.push((
-                ElementPadRef::pad(&q_id, "src"),
-                ElementPadRef::pad(&crop_id, "sink"),
-            ));
-            crop_id
-        };
-        links.push((
-            ElementPadRef::pad(&last, "src"),
-            ElementPadRef::pad(&comp_id, PadMap::sink(pm.pvw_out_input(i))),
-        ));
+        append_input_branch(&spec, i, tee_src, elems, links)?;
     }
-
-    if let Some(base) = pm.pvw_out_underlay_base() {
-        append_underlays(p, &comp_id, base, elems, links)?;
+    for i in 0..p.num_inputs {
+        append_input_underlay(&spec, i, elems, links)?;
     }
 
     let q_out_id = p.id("queue_pvw_out");
@@ -144,55 +121,92 @@ pub(super) fn append(
     Ok(pvw_comp)
 }
 
-/// One border underlay chain per input into `pvw_comp.sink_{base+i}`, built
-/// like the multiview's (see the backend builders).
-fn append_underlays(
-    p: &PipelineParams,
-    comp_id: &str,
-    base: usize,
+/// Input `i`'s branch to the preview compositor:
+/// `tee_i.src_{tee_src} → queue_to_pvw_out_i → [videocrop_pvw_out_i] →
+/// pvw_comp`. Shared by static and dynamic inputs.
+pub(crate) fn append_input_branch(
+    spec: &InputSpec,
+    i: usize,
+    tee_src: usize,
     elems: &mut Vec<(String, gst::Element)>,
     links: &mut Vec<(ElementPadRef, ElementPadRef)>,
 ) -> Result<(), BlockBuildError> {
-    let (live, caps) = p.underlay_source();
+    let q_id = spec.id(&format!("queue_to_pvw_out_{}", i));
+    elems.push((q_id.clone(), elements::make_queue(&q_id)?));
+    links.push((
+        ElementPadRef::pad(spec.id(&format!("tee_{}", i)), format!("src_{}", tee_src)),
+        ElementPadRef::pad(&q_id, "sink"),
+    ));
+    let last = if spec.backend == CompositorBackend::OpenGL {
+        // GL crops with pad properties, which the mirror copies.
+        q_id
+    } else {
+        let crop_id = spec.id(&format!("videocrop_pvw_out_{}", i));
+        elems.push((
+            crop_id.clone(),
+            elements::make_element("videocrop", &crop_id)?,
+        ));
+        links.push((
+            ElementPadRef::pad(&q_id, "src"),
+            ElementPadRef::pad(&crop_id, "sink"),
+        ));
+        crop_id
+    };
+    links.push((
+        ElementPadRef::pad(&last, "src"),
+        ElementPadRef::pad(spec.id("pvw_comp"), PadMap::sink(spec.pm.pvw_out_input(i))),
+    ));
+    Ok(())
+}
+
+/// Input `i`'s border underlay chain into `pvw_comp.sink_{base+i}`, built
+/// like the multiview's (see the backend builders). Nothing without PiPs.
+pub(crate) fn append_input_underlay(
+    spec: &InputSpec,
+    i: usize,
+    elems: &mut Vec<(String, gst::Element)>,
+    links: &mut Vec<(ElementPadRef, ElementPadRef)>,
+) -> Result<(), BlockBuildError> {
+    let (Some(base), Some((live, caps))) = (spec.pm.pvw_out_underlay_base(), &spec.underlay) else {
+        return Ok(());
+    };
     let caps: gst::Caps = caps
         .parse()
         .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
-    for i in 0..p.num_inputs {
-        let name = |part: &str| p.id(&format!("underlay_pvw_out_{}_{}", i, part));
-        let src = crate::gst::underlay::make_underlay_src(&name("src"), live)
-            .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", name("src"), e)))?;
-        let cf = capsfilter(&name("caps"), &caps)?;
-        let mut chain = vec![name("src"), name("caps")];
-        elems.push((name("src"), src));
-        let upload = match p.backend {
-            CompositorBackend::OpenGL => {
-                if let Some(pad) = cf.static_pad("src") {
-                    crate::gst::gl_input_front::keep_own_memory(&pad);
-                }
-                Some("glupload")
+    let name = |part: &str| spec.id(&format!("underlay_pvw_out_{}_{}", i, part));
+    let src = crate::gst::underlay::make_underlay_src(&name("src"), *live)
+        .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", name("src"), e)))?;
+    let cf = capsfilter(&name("caps"), &caps)?;
+    let mut chain = vec![name("src"), name("caps")];
+    elems.push((name("src"), src));
+    let upload = match spec.backend {
+        CompositorBackend::OpenGL => {
+            if let Some(pad) = cf.static_pad("src") {
+                crate::gst::gl_input_front::keep_own_memory(&pad);
             }
-            CompositorBackend::Cuda => Some(super::pipeline_cpu::CUDA_UPLOAD),
-            CompositorBackend::Software => None,
-        };
-        elems.push((name("caps"), cf));
-        if let Some(factory) = upload {
-            elems.push((
-                name("upload"),
-                elements::make_element(factory, &name("upload"))?,
-            ));
-            chain.push(name("upload"));
+            Some("glupload")
         }
-        for pair in chain.windows(2) {
-            links.push((
-                ElementPadRef::pad(&pair[0], "src"),
-                ElementPadRef::pad(&pair[1], "sink"),
-            ));
-        }
+        CompositorBackend::Cuda => Some(super::pipeline_cpu::CUDA_UPLOAD),
+        CompositorBackend::Software => None,
+    };
+    elems.push((name("caps"), cf));
+    if let Some(factory) = upload {
+        elems.push((
+            name("upload"),
+            elements::make_element(factory, &name("upload"))?,
+        ));
+        chain.push(name("upload"));
+    }
+    for pair in chain.windows(2) {
         links.push((
-            ElementPadRef::pad(chain.last().expect("chain"), "src"),
-            ElementPadRef::pad(comp_id, PadMap::sink(base + i)),
+            ElementPadRef::pad(&pair[0], "src"),
+            ElementPadRef::pad(&pair[1], "sink"),
         ));
     }
+    links.push((
+        ElementPadRef::pad(chain.last().expect("chain"), "src"),
+        ElementPadRef::pad(spec.id("pvw_comp"), PadMap::sink(base + i)),
+    ));
     Ok(())
 }
 
@@ -264,7 +278,7 @@ fn upstream_crop(pad: &gst::Pad) -> Option<gst::Element> {
 /// element setup, once the request pads exist): for each of `inputs` its PVW
 /// pad, and with PiPs its border underlay pad. `pvw_rect` is the
 /// multiview's PVW rectangle, `out_w`×`out_h` the preview output's size.
-pub(super) fn mirror(
+pub(crate) fn mirror(
     mv_comp: &gst::Element,
     pvw_comp: &gst::Element,
     pm: &PadMap,

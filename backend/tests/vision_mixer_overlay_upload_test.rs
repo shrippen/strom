@@ -220,7 +220,7 @@ fn thumbnail_tally(
     i: usize,
 ) -> Tally {
     let state = overlay::get_overlay_state(flow_id, block_id).expect("overlay state registered");
-    let r = state.layout.thumbnail_slot_rects[i];
+    let r = state.layout().thumbnail_slot_rects[i];
     let caps = sample.caps().expect("caps");
     let s = caps.structure(0).unwrap();
     let w = s.get::<i32>("width").unwrap() as usize;
@@ -546,7 +546,7 @@ fn pgm_display_is_blue(
     block_id: &str,
 ) -> bool {
     let state = overlay::get_overlay_state(flow_id, block_id).expect("overlay state registered");
-    let r = state.layout.pgm_rect;
+    let r = state.layout().pgm_rect;
     let caps = sample.caps().expect("caps");
     let s = caps.structure(0).unwrap();
     let w = s.get::<i32>("width").unwrap() as usize;

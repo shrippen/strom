@@ -756,7 +756,7 @@ const MAX_LISTED_ENUM_VALUES: usize = 24;
 /// — `{"pattern": 1}` on a `videotestsrc` is enough, and the unwind crosses the
 /// axum handler and skips the flow's teardown. Nothing reaches GLib from here
 /// without having been checked against the spec first.
-fn checked_property_value(
+pub(crate) fn checked_property_value(
     pspec: &glib::ParamSpec,
     prop_value: &PropertyValue,
 ) -> Result<glib::Value, String> {
@@ -1027,7 +1027,7 @@ fn text_form(prop_value: &PropertyValue) -> String {
 /// which drops the client's connection without a response and skips the
 /// caller's teardown, leaving a half-built flow behind — so treat a panic as
 /// one more way for the value to be invalid.
-fn set_checked_value<O: IsA<glib::Object>>(
+pub(crate) fn set_checked_value<O: IsA<glib::Object>>(
     obj: &O,
     prop_name: &str,
     value: &glib::Value,
