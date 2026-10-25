@@ -88,9 +88,10 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
 
-    /// Counts tracing events emitted from `event_logging`, so tests can assert on the
-    /// `structured_events` / `include_high_frequency_events` gate in `broadcast()` without
-    /// depending on the unrelated "Broadcasting event" trace/debug line.
+    /// Counts tracing events emitted from `event_logging`, without the unrelated
+    /// "Broadcasting event" trace/debug line. Only a smoke test of `broadcast()`'s
+    /// path uses it: a count above 0 is not reliable (see below), the gate itself
+    /// is tested through `logs_structured`.
     struct StructuredLogCounter {
         count: Arc<AtomicUsize>,
     }
@@ -119,10 +120,13 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 0);
     }
 
-    // The gate is checked directly, not through a counting subscriber: tracing
-    // caches per callsite whether anyone listens, and a test running beside
-    // this one without the counting layer could leave that cache at "no one",
-    // so the counted record goes missing (1 test run in about 50 under load).
+    // The gate is checked directly, not through a counting subscriber. tracing
+    // stores per callsite, globally, whether anyone listens; with a single
+    // scoped dispatcher alive it asks the dispatcher of the thread that hits
+    // the callsite first. The smoke tests in `event_logging` hit the same
+    // `info!` callsites on threads without a subscriber, and when one comes
+    // first the callsite reads "never": the counted record went missing
+    // (1 run in 48 under load).
     #[test]
     fn high_frequency_events_dropped_unless_included() {
         let meter = StromEvent::MeterData {
