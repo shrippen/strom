@@ -414,7 +414,7 @@ async fn source_resized_during_a_fade_is_fitted_after_it() {
         .expect("fade");
     running
         .manager
-        .update_vision_mixer_after_take(block_id, Some(1), Some(0), 2)
+        .update_vision_mixer_after_take(block_id, Some(1), Some(0))
         .expect("after take");
     while running.position(block_id) < start + gstreamer::ClockTime::from_mseconds(800) {
         std::thread::sleep(std::time::Duration::from_millis(10));

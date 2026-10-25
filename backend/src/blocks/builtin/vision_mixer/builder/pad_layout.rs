@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use strom_types::vision_mixer::PadMap;
 use strom_types::{vision_mixer, PropertyValue};
 
 use super::super::layout;
@@ -80,7 +81,8 @@ fn underlay_initial_props(props: &mut HashMap<String, PropertyValue>, zorder: u3
 ///
 /// Since glvideomixerelement uses auto-created request pads (the linker uses
 /// link_pads(src, None)), pads are created sequentially in link order.
-/// We group links: dist sink_0..N-1, mv thumbnails sink_0..N-1, mv big sink_N..2N-1.
+/// The pipeline builders link in pad-index order (see `PadMap`), so the names
+/// here match the pads the GL mixer auto-creates.
 pub(super) fn build_pad_properties(
     p: &PipelineParams,
     mv_layout: &layout::OverlayLayout,
@@ -90,6 +92,7 @@ pub(super) fn build_pad_properties(
 
     let mixer_id = p.id("mixer");
     let mv_comp_id = p.id("mv_comp");
+    let pm = p.pad_map();
 
     // --- Distribution compositor pad properties ---
     // Each input has its alpha/geometry set based on the initial PGM source:
@@ -110,7 +113,7 @@ pub(super) fn build_pad_properties(
 
     let dist_pads = pad_props.entry(mixer_id).or_default();
     for i in 0..p.num_inputs {
-        let pad_name = format!("sink_{}", i);
+        let pad_name = PadMap::sink(pm.dist_input(i));
         let props = dist_pads.entry(pad_name).or_default();
 
         let (x, y, w, h, alpha, zorder) = match p.pgm_source {
@@ -152,7 +155,7 @@ pub(super) fn build_pad_properties(
 
     // --- DSK pads on dist compositor (high zorder, above video inputs) ---
     for i in 0..p.num_dsk_inputs {
-        let pad_name = format!("sink_{}", p.num_inputs + i);
+        let pad_name = PadMap::sink(pm.dist_dsk(i));
         let props = dist_pads.entry(pad_name).or_default();
         props.insert("width".to_string(), PropertyValue::Int(p.pgm_w as i64));
         props.insert("height".to_string(), PropertyValue::Int(p.pgm_h as i64));
@@ -172,14 +175,16 @@ pub(super) fn build_pad_properties(
     // matte pad keeps the colour already drawn and subtracts the matte from
     // its alpha, which the incoming source of a track-matte take blends by.
     if p.enable_stinger {
-        let base = p.stinger_pad_base();
         let gpu = matches!(p.backend, super::super::elements::CompositorBackend::OpenGL);
-        let mut pads = vec![(base, vision_mixer::DIST_STINGER_FILL_ZORDER)];
+        let mut pads = vec![(pm.dist_stinger(), vision_mixer::DIST_STINGER_FILL_ZORDER)];
         if gpu {
-            pads.push((base + 1, vision_mixer::DIST_STINGER_MATTE_ZORDER));
+            pads.push((
+                pm.dist_stinger_matte(),
+                vision_mixer::DIST_STINGER_MATTE_ZORDER,
+            ));
         }
         for (idx, zorder) in pads {
-            let props = dist_pads.entry(format!("sink_{}", idx)).or_default();
+            let props = dist_pads.entry(PadMap::sink(idx)).or_default();
             props.insert("xpos".to_string(), PropertyValue::Int(0));
             props.insert("ypos".to_string(), PropertyValue::Int(0));
             props.insert("width".to_string(), PropertyValue::Int(p.pgm_w as i64));
@@ -202,7 +207,9 @@ pub(super) fn build_pad_properties(
             );
         }
         if gpu {
-            let props = dist_pads.entry(format!("sink_{}", base + 1)).or_default();
+            let props = dist_pads
+                .entry(PadMap::sink(pm.dist_stinger_matte()))
+                .or_default();
             for (k, v) in [
                 ("blend-function-src-rgb", "zero"),
                 ("blend-function-dst-rgb", "one"),
@@ -215,12 +222,12 @@ pub(super) fn build_pad_properties(
         }
     }
 
-    // --- Dist border underlay pads: sink_{N + DSK + i} ---
+    // --- Dist border underlay pads ---
     // Only present when PiPs are configured (see the pipeline builders).
     // Hidden at build — zones are runtime-only.
-    if p.num_pips > 0 {
+    if let Some(base) = pm.dist_underlay_base() {
         for i in 0..p.num_inputs {
-            let pad_name = format!("sink_{}", p.num_inputs + p.num_dsk_inputs + i);
+            let pad_name = PadMap::sink(base + i);
             underlay_initial_props(
                 dist_pads.entry(pad_name).or_default(),
                 vision_mixer::DIST_PIP_OVERLAY_ZORDER,
@@ -231,9 +238,9 @@ pub(super) fn build_pad_properties(
     // --- Multiview compositor pad properties ---
     let mv_pads = pad_props.entry(mv_comp_id).or_default();
 
-    // Thumbnail pads: sink_0..sink_{N-1}
+    // Thumbnail pads
     for i in 0..p.num_inputs {
-        let pad_name = format!("sink_{}", i);
+        let pad_name = PadMap::sink(pm.mv_thumb(i));
         let props = mv_pads.entry(pad_name).or_default();
         let (x, y, w, h) = layout::thumbnail_pad_position(mv_layout, i);
         props.insert("xpos".to_string(), PropertyValue::Int(x as i64));
@@ -253,9 +260,9 @@ pub(super) fn build_pad_properties(
         );
     }
 
-    // PGM big display: sink_N (fed from tee_pgm, always visible at PGM position)
+    // PGM big display (fed from tee_pgm, always visible at PGM position)
     {
-        let pad_name = format!("sink_{}", p.num_inputs);
+        let pad_name = PadMap::sink(pm.mv_pgm());
         let props = mv_pads.entry(pad_name).or_default();
         let (x, y, w, h) = layout::pgm_pad_position(mv_layout);
         props.insert("xpos".to_string(), PropertyValue::Int(x as i64));
@@ -275,14 +282,14 @@ pub(super) fn build_pad_properties(
         );
     }
 
-    // PVW big display candidate pads: sink_{N+1}..sink_{2N}
+    // PVW big display candidate pads
     // Same dual treatment as the dist compositor: an Input source activates one
     // pad at the PVW rect; a Pip source uses bg+zone auto-tile inside the PVW rect.
     let pvw_rect = layout::pvw_pad_position(mv_layout);
     let (pvw_x, pvw_y, pvw_w, pvw_h) = pvw_rect;
 
     for i in 0..p.num_inputs {
-        let pad_name = format!("sink_{}", p.num_inputs + 1 + i);
+        let pad_name = PadMap::sink(pm.mv_pvw(i));
         let props = mv_pads.entry(pad_name).or_default();
 
         let (x, y, w, h, alpha, zorder) = match p.pvw_source {
@@ -325,7 +332,7 @@ pub(super) fn build_pad_properties(
         );
     }
 
-    // PiP candidate pads: sink_{2N+1 + pip_idx*N + i}. One per (PiP tile, input).
+    // PiP candidate pads: one per (PiP tile, input).
     // For each PiP tile, the bg input fills the tile (low zorder) and the zone
     // sources are auto-tiled in sub-rects on top (higher zorder, see
     // `resolve_zone_pads`). All other PiP pads stay alpha=0.
@@ -333,8 +340,7 @@ pub(super) fn build_pad_properties(
         let (bg_x, bg_y, bg_w, bg_h) = layout::pip_bg_pad_position(mv_layout, pip_idx);
 
         for i in 0..p.num_inputs {
-            let sink_idx = 2 * p.num_inputs + 1 + pip_idx * p.num_inputs + i;
-            let pad_name = format!("sink_{}", sink_idx);
+            let pad_name = PadMap::sink(pm.mv_pip(pip_idx, i));
             let props = mv_pads.entry(pad_name).or_default();
 
             let (x, y, w, h, alpha, zorder) = initial_pad_geom_for_input(
@@ -361,9 +367,8 @@ pub(super) fn build_pad_properties(
     }
 
     // --- Overlay pad: fullscreen, highest zorder ---
-    let overlay_pad_idx = 2 * p.num_inputs + 1 + p.num_pips * p.num_inputs;
     {
-        let overlay_pad_name = format!("sink_{}", overlay_pad_idx);
+        let overlay_pad_name = PadMap::sink(pm.mv_overlay());
         let props = mv_pads.entry(overlay_pad_name).or_default();
         props.insert("xpos".to_string(), PropertyValue::Int(0));
         props.insert("ypos".to_string(), PropertyValue::Int(0));
@@ -377,21 +382,20 @@ pub(super) fn build_pad_properties(
     }
 
     // --- Multiview border underlay pads (PVW big + PiP tiles), hidden ---
-    if p.num_pips > 0 {
-        let mv_underlay_base = overlay_pad_idx + 1;
+    if let Some(mv_underlay_base) = pm.mv_pvw_underlay_base() {
         for i in 0..p.num_inputs {
-            let pad_name = format!("sink_{}", mv_underlay_base + i);
+            let pad_name = PadMap::sink(mv_underlay_base + i);
             underlay_initial_props(
                 mv_pads.entry(pad_name).or_default(),
                 vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
             );
         }
         for pip_idx in 0..p.num_pips {
+            let Some(base) = pm.mv_pip_underlay_base(pip_idx) else {
+                continue;
+            };
             for i in 0..p.num_inputs {
-                let pad_name = format!(
-                    "sink_{}",
-                    mv_underlay_base + p.num_inputs * (1 + pip_idx) + i
-                );
+                let pad_name = PadMap::sink(base + i);
                 underlay_initial_props(
                     mv_pads.entry(pad_name).or_default(),
                     vision_mixer::MV_PIP_OVERLAY_ZORDER,

@@ -378,24 +378,28 @@ impl VisionMixerOverlayState {
         changed
     }
 
+    /// Sink pad indices of this mixer's compositors.
+    pub fn pad_map(&self) -> vision_mixer::PadMap {
+        vision_mixer::PadMap::new(self.num_inputs, self.num_dsk_inputs, self.num_pips)
+    }
+
     /// Sink index of input 0's border underlay pad on the dist compositor
     /// (input i's underlay = base + i). `None` when the mixer has no PiPs —
     /// underlay pads exist only when zones can (see the pipeline builders).
     pub fn dist_underlay_base(&self) -> Option<usize> {
-        (self.num_pips > 0).then(|| self.num_inputs + self.num_dsk_inputs)
+        self.pad_map().dist_underlay_base()
     }
 
     /// Sink index of input 0's border underlay pad for the multiview PVW big
     /// region. `None` when the mixer has no PiPs.
     pub fn mv_pvw_underlay_base(&self) -> Option<usize> {
-        (self.num_pips > 0).then(|| 2 * self.num_inputs + 2 + self.num_pips * self.num_inputs)
+        self.pad_map().mv_pvw_underlay_base()
     }
 
     /// Sink index of input 0's border underlay pad for PiP tile `pip_idx`
     /// on the multiview compositor. `None` when the mixer has no PiPs.
     pub fn mv_pip_underlay_base(&self, pip_idx: usize) -> Option<usize> {
-        self.mv_pvw_underlay_base()
-            .map(|b| b + self.num_inputs * (1 + pip_idx))
+        self.pad_map().mv_pip_underlay_base(pip_idx)
     }
 
     /// Whether VU meters should be rendered.

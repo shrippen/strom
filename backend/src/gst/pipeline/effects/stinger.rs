@@ -376,7 +376,7 @@ impl PipelineManager {
             mixer,
             Some(state),
             Some(take.from_input),
-            state.num_inputs,
+            state.pad_map().capacity,
             cw,
             ch,
         );

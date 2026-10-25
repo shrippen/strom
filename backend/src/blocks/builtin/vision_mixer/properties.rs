@@ -78,18 +78,35 @@ pub fn parse_pip_bg(
     Some(raw.min(num_inputs - 1))
 }
 
-/// Parse the number of inputs from block properties, clamped to valid range.
-pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> usize {
-    properties
+/// Parse the number of inputs from block properties.
+///
+/// A value above [`MAX_NUM_INPUTS`] is an error: clamping it would leave the
+/// links to the inputs beyond the maximum without a target. A value below
+/// [`MIN_NUM_INPUTS`] is raised to it (the extra inputs stay unlinked).
+pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<usize, String> {
+    let requested = properties
         .get("num_inputs")
         .and_then(|v| match v {
-            PropertyValue::String(s) => s.parse::<usize>().ok(),
-            PropertyValue::UInt(n) => Some(*n as usize),
-            PropertyValue::Int(n) => Some(*n as usize),
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
             _ => None,
         })
-        .unwrap_or(DEFAULT_NUM_INPUTS)
-        .clamp(MIN_NUM_INPUTS, MAX_NUM_INPUTS)
+        .unwrap_or(DEFAULT_NUM_INPUTS as u64);
+    if requested > MAX_NUM_INPUTS as u64 {
+        return Err(format!(
+            "num_inputs is {}, the vision mixer takes at most {} inputs",
+            requested, MAX_NUM_INPUTS
+        ));
+    }
+    Ok((requested as usize).max(MIN_NUM_INPUTS))
+}
+
+/// [`parse_num_inputs`] for callers that cannot fail (pad listings, pages of
+/// a flow that is not running): an out-of-range value counts as the maximum.
+/// The build itself rejects it.
+pub fn num_inputs_or_max(properties: &HashMap<String, PropertyValue>) -> usize {
+    parse_num_inputs(properties).unwrap_or(MAX_NUM_INPUTS)
 }
 
 /// Parse the initial PGM source from block properties.

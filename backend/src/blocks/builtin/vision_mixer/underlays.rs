@@ -66,8 +66,10 @@ fn underlay_pads(
             let argb = shared_region_argb(state, pvw_pip, None, input);
             pads.push((mv_comp.clone(), base + input, argb));
             // The preview output shows what the PVW big display shows.
-            if let Some(pvw_comp) = &pvw_comp {
-                pads.push((pvw_comp.clone(), state.num_inputs + input, argb));
+            if let (Some(pvw_comp), Some(out_base)) =
+                (&pvw_comp, state.pad_map().pvw_out_underlay_base())
+            {
+                pads.push((pvw_comp.clone(), out_base + input, argb));
             }
         }
         for pip in 0..state.num_pips {
@@ -84,7 +86,7 @@ fn underlay_pads(
 }
 
 fn sink_pad(compositor: &gst::Element, idx: usize) -> Option<gst::Pad> {
-    compositor.static_pad(&format!("sink_{}", idx))
+    compositor.static_pad(&strom_types::vision_mixer::PadMap::sink(idx))
 }
 
 /// Register every underlay pad (from the element setup, once linked) and

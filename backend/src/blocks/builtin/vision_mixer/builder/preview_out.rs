@@ -12,7 +12,7 @@
 //! [`mirror`] copies each change of a multiview PVW pad to its twin, scaled
 //! from `pvw_rect` to the full frame. So no operation has to know about it.
 //! Zone borders: with PiPs, each input also has a border underlay chain to
-//! `pvw_comp.sink_{N+i}`, mirrored from the multiview's PVW underlay pad,
+//! a `pvw_comp` underlay pad (see `PadMap`), mirrored from the multiview's PVW underlay pad,
 //! its colour too (takes set it on the multiview's source directly); its
 //! hold comes from `underlays` like every other underlay.
 //!
@@ -24,6 +24,7 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use strom_types::element::ElementPadRef;
+use strom_types::vision_mixer::PadMap;
 use tracing::{debug, info};
 
 use super::super::elements::{self, CompositorBackend};
@@ -63,6 +64,7 @@ pub(super) fn append(
     pvw_comp.set_property("name", &comp_id);
     elems.push((comp_id.clone(), pvw_comp.clone()));
 
+    let pm = p.pad_map();
     for i in 0..p.num_inputs {
         let q_id = p.id(&format!("queue_to_pvw_out_{}", i));
         elems.push((q_id.clone(), elements::make_queue(&q_id)?));
@@ -87,12 +89,12 @@ pub(super) fn append(
         };
         links.push((
             ElementPadRef::pad(&last, "src"),
-            ElementPadRef::pad(&comp_id, format!("sink_{}", i)),
+            ElementPadRef::pad(&comp_id, PadMap::sink(pm.pvw_out_input(i))),
         ));
     }
 
-    if p.num_pips > 0 {
-        append_underlays(p, &comp_id, elems, links)?;
+    if let Some(base) = pm.pvw_out_underlay_base() {
+        append_underlays(p, &comp_id, base, elems, links)?;
     }
 
     let q_out_id = p.id("queue_pvw_out");
@@ -142,11 +144,12 @@ pub(super) fn append(
     Ok(pvw_comp)
 }
 
-/// One border underlay chain per input into `pvw_comp.sink_{N+i}`, built
+/// One border underlay chain per input into `pvw_comp.sink_{base+i}`, built
 /// like the multiview's (see the backend builders).
 fn append_underlays(
     p: &PipelineParams,
     comp_id: &str,
+    base: usize,
     elems: &mut Vec<(String, gst::Element)>,
     links: &mut Vec<(ElementPadRef, ElementPadRef)>,
 ) -> Result<(), BlockBuildError> {
@@ -187,7 +190,7 @@ fn append_underlays(
         }
         links.push((
             ElementPadRef::pad(chain.last().expect("chain"), "src"),
-            ElementPadRef::pad(comp_id, format!("sink_{}", p.num_inputs + i)),
+            ElementPadRef::pad(comp_id, PadMap::sink(base + i)),
         ));
     }
     Ok(())
@@ -258,27 +261,30 @@ fn upstream_crop(pad: &gst::Pad) -> Option<gst::Element> {
 }
 
 /// Make the preview compositor follow the multiview's PVW pads (from the
-/// element setup, once the request pads exist): each input's PVW pad, and
-/// its border underlay pad from `mv_underlay_base` on. `pvw_rect` is the
+/// element setup, once the request pads exist): for each of `inputs` its PVW
+/// pad, and with PiPs its border underlay pad. `pvw_rect` is the
 /// multiview's PVW rectangle, `out_w`×`out_h` the preview output's size.
 pub(super) fn mirror(
     mv_comp: &gst::Element,
     pvw_comp: &gst::Element,
-    num_inputs: usize,
-    mv_underlay_base: Option<usize>,
+    pm: &PadMap,
+    inputs: impl IntoIterator<Item = usize>,
     pvw_rect: &Rect,
     out_w: u32,
     out_h: u32,
 ) {
     let scale = Scale::new(pvw_rect, out_w, out_h);
-    let inputs = (0..num_inputs).map(|i| (num_inputs + 1 + i, i, false));
-    let underlays = mv_underlay_base
-        .into_iter()
-        .flat_map(|base| (0..num_inputs).map(move |i| (base + i, num_inputs + i, true)));
-    for (mv_idx, pvw_idx, underlay) in inputs.chain(underlays) {
+    let pairs = inputs.into_iter().flat_map(|i| {
+        let underlay = pm
+            .mv_pvw_underlay_base()
+            .zip(pm.pvw_out_underlay_base())
+            .map(|(mv, out)| (mv + i, out + i, true));
+        std::iter::once((pm.mv_pvw(i), pm.pvw_out_input(i), false)).chain(underlay)
+    });
+    for (mv_idx, pvw_idx, underlay) in pairs {
         let (Some(from), Some(to)) = (
-            mv_comp.static_pad(&format!("sink_{}", mv_idx)),
-            pvw_comp.static_pad(&format!("sink_{}", pvw_idx)),
+            mv_comp.static_pad(&PadMap::sink(mv_idx)),
+            pvw_comp.static_pad(&PadMap::sink(pvw_idx)),
         ) else {
             debug!("preview output: no pad pair {} -> {}", mv_idx, pvw_idx);
             continue;
