@@ -238,6 +238,15 @@ pub async fn create_app_with_config(
                 .post(api::vision_mixer_inputs::add_vision_mixer_input),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/aux_buses",
+            get(api::mixer_aux_buses::list_mixer_aux_buses)
+                .post(api::mixer_aux_buses::add_mixer_aux_bus),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/aux_buses/{aux}",
+            delete(api::mixer_aux_buses::remove_mixer_aux_bus),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/inputs/{index}",
             delete(api::vision_mixer_inputs::remove_vision_mixer_input),
         )

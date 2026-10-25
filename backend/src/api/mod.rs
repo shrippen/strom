@@ -10,6 +10,7 @@ pub mod logging;
 pub mod mcp;
 pub mod media;
 pub mod mediaplayer;
+pub mod mixer_aux_buses;
 pub mod network;
 pub mod osc;
 pub mod ports;

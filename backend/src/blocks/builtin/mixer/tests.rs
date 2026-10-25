@@ -7,12 +7,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use strom_types::block::ExposedProperty;
-use strom_types::mixer::DEFAULT_INTERNAL_BUS_LATENCY_MS;
+use strom_types::mixer::{
+    AddMixerAuxBusRequest, DynamicAuxBus, DEFAULT_INTERNAL_BUS_LATENCY_MS,
+    DYNAMIC_AUX_BUSES_PROPERTY, MAX_AUX_BUSES_PROPERTY,
+};
 use strom_types::PropertyValue;
 
 fn init_gst() {
     let _ = gst::init();
     let _ = gst_plugins_lsp::plugin_register_static();
+    // Dynamic buses publish on inter channels. Once: registering the inter
+    // elements again replaces their factories under elements already made.
+    static INTER: std::sync::Once = std::sync::Once::new();
+    INTER.call_once(|| {
+        let _ = gstrsinter::plugin_register_static();
+    });
 }
 
 /// GObject type name. `factory()` can SIGSEGV when static and LV2 plugins
@@ -1598,5 +1607,278 @@ fn test_channel_keeps_feeding_aux_while_monitor_waits_for_its_consumer() {
         "aux0_out_tee",
         2500,
         Duration::from_millis(4500),
+    );
+}
+
+// ---- Dynamic aux buses ----
+
+/// The loudest peak (dB) `level` element `name` posts on `bus` within
+/// `window`; fails on a pipeline error.
+fn loudest(bus: &gst::Bus, name: &str, window: Duration) -> f64 {
+    let deadline = Instant::now() + window;
+    let mut loudest = f64::NEG_INFINITY;
+    while Instant::now() < deadline {
+        let Some(msg) = bus.timed_pop_filtered(
+            gst::ClockTime::from_mseconds(20),
+            &[gst::MessageType::Error, gst::MessageType::Element],
+        ) else {
+            continue;
+        };
+        if let gst::MessageView::Error(err) = msg.view() {
+            panic!("pipeline error: {err:?}");
+        }
+        let (Some(from), Some(structure)) = (msg.src(), msg.structure()) else {
+            continue;
+        };
+        if structure.name() == "level" && from.name() == name {
+            for db in extract_level_values(structure, "peak") {
+                loudest = loudest.max(db);
+            }
+        }
+    }
+    loudest
+}
+
+/// A pipeline that listens to inter channel `channel` through a `level`
+/// named `level_name`.
+fn listen(channel: &str, level_name: &str) -> gst::Pipeline {
+    let pipeline = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("intersrc")
+        .property("producer-name", channel)
+        .build()
+        .unwrap();
+    let level = gst::ElementFactory::make("level")
+        .name(level_name)
+        .property("interval", 50_000_000u64)
+        .property("post-messages", true)
+        .build()
+        .unwrap();
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .property("async", false)
+        .build()
+        .unwrap();
+    pipeline.add_many([&src, &level, &sink]).unwrap();
+    gst::Element::link_many([&src, &level, &sink]).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    pipeline
+}
+
+fn dyn_bus(aux: usize, channel: &str) -> DynamicAuxBus {
+    DynamicAuxBus {
+        aux,
+        channel: channel.to_string(),
+    }
+}
+
+fn request(aux: Option<usize>, channel: &str) -> AddMixerAuxBusRequest {
+    AddMixerAuxBusRequest {
+        aux,
+        channel: channel.to_string(),
+        pre_fader: None,
+    }
+}
+
+#[test]
+fn test_dynamic_bus_built_with_the_flow_leaves_on_its_channel() {
+    let json = serde_json::to_string(&[dyn_bus(3, "bus_three")]).unwrap();
+    let properties = small_mixer_props(&[
+        (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(4)),
+        (DYNAMIC_AUX_BUSES_PROPERTY, PropertyValue::String(json)),
+    ]);
+    let m = assemble(&properties);
+    // Bus 3 is built under its own number, with a send from each channel
+    // and its output on the channel; bus 2 is free.
+    for id in [
+        "aux2_mixer",
+        "aux2_intersink",
+        "aux_send_0_2",
+        "aux_send_1_2",
+    ] {
+        assert!(m.has_element(id), "{id} not built");
+    }
+    assert!(!m.has_element("aux1_mixer"));
+    assert!(m.downstream("aux2_out_tee").contains("aux2_intersink"));
+    // No block pad for it: only the static bus has one.
+    let pads = MixerBuilder.get_external_pads(&properties).unwrap();
+    let aux_pads: Vec<_> = pads
+        .outputs
+        .iter()
+        .filter(|p| p.name.starts_with("aux_out_"))
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(aux_pads, ["aux_out_1"]);
+}
+
+#[test]
+fn test_stored_buses_outside_the_free_numbers_are_not_built() {
+    let json = serde_json::to_string(&[dyn_bus(1, "taken")]).unwrap();
+    let m = assemble(&small_mixer_props(&[
+        (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(4)),
+        (DYNAMIC_AUX_BUSES_PROPERTY, PropertyValue::String(json)),
+    ]));
+    assert!(!m.has_element("aux0_intersink"));
+}
+
+#[test]
+fn test_aux_bus_added_at_runtime_is_heard_and_removed_cleanly() {
+    let channel = "mixer_test_runtime_bus";
+    let properties = small_mixer_props(&[
+        (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(3)),
+        ("ch1_aux2_level", PropertyValue::Float(1.0)),
+    ]);
+    let m = assemble(&properties);
+    feed(&m, 0, true);
+    tap(&m, "main_out_tee", "audio/x-raw", "tap_main");
+    m.pipeline.set_state(gst::State::Playing).unwrap();
+    let bus = m.pipeline.bus().unwrap();
+    assert!(loudest(&bus, "tap_main", Duration::from_millis(500)) > -40.0);
+    let tee_pads = |tee: &str| m.element(tee).src_pads().len();
+    let before = (tee_pads("pre_fader_tee_0"), tee_pads("post_fader_tee_0"));
+
+    let ears = listen(channel, "ears");
+    let ears_bus = ears.bus().unwrap();
+    let added = dynamic::add_aux_bus(&m.pipeline, INSTANCE, &properties, &dyn_bus(2, channel))
+        .expect("add the bus");
+    assert!(added.iter().any(|(id, _)| id.ends_with(":aux1_intersink")));
+    assert!(
+        loudest(&ears_bus, "ears", Duration::from_secs(2)) > -40.0,
+        "the new bus was not heard on its channel"
+    );
+    assert!(dynamic::is_built(&m.pipeline, INSTANCE, 2));
+
+    let removed = dynamic::remove_aux_bus(&m.pipeline, INSTANCE, &properties, 2);
+    assert_eq!(removed.len(), added.len());
+    for name in &removed {
+        assert!(m.pipeline.by_name(name).is_none(), "{name} stayed");
+    }
+    assert!(!dynamic::is_built(&m.pipeline, INSTANCE, 2));
+    assert_eq!(
+        (tee_pads("pre_fader_tee_0"), tee_pads("post_fader_tee_0")),
+        before,
+        "the sends left pads on the channel's tees"
+    );
+    // Main plays on, and the bus can come back under the same number.
+    assert!(loudest(&bus, "tap_main", Duration::from_millis(500)) > -40.0);
+    dynamic::add_aux_bus(&m.pipeline, INSTANCE, &properties, &dyn_bus(2, channel))
+        .expect("add the bus again");
+    assert!(loudest(&ears_bus, "ears", Duration::from_secs(2)) > -40.0);
+    let _ = ears.set_state(gst::State::Null);
+}
+
+#[test]
+fn test_send_tap_moves_while_the_mixer_runs() {
+    // Channel 1 is muted at its fader: a send after the fader is silent,
+    // one before it carries the tone.
+    let properties = small_mixer_props(&[
+        ("ch1_mute", PropertyValue::Bool(true)),
+        ("ch1_aux1_level", PropertyValue::Float(1.0)),
+    ]);
+    let m = assemble(&properties);
+    feed(&m, 0, true);
+    tap(&m, "aux0_out_tee", "audio/x-raw", "tap_aux1");
+    m.pipeline.set_state(gst::State::Playing).unwrap();
+    let bus = m.pipeline.bus().unwrap();
+    assert!(loudest(&bus, "tap_aux1", Duration::from_millis(500)) < -80.0);
+
+    let tee_of_send = || {
+        m.element("aux_send_0_0")
+            .static_pad("sink")
+            .and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+            .map(|e| e.name().to_string())
+    };
+    dynamic::set_send_tap(&m.pipeline, INSTANCE, 0, 0, true).unwrap();
+    assert_eq!(tee_of_send(), Some(format!("{INSTANCE}:pre_fader_tee_0")));
+    let _ = loudest(&bus, "tap_aux1", Duration::from_millis(200));
+    assert!(
+        loudest(&bus, "tap_aux1", Duration::from_millis(500)) > -40.0,
+        "the pre-fader send was not heard"
+    );
+
+    dynamic::set_send_tap(&m.pipeline, INSTANCE, 0, 0, false).unwrap();
+    assert_eq!(tee_of_send(), Some(format!("{INSTANCE}:post_fader_tee_0")));
+    let _ = loudest(&bus, "tap_aux1", Duration::from_millis(200));
+    assert!(loudest(&bus, "tap_aux1", Duration::from_millis(500)) < -80.0);
+    // Same tap again changes nothing; a bus not built is left for later.
+    dynamic::set_send_tap(&m.pipeline, INSTANCE, 0, 0, false).unwrap();
+    dynamic::set_send_tap(&m.pipeline, INSTANCE, 0, 5, true).unwrap();
+}
+
+#[test]
+fn test_choose_aux_takes_free_numbers_only() {
+    let none_built = |_| false;
+    let fixed = small_mixer_props(&[]);
+    assert!(matches!(
+        dynamic::choose_aux(&fixed, &request(None, "a"), none_built),
+        Err(dynamic::AuxBusError::NotSupported(_))
+    ));
+    let json = serde_json::to_string(&[dyn_bus(2, "taken")]).unwrap();
+    let props = small_mixer_props(&[
+        (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(4)),
+        (DYNAMIC_AUX_BUSES_PROPERTY, PropertyValue::String(json)),
+    ]);
+    // The lowest free number, skipping stored and built ones.
+    assert_eq!(
+        dynamic::choose_aux(&props, &request(None, "a"), none_built).unwrap(),
+        3
+    );
+    assert_eq!(
+        dynamic::choose_aux(&props, &request(None, "a"), |aux| aux == 3).unwrap(),
+        4
+    );
+    assert_eq!(
+        dynamic::choose_aux(&props, &request(Some(4), "a"), none_built).unwrap(),
+        4
+    );
+    for (aux, channel) in [(Some(1), "a"), (Some(5), "a")] {
+        assert!(matches!(
+            dynamic::choose_aux(&props, &request(aux, channel), none_built),
+            Err(dynamic::AuxBusError::Invalid(_))
+        ));
+    }
+    for (aux, channel) in [(Some(2), "a"), (Some(3), "taken")] {
+        assert!(matches!(
+            dynamic::choose_aux(&props, &request(aux, channel), none_built),
+            Err(dynamic::AuxBusError::Conflict(_))
+        ));
+    }
+    assert!(matches!(
+        dynamic::choose_aux(&props, &request(None, " "), none_built),
+        Err(dynamic::AuxBusError::Invalid(_))
+    ));
+}
+
+#[test]
+fn test_bus_property_names() {
+    assert_eq!(
+        dynamic::send_pre_property_target("ch3_aux2_pre"),
+        Some((2, 1))
+    );
+    for name in ["ch0_aux2_pre", "ch3_aux2_level", "aux2_pre", "ch3_aux_pre"] {
+        assert_eq!(dynamic::send_pre_property_target(name), None, "{name}");
+    }
+    for name in ["aux2_fader", "aux2_afl", "ch1_aux2_level", "ch12_aux2_pre"] {
+        assert!(dynamic::is_bus_property(name, 2), "{name}");
+    }
+    for name in [
+        "aux12_fader",
+        "ch1_aux12_level",
+        "ch2_fader",
+        "group2_fader",
+    ] {
+        assert!(!dynamic::is_bus_property(name, 2), "{name}");
+    }
+    let props = small_mixer_props(&[]);
+    let mut req = request(None, "a");
+    assert!(dynamic::added_bus_properties(&props, 2, &req).is_empty());
+    req.pre_fader = Some(true);
+    let added: Vec<String> = dynamic::added_bus_properties(&props, 2, &req)
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value:?}"))
+        .collect();
+    assert_eq!(
+        added,
+        ["ch1_aux2_pre=Bool(true)", "ch2_aux2_pre=Bool(true)"]
     );
 }

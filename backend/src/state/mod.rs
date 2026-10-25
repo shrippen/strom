@@ -42,6 +42,7 @@ struct RegisteredEndpoints {
     whip: Vec<String>,
 }
 
+mod mixer_aux_buses;
 pub(crate) mod stinger;
 mod vision_mixer_inputs;
 #[doc(hidden)]
@@ -1967,6 +1968,37 @@ impl AppState {
                     }
                 }
                 continue;
+            }
+
+            // A mixer send's tap (before or after the fader) is a link, not an
+            // element property: the send moves to the other tee. A bus not
+            // built yet takes the stored tap when it is. Handled before the
+            // `_block` rejection below.
+            if definition.id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID {
+                use crate::blocks::builtin::mixer::dynamic;
+                if let Some((ch, aux)) = dynamic::send_pre_property_target(&name) {
+                    let PropertyValue::Bool(pre) = value else {
+                        rejected.insert(name, "value must be a boolean".to_string());
+                        continue;
+                    };
+                    let applied = match self.inner.pipelines.read().await.get(flow_id) {
+                        Some(manager) => dynamic::set_send_tap(
+                            manager.pipeline(),
+                            block_instance_id,
+                            ch,
+                            aux,
+                            pre,
+                        ),
+                        None => Ok(()),
+                    };
+                    match applied {
+                        Ok(()) => to_persist.push((name, value)),
+                        Err(reason) => {
+                            rejected.insert(name, reason);
+                        }
+                    }
+                    continue;
+                }
             }
 
             // The `_block` element_id marker is a virtual element for properties that

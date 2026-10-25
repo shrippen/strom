@@ -66,7 +66,9 @@
 //! when LV2 plugins are not installed.
 
 mod builder;
+mod buses;
 mod definition;
+pub mod dynamic;
 mod elements;
 pub(crate) use elements::make_audiomixer;
 mod metering;

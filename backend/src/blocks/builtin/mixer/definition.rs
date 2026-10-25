@@ -100,6 +100,26 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Bus numbers for buses added while the flow runs — construction-time only.
+        ExposedProperty {
+            name: strom_types::mixer::MAX_AUX_BUSES_PROPERTY.to_string(),
+            label: "Aux Bus Capacity".to_string(),
+            description: format!(
+                "Highest aux bus number, for buses added while the flow runs (the \
+                 API's aux_buses endpoint adds them; their output goes to an inter \
+                 channel). 0 = no free buses, else at least Aux Buses, at most {}.",
+                MAX_AUX_BUSES
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::mixer::MAX_AUX_BUSES_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Number of groups — construction-time only.
         ExposedProperty {
             name: "num_groups".to_string(),
@@ -690,12 +710,14 @@ pub(super) fn mixer_definition() -> BlockDefinition {
                 ),
                 property_type: PropertyType::Bool,
                 default_value: Some(PropertyValue::Bool(false)), // all aux sends default post-fader
+                // Live: the state layer moves the send to the other tee
+                // (`dynamic::set_send_tap`).
                 mapping: PropertyMapping {
                     element_id: "_block".to_string(),
                     property_name: format!("ch{}_aux{}_pre", ch, aux),
                     transform: None,
                 },
-                live: false,
+                live: true,
                 persist: None,
             });
         }

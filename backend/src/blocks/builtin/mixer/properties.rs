@@ -5,6 +5,10 @@ use gstreamer::prelude::*;
 use strom_types::{parse_common_audio_sample_rate, PropertyValue, DEFAULT_AUDIO_SAMPLE_RATE};
 use tracing::warn;
 
+use strom_types::mixer::{
+    validate_dynamic_aux_buses, DynamicAuxBus, DYNAMIC_AUX_BUSES_PROPERTY, MAX_AUX_BUSES_PROPERTY,
+};
+
 use super::{DEFAULT_CHANNELS, MAX_AUX_BUSES, MAX_CHANNELS, MAX_GROUPS, MIN_KNEE_LINEAR};
 
 /// Read a count property. A negative integer counts as zero so the caller's
@@ -34,6 +38,39 @@ pub(super) fn parse_num_aux_buses(properties: &HashMap<String, PropertyValue>) -
         .and_then(parse_count)
         .unwrap_or(0)
         .clamp(0, MAX_AUX_BUSES)
+}
+
+/// Parse the bus capacity (`max_aux_buses`): at least `num_aux_buses`.
+pub(super) fn parse_max_aux_buses(
+    properties: &HashMap<String, PropertyValue>,
+    num_aux_buses: usize,
+) -> usize {
+    properties
+        .get(MAX_AUX_BUSES_PROPERTY)
+        .and_then(parse_count)
+        .unwrap_or(0)
+        .clamp(num_aux_buses, MAX_AUX_BUSES)
+}
+
+/// Parse the stored dynamic aux buses and check them against the free bus
+/// numbers. No property is no buses.
+pub(super) fn parse_dynamic_aux_buses(
+    properties: &HashMap<String, PropertyValue>,
+    num_aux_buses: usize,
+    capacity: usize,
+) -> Result<Vec<DynamicAuxBus>, String> {
+    let buses = match properties.get(DYNAMIC_AUX_BUSES_PROPERTY) {
+        None => return Ok(Vec::new()),
+        Some(PropertyValue::String(json)) => strom_types::mixer::parse_dynamic_aux_buses(json)?,
+        Some(other) => {
+            return Err(format!(
+                "{} must be a JSON string, not {:?}",
+                DYNAMIC_AUX_BUSES_PROPERTY, other
+            ))
+        }
+    };
+    validate_dynamic_aux_buses(&buses, num_aux_buses, capacity)?;
+    Ok(buses)
 }
 
 /// Parse the monitor's source from properties: the 0-based aux bus it

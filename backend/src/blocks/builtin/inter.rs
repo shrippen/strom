@@ -28,7 +28,7 @@ struct BufferConfig {
 ///
 /// Creates an `intersink` element from the rsinter plugin.
 /// The rsinter plugin is format-agnostic - it works with any media type.
-fn create_intersink(
+pub(crate) fn create_intersink(
     element_id: &str,
     channel_name: &str,
     sync: bool,
