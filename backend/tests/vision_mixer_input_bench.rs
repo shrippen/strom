@@ -1,13 +1,14 @@
 //! Vision mixer input cost: process CPU load of a CPU-backend mixer with N
 //! inputs, in a configuration like lmix's (1080p30 program, 720p multiview,
-//! 4 PiPs, 8 DSK layers, stinger, preview output). Prints a table; asserts
-//! nothing beyond the flows running.
+//! 4 PiPs, 8 DSK layers, stinger, preview output). Prints tables; asserts
+//! only that the flows run and every mixer delivers frames.
 //!
 //! ```text
 //! cargo test --release --test vision_mixer_input_bench -- --ignored --nocapture
 //! ```
 //!
-//! Three rows per N:
+//! Three rows per N in 8, 16, 32 (and, for comparison, the 2 sources alone
+//! and a 2-input mixer with both fed):
 //! - `sources only`: the N test sources into fakesinks, no mixer (the
 //!   baseline to subtract);
 //! - `all fed`: every input fed by a live 1080p30 source, only input 0 on
@@ -206,8 +207,14 @@ async fn measure(dir: &std::path::Path, flow: Flow) -> Sample {
     tokio::time::sleep(MEASURE).await;
     let secs = t0.elapsed().as_secs_f64();
     let load = (process_cpu() - cpu0).as_secs_f64() / secs;
-    let pgm_fps = (rendered(&state, &flow_id, "pgmsink").await - pgm0) as f64 / secs;
-    let mv_fps = (rendered(&state, &flow_id, "mvsink").await - mv0) as f64 / secs;
+    let pgm_fps = rendered(&state, &flow_id, "pgmsink")
+        .await
+        .saturating_sub(pgm0) as f64
+        / secs;
+    let mv_fps = rendered(&state, &flow_id, "mvsink")
+        .await
+        .saturating_sub(mv0) as f64
+        / secs;
     state.stop_flow(&flow_id).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     Sample {
@@ -222,53 +229,65 @@ async fn measure(dir: &std::path::Path, flow: Flow) -> Sample {
 async fn vision_mixer_input_cost() {
     gstreamer::init().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let base2 = measure(dir.path(), flow_for(2, Case::SourcesOnly))
-        .await
-        .load;
-    eprintln!("2 sources only: {:.0} % of one core", base2 * 100.0);
     let mut rows = Vec::new();
+    // The 2-input mixer with both inputs fed: what the "2 fed" rows of the
+    // larger mixers compare with.
+    let src2 = run(dir.path(), 2, Case::SourcesOnly, &mut rows).await;
+    let mix2 = run(dir.path(), 2, Case::AllFed, &mut rows).await;
+    let mut costs = Vec::new();
     for n in [8usize, 16, 32] {
-        let mut base = 0.0;
-        for case in [Case::SourcesOnly, Case::AllFed, Case::TwoFed] {
-            let sample = measure(dir.path(), flow_for(n, case)).await;
-            let load = sample.load;
-            eprintln!(
-                "N={n} {case:?}: {:.0} % of one core, PGM {:.1} fps, MV {:.1} fps",
-                load * 100.0,
-                sample.pgm_fps,
-                sample.mv_fps
-            );
-            let (minus, per) = match case {
-                Case::SourcesOnly => {
-                    base = load;
-                    (None, None)
-                }
-                Case::AllFed => (Some(load - base), Some((load - base) / n as f64)),
-                // The mixer's cost beyond the two sources, spread over the
-                // N-2 empty inputs on top of a 2-input mixer is not
-                // separable here; the column shows mixer minus 2 sources.
-                Case::TwoFed => (Some(load - base2), None),
-            };
-            rows.push((n, case, sample, minus, per));
-        }
+        let src = run(dir.path(), n, Case::SourcesOnly, &mut rows).await;
+        let all = run(dir.path(), n, Case::AllFed, &mut rows).await;
+        let two = run(dir.path(), n, Case::TwoFed, &mut rows).await;
+        let slots = (n - 2) as f64;
+        // A fed input: the all-fed mixer minus the 2-fed one of the same
+        // size (both without their sources), over the N-2 extra inputs.
+        let fed = ((all - src) - (two - src2)) / slots;
+        // An empty slot: the 2-fed mixer with N slots minus the 2-input
+        // mixer, over the N-2 empty slots.
+        let empty = (two - mix2) / slots;
+        costs.push((n, fed, empty));
     }
 
-    let pct = |v: Option<f64>, digits: usize| {
-        v.map(|v| format!("{:.*}", digits, v * 100.0))
-            .unwrap_or_else(|| "-".to_string())
-    };
-    eprintln!(
-        "\n| N | case | CPU (% of one core) | mixer minus its sources | mixer per input | PGM fps | MV fps |"
-    );
-    eprintln!("|---|---|---|---|---|---|---|");
-    for (n, case, sample, minus, per) in rows {
+    eprintln!("\n| N | case | CPU (% of one core) | PGM fps | MV fps |");
+    eprintln!("|---|---|---|---|---|");
+    for (n, case, sample) in &rows {
         eprintln!(
-            "| {n} | {case:?} | {:.0} | {} | {} | {:.1} | {:.1} |",
+            "| {n} | {case:?} | {:.0} | {:.1} | {:.1} |",
             sample.load * 100.0,
-            pct(minus, 0),
-            pct(per, 1),
             sample.pgm_fps,
             sample.mv_fps
         );
     }
+    eprintln!("\n| N | per fed input (% of one core) | per empty slot (% of one core) |");
+    eprintln!("|---|---|---|");
+    for (n, fed, empty) in costs {
+        eprintln!("| {n} | {:.1} | {:.1} |", fed * 100.0, empty * 100.0);
+    }
+}
+
+/// Measure one case, print and record it, and return its CPU load. A mixer
+/// that delivers no frames fails the run instead of giving a plausible row.
+async fn run(
+    dir: &std::path::Path,
+    n: usize,
+    case: Case,
+    rows: &mut Vec<(usize, Case, Sample)>,
+) -> f64 {
+    let sample = measure(dir, flow_for(n, case)).await;
+    eprintln!(
+        "N={n} {case:?}: {:.0} % of one core, PGM {:.1} fps, MV {:.1} fps",
+        sample.load * 100.0,
+        sample.pgm_fps,
+        sample.mv_fps
+    );
+    if !matches!(case, Case::SourcesOnly) {
+        assert!(
+            sample.pgm_fps > 0.0 && sample.mv_fps > 0.0,
+            "N={n} {case:?}: the mixer delivered no frames"
+        );
+    }
+    let load = sample.load;
+    rows.push((n, case, sample));
+    load
 }
