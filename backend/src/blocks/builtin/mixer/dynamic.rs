@@ -40,6 +40,7 @@ pub(crate) use super::properties::stored_dynamic_aux_buses;
 use super::properties::{
     parse_dynamic_aux_buses, parse_max_aux_buses, parse_num_aux_buses, parse_num_channels,
 };
+use crate::blocks::builtin::start_time::StartTime;
 
 /// Why adding or removing a bus, or changing a send's tap, failed.
 #[derive(Debug, thiserror::Error)]
@@ -201,7 +202,15 @@ pub fn add_aux_bus(
     properties: &HashMap<String, PropertyValue>,
     bus: &DynamicAuxBus,
 ) -> Result<Vec<(String, gst::Element)>, AuxBusError> {
-    let spec = BusSpec::new(instance_id, properties);
+    // The bus's mixer starts at its first buffer, the running time of now.
+    // At zero (the block's default) it would first make every buffer since
+    // the flow started, and the sends' queues would fill and stall the
+    // channels' streaming threads, Main with them, for as long as the flow
+    // has run.
+    let spec = BusSpec {
+        start: StartTime::First,
+        ..BusSpec::new(instance_id, properties)
+    };
     let aux = bus.aux - 1;
     let failed = |e: crate::blocks::BlockBuildError| AuxBusError::Failed(e.to_string());
     let mut elements = Vec::new();

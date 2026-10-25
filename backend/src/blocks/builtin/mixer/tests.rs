@@ -1782,6 +1782,59 @@ fn test_aux_bus_added_at_runtime_is_heard_and_removed_cleanly() {
     assert!(loudest(&ears_bus, "ears", Duration::from_secs(2)) > -40.0);
 }
 
+/// A bus added to a running mixer starts at the running time of now. Started
+/// at zero (the block's default), its aggregator would first make every
+/// buffer since the flow started, while the sends' queues fill and stall the
+/// channels' streaming threads: after an hour, Main stops for seconds.
+#[test]
+fn test_aux_bus_added_late_starts_at_the_running_time_of_now() {
+    let channel = "mixer_test_late_bus";
+    let properties = small_mixer_props(&[
+        (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(3)),
+        ("ch1_aux2_level", PropertyValue::Float(1.0)),
+    ]);
+    let m = assemble(&properties);
+    feed(&m, 0, true);
+    tap(&m, "main_out_tee", "audio/x-raw", "tap_main");
+    m.pipeline.set_state(gst::State::Playing).unwrap();
+    let bus = m.pipeline.bus().unwrap();
+    // Let it run a while: the running time the bus must start from.
+    assert!(loudest(&bus, "tap_main", Duration::from_millis(1500)) > -40.0);
+
+    let ears = listen(channel, "ears");
+    let ears_bus = ears.bus().unwrap();
+    let added_at = m.pipeline.current_running_time().expect("running time");
+    dynamic::add_aux_bus(&m.pipeline, INSTANCE, &properties, &dyn_bus(2, channel))
+        .expect("add the bus");
+    let first_pts: Arc<std::sync::Mutex<Option<gst::ClockTime>>> = Arc::default();
+    let first = Arc::clone(&first_pts);
+    m.pipeline
+        .by_name(&format!("{INSTANCE}:aux1_out_tee"))
+        .unwrap()
+        .static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                first
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(b.pts().unwrap_or_default());
+            }
+            gst::PadProbeReturn::Ok
+        });
+    assert!(
+        loudest(&ears_bus, "ears", Duration::from_secs(2)) > -40.0,
+        "the new bus was not heard"
+    );
+    let first = first_pts.lock().unwrap().expect("the bus made no buffer");
+    // A little before is fine (the buffers queued at the sends); from zero
+    // is not.
+    assert!(
+        first + gst::ClockTime::from_mseconds(500) > added_at,
+        "the bus started at {first}, added at {added_at}"
+    );
+}
+
 #[test]
 fn test_send_tap_moves_while_the_mixer_runs() {
     // Channel 1 is muted at its fader: a send after the fader is silent,

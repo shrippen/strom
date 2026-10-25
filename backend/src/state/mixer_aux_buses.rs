@@ -63,7 +63,16 @@ impl AppState {
         let stored = self
             .store_aux_buses(flow_id, block_id, |buses| buses.push(bus), added, None)
             .await;
-        if stored.is_ok() {
+        // Registered only while the bus runs: a stop in between took the
+        // flow's channels out already.
+        let running = self
+            .inner
+            .pipelines
+            .read()
+            .await
+            .get(flow_id)
+            .is_some_and(|m| dynamic::is_built_dynamic(m.pipeline(), block_id, aux));
+        if stored.is_ok() && running {
             self.register_aux_bus_channel(flow_id, block_id, &bus_channel)
                 .await;
         }
@@ -109,18 +118,25 @@ impl AppState {
                 AuxBusError::NotFound(format!("aux bus {} is not a dynamic bus", aux))
             });
         }
-        let mut channel = listed.as_ref().map(|b| b.channel.clone());
+        let mut channel = None;
         if built {
             if let Some(manager) = pipelines.get_mut(flow_id) {
-                channel = dynamic::bus_channel(manager.pipeline(), block_id, aux).or(channel);
+                channel = dynamic::bus_channel(manager.pipeline(), block_id, aux);
                 let removed =
                     dynamic::remove_aux_bus(manager.pipeline(), block_id, &properties, aux);
                 manager.forget_elements(&removed);
             }
         }
         drop(pipelines);
+        // Only the entry this bus made: a bus that did not run registered
+        // nothing, and the name may be another flow's.
         if let Some(channel) = channel {
-            self.channels().unregister(&channel).await;
+            let ours = self.channels().get(&channel).await.is_some_and(|info| {
+                info.source_flow_id == *flow_id && info.output_name == aux_bus_output(block_id)
+            });
+            if ours {
+                self.channels().unregister(&channel).await;
+            }
         }
         // The bus's settings go with it, so one added later under its number
         // starts from the defaults; a number the flow now builds itself keeps
@@ -158,7 +174,7 @@ impl AppState {
         self.channels()
             .register(crate::sharing::ChannelInfo {
                 source_flow_id: *flow_id,
-                output_name: format!("{}:aux_bus", block_id),
+                output_name: aux_bus_output(block_id),
                 channel_name: channel.to_string(),
                 media_type: strom_types::MediaType::Audio,
             })
@@ -182,6 +198,8 @@ impl AppState {
                     .filter(|b| b.block_definition_id == MIXER_BLOCK_ID)
                     .filter(|b| !(flow.id == *flow_id && b.id == block_id))
                     .find_map(|b| {
+                        // A list that does not parse is refused until it is
+                        // fixed; its channels are not known here.
                         let stored = stored_dynamic_aux_buses(&b.properties).ok()?;
                         let bus = stored.iter().find(|bus| bus.channel == channel)?;
                         Some(format!(
@@ -285,6 +303,11 @@ fn stored_list(
 ) -> Result<Vec<DynamicAuxBus>, AuxBusError> {
     stored_dynamic_aux_buses(properties)
         .map_err(|e| AuxBusError::Conflict(format!("{}; fix or remove it first", e)))
+}
+
+/// The registry's output name of a mixer's dynamic aux buses.
+fn aux_bus_output(block_id: &str) -> String {
+    format!("{}:aux_bus", block_id)
 }
 
 fn not_running(flow_id: &FlowId) -> AuxBusError {
