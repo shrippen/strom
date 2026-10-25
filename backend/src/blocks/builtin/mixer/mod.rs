@@ -55,7 +55,8 @@
 //! main_to_mon=1, solo_to_mon=0; any solo active → reversed. Clients only
 //! write the bools; the gates are not part of the public API. monitor_mixer
 //! feeds monitor_master_vol → monitor_level → monitor_out_tee → monitor_out
-//! pad.
+//! pad. With `monitor_source` = N the gate main_to_mon takes aux bus N
+//! instead of Main (a headphone mix that is not program); the rule stays.
 //!
 //! All output buses terminate in a tee with allow-not-linked=true, so unconnected
 //! output pads don't cause NOT_LINKED flow errors. Audiomixer elements use
