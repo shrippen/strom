@@ -7,6 +7,9 @@ use std::str::FromStr;
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
 
+mod pad_map;
+pub use pad_map::PadMap;
+
 /// A source that can be assigned to PGM or PVW.
 ///
 /// JSON encoding is externally tagged: `{"input": 5}` or `{"pip": 1}`.
@@ -78,9 +81,9 @@ impl FromStr for Source {
 /// Default number of video inputs.
 pub const DEFAULT_NUM_INPUTS: usize = 4;
 
-/// Maximum number of video inputs. Soft cap — CPU/GPU/memory are the real
-/// ceiling. The multiview thumbnail grid scales rows dynamically so any value
-/// in `[MIN_NUM_INPUTS, MAX_NUM_INPUTS]` produces a usable layout (smaller
+/// Maximum number of video inputs. A flow asking for more fails to build.
+/// The multiview thumbnail grid scales rows dynamically so any value in
+/// `[MIN_NUM_INPUTS, MAX_NUM_INPUTS]` produces a usable layout (smaller
 /// thumbnails for larger N).
 pub const MAX_NUM_INPUTS: usize = 32;
 
@@ -182,13 +185,6 @@ pub const DIST_STINGER_INCOMING_ZORDER: u32 = 91;
 
 /// Z-order of the stinger graphic: over the program, under the DSKs.
 pub const DIST_STINGER_FILL_ZORDER: u32 = 92;
-
-/// Index of the stinger graphic's sink pad on the distribution compositor;
-/// the matte's (GPU only) is the next one. Stinger pads come after the
-/// inputs, the DSKs and the border underlays (present with PiPs).
-pub fn dist_stinger_pad_base(num_inputs: usize, num_dsk_inputs: usize, num_pips: usize) -> usize {
-    num_inputs + num_dsk_inputs + if num_pips > 0 { num_inputs } else { 0 }
-}
 
 /// Z-order for PiP overlay pads on the distribution compositor when PGM is a PiP source.
 /// Must be above [`DIST_PGM_ZORDER`] (which the bg uses) and below DSK.

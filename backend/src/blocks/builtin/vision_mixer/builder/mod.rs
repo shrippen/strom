@@ -38,7 +38,7 @@ pub struct VisionMixerBuilder;
 
 impl BlockBuilder for VisionMixerBuilder {
     fn get_external_pads(&self, props: &HashMap<String, PropertyValue>) -> Option<ExternalPads> {
-        let num_inputs = properties::parse_num_inputs(props);
+        let num_inputs = properties::num_inputs_or_max(props);
         let num_dsk = properties::parse_num_dsk_inputs(props);
 
         // Internal element IDs are bare names — block expansion adds the instance_id prefix
@@ -124,7 +124,8 @@ impl BlockBuilder for VisionMixerBuilder {
         props: &HashMap<String, PropertyValue>,
         ctx: &BlockBuildContext,
     ) -> Result<BlockBuildResult, BlockBuildError> {
-        let num_inputs = properties::parse_num_inputs(props);
+        let num_inputs =
+            properties::parse_num_inputs(props).map_err(BlockBuildError::InvalidProperty)?;
         let num_pips = properties::parse_num_pips(props);
         let pgm_input = properties::parse_initial_pgm(props, num_inputs);
         let pvw_input = properties::parse_initial_pvw(props, num_inputs);
@@ -278,9 +279,9 @@ pub(super) struct PipelineParams<'a> {
 }
 
 impl PipelineParams<'_> {
-    /// Sink index of the stinger graphic on the dist mixer (matte: + 1).
-    pub(super) fn stinger_pad_base(&self) -> usize {
-        vision_mixer::dist_stinger_pad_base(self.num_inputs, self.num_dsk_inputs, self.num_pips)
+    /// Sink pad indices of the compositors this mixer builds.
+    pub(super) fn pad_map(&self) -> vision_mixer::PadMap {
+        vision_mixer::PadMap::new(self.num_inputs, self.num_dsk_inputs, self.num_pips)
     }
 }
 

@@ -55,7 +55,7 @@ impl PipelineManager {
         );
         let num_video_inputs = overlay_state
             .as_ref()
-            .map(|s| s.num_inputs)
+            .map(|s| s.pad_map().capacity)
             .unwrap_or(usize::MAX);
         // When overlay state is missing entirely, fall back to the request-
         // provided indices. When state exists but reports None (PiP on bus),
@@ -153,7 +153,7 @@ impl PipelineManager {
                     16.0 / 9.0
                 };
                 let src_aspects =
-                    self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
+                    self.vision_mixer_source_aspects(block_instance_id, state.pad_map().capacity);
                 let pgm_w = state.pgm_w.max(1) as f64;
                 let dist_underlay =
                     state
@@ -199,7 +199,7 @@ impl PipelineManager {
                     old_pvw_pip,
                     state.pvw_input(),
                     pvw_region,
-                    state.num_inputs + 1,
+                    state.pad_map().mv_pvw_base(),
                     strom_types::vision_mixer::MV_BIG_DISPLAY_ZORDER,
                     strom_types::vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
                     src_aspect,
@@ -211,7 +211,7 @@ impl PipelineManager {
                     new_pvw_pip,
                     new_pvw_swap,
                     pvw_region,
-                    state.num_inputs + 1,
+                    state.pad_map().mv_pvw_base(),
                     strom_types::vision_mixer::MV_BIG_DISPLAY_ZORDER,
                     strom_types::vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
                     src_aspect,
@@ -225,7 +225,7 @@ impl PipelineManager {
                         apply_pip_layout_to_region(
                             mixer,
                             0,
-                            state.num_inputs,
+                            state.pad_map().capacity,
                             dist_region,
                             state.pip_bg_input(p),
                             &state.pip_zones(p),
@@ -240,7 +240,7 @@ impl PipelineManager {
                         apply_input_group_to_region(
                             mixer,
                             0,
-                            state.num_inputs,
+                            state.pad_map().capacity,
                             dist_region,
                             new_pgm_swap,
                             strom_types::vision_mixer::DIST_PGM_ZORDER,
@@ -252,8 +252,8 @@ impl PipelineManager {
                     if let Some(p) = new_pvw_pip {
                         apply_pip_layout_to_region(
                             mv_comp,
-                            state.num_inputs + 1,
-                            state.num_inputs,
+                            state.pad_map().mv_pvw_base(),
+                            state.pad_map().capacity,
                             pvw_region,
                             state.pip_bg_input(p),
                             &state.pip_zones(p),
@@ -267,8 +267,8 @@ impl PipelineManager {
                     } else {
                         apply_input_group_to_region(
                             mv_comp,
-                            state.num_inputs + 1,
-                            state.num_inputs,
+                            state.pad_map().mv_pvw_base(),
+                            state.pad_map().capacity,
                             pvw_region,
                             new_pvw_swap,
                             strom_types::vision_mixer::MV_BIG_DISPLAY_ZORDER,
@@ -315,7 +315,7 @@ impl PipelineManager {
                             .name()
                             .strip_prefix("sink_")
                             .and_then(|i| i.parse::<usize>().ok())
-                            .filter(|idx| *idx < state.num_inputs)
+                            .filter(|idx| state.pad_map().dist_input_of(*idx).is_some())
                         else {
                             continue;
                         };
@@ -372,7 +372,7 @@ impl PipelineManager {
                         &dist_controller,
                         &self.pipeline,
                         &new_pgm_transforms,
-                        state.num_inputs,
+                        state.pad_map().capacity,
                         0,
                         &old_dist_targets,
                         &new_dist_targets,
@@ -386,8 +386,8 @@ impl PipelineManager {
                         &mv_controller,
                         &self.pipeline,
                         &new_pvw_transforms,
-                        state.num_inputs,
-                        state.num_inputs + 1,
+                        state.pad_map().capacity,
+                        state.pad_map().mv_pvw_base(),
                         &old_pvw_targets,
                         &new_pvw_targets,
                         duration_ms,
@@ -554,7 +554,7 @@ impl PipelineManager {
         if let Some(left) =
             crate::blocks::builtin::vision_mixer::geometry::inputs_animation_remaining(
                 mixer,
-                state.num_inputs,
+                &state.pad_map(),
             )
         {
             return Err(invalid(format!(
@@ -587,7 +587,7 @@ impl PipelineManager {
                     mixer,
                     Some(&state),
                     Some(from),
-                    state.num_inputs,
+                    state.pad_map().capacity,
                     canvas_width,
                     canvas_height,
                     false,
@@ -630,13 +630,13 @@ impl PipelineManager {
                 mixer,
                 Some(&state),
                 Some(from),
-                state.num_inputs,
+                state.pad_map().capacity,
                 canvas_width,
                 canvas_height,
                 false,
             );
         }
-        let aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
+        let aspects = self.vision_mixer_source_aspects(block_instance_id, state.pad_map().capacity);
         let canvas_aspect = if canvas_height > 0 {
             canvas_width as f64 / canvas_height as f64
         } else {
@@ -667,7 +667,7 @@ impl PipelineManager {
                 .name()
                 .strip_prefix("sink_")
                 .and_then(|i| i.parse::<usize>().ok())
-                .filter(|idx| *idx < state.num_inputs)
+                .filter(|idx| state.pad_map().dist_input_of(*idx).is_some())
             else {
                 continue;
             };
@@ -829,8 +829,11 @@ impl PipelineManager {
                             hidden.push((idx, pad.clone()));
                         }
                     } else if let Some(state) = overlay_state {
-                        let dsk_idx = idx - num_video_inputs;
-                        if dsk_idx < state.dsk_enabled.len() {
+                        let dsk = state
+                            .pad_map()
+                            .dist_dsk_of(idx)
+                            .filter(|d| *d < state.dsk_enabled.len());
+                        if let Some(dsk_idx) = dsk {
                             let enabled = state.dsk_enabled[dsk_idx]
                                 .load(std::sync::atomic::Ordering::Relaxed);
                             let alpha = if enabled { 1.0f64 } else { 0.0f64 };

@@ -23,7 +23,7 @@ fn overlay_timer_test_guard() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn test_parse_num_inputs_default() {
     let props = HashMap::new();
-    assert_eq!(properties::parse_num_inputs(&props), 4);
+    assert_eq!(properties::parse_num_inputs(&props), Ok(4));
 }
 
 #[test]
@@ -33,20 +33,60 @@ fn test_parse_num_inputs_valid() {
         "num_inputs".to_string(),
         PropertyValue::String("8".to_string()),
     );
-    assert_eq!(properties::parse_num_inputs(&props), 8);
+    assert_eq!(properties::parse_num_inputs(&props), Ok(8));
 }
 
 #[test]
-fn test_parse_num_inputs_clamped_to_max() {
+fn test_parse_num_inputs_above_max_is_rejected() {
+    use strom_types::vision_mixer::MAX_NUM_INPUTS;
     let mut props = HashMap::new();
     props.insert(
         "num_inputs".to_string(),
+        PropertyValue::UInt(MAX_NUM_INPUTS as u64),
+    );
+    assert_eq!(properties::parse_num_inputs(&props), Ok(MAX_NUM_INPUTS));
+    for too_many in [
+        PropertyValue::UInt(MAX_NUM_INPUTS as u64 + 1),
         PropertyValue::String("9999".to_string()),
+    ] {
+        props.insert("num_inputs".to_string(), too_many);
+        let err = properties::parse_num_inputs(&props).expect_err("above the maximum");
+        assert!(err.contains(&format!("at most {MAX_NUM_INPUTS}")), "{err}");
+        assert_eq!(properties::num_inputs_or_max(&props), MAX_NUM_INPUTS);
+    }
+}
+
+/// A flow asking for more inputs than the mixer has fails to build, with the
+/// reason, instead of building 32 inputs and leaving the links to the rest
+/// without a target.
+#[test]
+fn test_build_rejects_num_inputs_above_max() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext, BlockBuildError};
+    gstreamer::init().unwrap();
+    let mut props = HashMap::new();
+    props.insert(
+        "compositor_preference".to_string(),
+        PropertyValue::String("cpu".to_string()),
     );
-    assert_eq!(
-        properties::parse_num_inputs(&props),
-        strom_types::vision_mixer::MAX_NUM_INPUTS
+    props.insert(
+        "num_inputs".to_string(),
+        PropertyValue::UInt(strom_types::vision_mixer::MAX_NUM_INPUTS as u64 + 1),
     );
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let result = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx);
+    match result {
+        Err(BlockBuildError::InvalidProperty(msg)) => {
+            let want = format!(
+                "num_inputs is {}",
+                strom_types::vision_mixer::MAX_NUM_INPUTS + 1
+            );
+            assert!(msg.contains(&want), "{msg}")
+        }
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("more inputs than the maximum built"),
+    }
 }
 
 #[test]
@@ -56,7 +96,7 @@ fn test_parse_num_inputs_clamped_min() {
         "num_inputs".to_string(),
         PropertyValue::String("1".to_string()),
     );
-    assert_eq!(properties::parse_num_inputs(&props), 2); // MIN
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2)); // MIN
 }
 
 #[test]
@@ -1288,4 +1328,134 @@ fn flows_sharing_a_block_id_keep_their_own_overlay() {
         "tearing down flow A must leave flow B's overlay registered"
     );
     unregister_flow(&flow_b);
+}
+
+/// The compositor sink pads the CPU builder links and gives properties to,
+/// with every pad kind present (DSKs, PiPs and their border underlays,
+/// stinger, preview output), are exactly the pads of the inline formulas
+/// the builders used before `PadMap`: existing flows keep their pad names.
+#[test]
+fn test_cpu_build_links_the_same_sink_pads_as_before_pad_map() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+    use std::collections::BTreeSet;
+
+    gstreamer::init().unwrap();
+    crate::gpu::detect_gpu_capabilities();
+    let (n, d, p) = (3usize, 2usize, 2usize);
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("cpu".into())),
+        ("num_inputs", PropertyValue::UInt(n as u64)),
+        ("num_dsk_inputs", PropertyValue::String(d.to_string())),
+        ("num_pips", PropertyValue::String(p.to_string())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("CPU vision mixer builds");
+
+    let linked = |element: &str| -> BTreeSet<usize> {
+        built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect()
+    };
+    let with_props = |element: &str| -> BTreeSet<usize> {
+        built
+            .pad_properties
+            .get(&format!("vm:{element}"))
+            .map(|pads| {
+                pads.keys()
+                    .filter_map(|k| k.strip_prefix("sink_")?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Dist: inputs, DSKs (N+d), underlays (N+D+i), stinger (N+D+N).
+    let mut dist: BTreeSet<usize> = (0..n).collect();
+    dist.extend((0..d).map(|k| n + k));
+    dist.extend((0..n).map(|i| n + d + i));
+    dist.insert(n + d + n);
+    // Multiview: thumbnails, PGM (N), PVW (N+1+i), PiP (2N+1+p*N+i),
+    // overlay (2N+1+P*N), PVW underlays (2N+2+P*N+i), tile underlays.
+    let overlay = 2 * n + 1 + p * n;
+    let mut mv: BTreeSet<usize> = (0..n).collect();
+    mv.insert(n);
+    mv.extend((0..n).map(|i| n + 1 + i));
+    mv.extend((0..p).flat_map(|pip| (0..n).map(move |i| 2 * n + 1 + pip * n + i)));
+    mv.insert(overlay);
+    mv.extend((0..n).map(|i| overlay + 1 + i));
+    mv.extend((0..p).flat_map(|pip| (0..n).map(move |i| overlay + 1 + n * (1 + pip) + i)));
+    // Preview output: inputs, underlays (N+i).
+    let pvw: BTreeSet<usize> = (0..2 * n).collect();
+
+    assert_eq!(linked("mixer"), dist);
+    assert_eq!(linked("mv_comp"), mv);
+    assert_eq!(linked("pvw_comp"), pvw);
+    // Every pad with properties is one of the linked ones (the PGM big pad
+    // and the dist pads all get properties; the GPU stinger matte does not
+    // exist on CPU).
+    assert!(with_props("mixer").is_subset(&dist));
+    assert_eq!(with_props("mv_comp"), mv);
+}
+
+/// The GL mixer names its auto-created pads in link order, so the GPU
+/// builder must link every compositor's sink pads in index order, with no
+/// gap: otherwise a pad named `sink_k` in the pad properties and the
+/// runtime operations is a different pad than the one linked for it.
+#[test]
+fn test_gpu_build_links_sink_pads_in_index_order() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+
+    gstreamer::init().unwrap();
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("gpu".into())),
+        ("num_inputs", PropertyValue::UInt(3)),
+        ("num_dsk_inputs", PropertyValue::String("2".into())),
+        ("num_pips", PropertyValue::String("2".into())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("GPU vision mixer builds (needs the GL plugins, not a GL context)");
+
+    for element in ["mixer", "mv_comp", "pvw_comp"] {
+        let order: Vec<usize> = built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect();
+        let expected: Vec<usize> = (0..order.len()).collect();
+        assert!(!order.is_empty(), "{element} has no sink links");
+        assert_eq!(order, expected, "{element} sink pads out of link order");
+    }
+}
+
+/// `num_inputs` given as a negative number counts as the minimum (it was
+/// the maximum through an unsigned wrap), and a string is read trimmed.
+#[test]
+fn test_parse_num_inputs_negative_and_padded() {
+    let mut props = HashMap::new();
+    props.insert("num_inputs".to_string(), PropertyValue::Int(-1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert(
+        "num_inputs".to_string(),
+        PropertyValue::String(" 8 ".to_string()),
+    );
+    assert_eq!(properties::parse_num_inputs(&props), Ok(8));
 }

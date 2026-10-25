@@ -1352,6 +1352,7 @@ mod event_accessor_tests {
                 num_cores: 1,
                 total_memory: 0,
                 used_memory: 0,
+                process_memory: None,
                 gpu_stats: vec![],
                 gl_renderer: None,
                 timestamp: 0,

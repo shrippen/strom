@@ -16,6 +16,7 @@ use super::mixer_layout::{
     hide_underlay, pads_for_source,
 };
 use crate::gst::underlay::UnderlayCtx;
+use strom_types::vision_mixer::PadMap;
 
 impl PipelineManager {
     /// Select a preview input on a vision mixer block.
@@ -47,6 +48,8 @@ impl PipelineManager {
                 ))
             })?;
 
+        let pm = state.pad_map();
+
         // Validate first — don't mutate any state until we know we can complete.
         if input >= num_inputs {
             return Err(PipelineError::InvalidProperty {
@@ -67,8 +70,8 @@ impl PipelineManager {
             // Clear any lingering control bindings from a previous PiP-aware
             // fade, then hide every PVW big pad (and their border underlays).
             // The new selection below re-activates only the chosen one.
-            for i in 0..num_inputs {
-                if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + i)) {
+            for i in 0..pm.capacity {
+                if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(i))) {
                     clear_layout_bindings(&pad);
                     pad.set_property("alpha", 0.0f64);
                 }
@@ -92,20 +95,19 @@ impl PipelineManager {
         // Hide the old PVW pad (unless it's the same input the new PGM uses).
         if let Some(old_idx) = old_pvw {
             if pgm != Some(old_idx) {
-                if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + old_idx))
-                {
+                if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(old_idx))) {
                     pad.set_property("alpha", 0.0f64);
                 }
             }
         }
 
         // Position the new PVW pad aspect-fitted into the PVW big rect.
-        if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + input)) {
+        if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(input))) {
             // Plain-input PVW never crops — wipe any crop from a PiP render.
             set_pad_crop(&pad, &Default::default());
             let r = &state.layout.pvw_rect;
             let aspect = self
-                .vision_mixer_source_aspects(block_instance_id, num_inputs)
+                .vision_mixer_source_aspects(block_instance_id, pm.capacity)
                 .get(&input)
                 .copied()
                 .unwrap_or(0.0);
@@ -140,7 +142,6 @@ impl PipelineManager {
         block_instance_id: &str,
         new_pgm: Option<usize>,
         new_pvw: Option<usize>,
-        num_inputs: usize,
     ) -> Result<(), PipelineError> {
         use crate::blocks::builtin::vision_mixer::overlay;
 
@@ -178,8 +179,9 @@ impl PipelineManager {
         // Clear any control bindings too — a previous fade may have left
         // lingering bindings that would otherwise override our property
         // writes below.
-        for i in 0..num_inputs {
-            if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + i)) {
+        let pm = state.pad_map();
+        for i in 0..pm.capacity {
+            if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(i))) {
                 clear_layout_bindings(&pad);
                 pad.set_property("alpha", 0.0f64);
             }
@@ -191,12 +193,12 @@ impl PipelineManager {
         // Position the new PVW pad aspect-fitted into the PVW big rect
         // (single input only — multi-source compositions are PiPs).
         if let Some(active) = new_pvw {
-            if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + active)) {
+            if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(active))) {
                 // Plain-input PVW never crops — wipe any crop from a PiP render.
                 set_pad_crop(&pad, &Default::default());
                 let r = &state.layout.pvw_rect;
                 let aspect = self
-                    .vision_mixer_source_aspects(block_instance_id, num_inputs)
+                    .vision_mixer_source_aspects(block_instance_id, pm.capacity)
                     .get(&active)
                     .copied()
                     .unwrap_or(0.0);
@@ -235,14 +237,20 @@ impl PipelineManager {
         enabled: bool,
         duration_ms: u64,
     ) -> Result<(), PipelineError> {
-        // DSK pads are on the dist compositor (mixer) at sink_{num_inputs + dsk_index}
+        // DSK pads are on the dist compositor (mixer), see `PadMap::dist_dsk`.
         let mixer_id = format!("{}:mixer", block_instance_id);
         let mixer = self
             .elements
             .get(&mixer_id)
             .ok_or_else(|| PipelineError::ElementNotFound(mixer_id.clone()))?;
 
-        let pad_name = format!("sink_{}", num_inputs + dsk_index);
+        let pm = crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(
+            &self.flow_id,
+            block_instance_id,
+        )
+        .map(|s| s.pad_map())
+        .unwrap_or_else(|| PadMap::new(num_inputs, dsk_index + 1, 0));
+        let pad_name = PadMap::sink(pm.dist_dsk(dsk_index));
         if let Some(pad) = find_pad(mixer, &pad_name) {
             let alpha = if enabled { 1.0f64 } else { 0.0f64 };
             let key = format!("{}:{}", mixer.name(), pad_name);
@@ -292,21 +300,14 @@ impl PipelineManager {
             .get(&mv_comp_id)
             .ok_or_else(|| PipelineError::ElementNotFound(mv_comp_id.clone()))?;
 
-        // Overlay pad is the last pad on mv_comp. Pad layout:
-        //   sink_0..N-1      : thumbnails
-        //   sink_N           : PGM big (from tee_pgm)
-        //   sink_N+1..2N     : PVW big candidates
-        //   sink_2N+1..2N+P  : PiP-tile candidates (P = num_pips * num_inputs)
-        //   sink_2N+1+P      : cairo overlay  ← this one
-        let num_pips = crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(
+        // The cairo overlay pad on mv_comp, see `PadMap::mv_overlay`.
+        let pm = crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(
             &self.flow_id,
             block_instance_id,
         )
-        .as_ref()
-        .map(|s| s.num_pips)
-        .unwrap_or(0);
-        let overlay_idx = 2 * num_inputs + 1 + num_pips * num_inputs;
-        let pad_name = format!("sink_{}", overlay_idx);
+        .map(|s| s.pad_map())
+        .unwrap_or_else(|| PadMap::new(num_inputs, 0, 0));
+        let pad_name = PadMap::sink(pm.mv_overlay());
         if let Some(pad) = find_pad(mv_comp, &pad_name) {
             pad.set_property("alpha", alpha);
             if let Some(state) = crate::blocks::builtin::vision_mixer::overlay::get_overlay_state(
@@ -386,7 +387,7 @@ impl PipelineManager {
                 strom_types::vision_mixer::DIST_PGM_ZORDER,
                 strom_types::vision_mixer::DIST_PIP_OVERLAY_ZORDER,
                 src_aspect,
-                &self.vision_mixer_source_aspects(block_instance_id, state.num_inputs),
+                &self.vision_mixer_source_aspects(block_instance_id, state.pad_map().capacity),
                 dist_underlay,
             );
             // Fit the pads to their sources' current shapes before they fade
@@ -450,10 +451,7 @@ impl PipelineManager {
                         // Restore the current PGM source's pads — content
                         // and the underlays of its bordered zone sources.
                         (0.0, 1.0)
-                    } else if idx >= state.num_inputs
-                        && idx < state.num_inputs + state.num_dsk_inputs
-                    {
-                        let dsk_idx = idx - state.num_inputs;
+                    } else if let Some(dsk_idx) = state.pad_map().dist_dsk_of(idx) {
                         let enabled =
                             state.dsk_enabled[dsk_idx].load(std::sync::atomic::Ordering::Relaxed);
                         if enabled {
@@ -719,7 +717,8 @@ impl PipelineManager {
         } else {
             16.0 / 9.0
         };
-        let src_aspects = self.vision_mixer_source_aspects(block_instance_id, state.num_inputs);
+        let src_aspects =
+            self.vision_mixer_source_aspects(block_instance_id, state.pad_map().capacity);
 
         let on_pgm = state.pgm_pip() == Some(pip_idx);
         let on_pvw = state.pvw_pip() == Some(pip_idx);
@@ -734,7 +733,7 @@ impl PipelineManager {
             let r = &state.layout.pvw_rect;
             (r.x as i32, r.y as i32, r.w as i32, r.h as i32)
         };
-        let pip_tile_base = 2 * state.num_inputs + 1 + pip_idx * state.num_inputs;
+        let pip_tile_base = state.pad_map().mv_pip_base(pip_idx);
 
         let pgm_w = state.pgm_w.max(1) as f64;
         let tile_underlay = state.mv_pip_underlay_base(pip_idx).map(|base| UnderlayCtx {
@@ -786,7 +785,7 @@ impl PipelineManager {
                 Some(pip_idx),
                 None,
                 pvw_rect,
-                state.num_inputs + 1,
+                state.pad_map().mv_pvw_base(),
                 vision_mixer::MV_BIG_DISPLAY_ZORDER,
                 vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
                 src_aspect,
@@ -847,7 +846,7 @@ impl PipelineManager {
                 Some(pip_idx),
                 None,
                 pvw_rect,
-                state.num_inputs + 1,
+                state.pad_map().mv_pvw_base(),
                 vision_mixer::MV_BIG_DISPLAY_ZORDER,
                 vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
                 src_aspect,
@@ -875,7 +874,7 @@ impl PipelineManager {
                 &ctrl,
                 &self.pipeline,
                 &transforms,
-                state.num_inputs,
+                state.pad_map().capacity,
                 pip_tile_base,
                 &old_t,
                 &new_t,
@@ -894,7 +893,7 @@ impl PipelineManager {
                 &ctrl,
                 &self.pipeline,
                 &transforms,
-                state.num_inputs,
+                state.pad_map().capacity,
                 0,
                 &old_p,
                 &new_p,
@@ -917,8 +916,8 @@ impl PipelineManager {
                 &ctrl,
                 &self.pipeline,
                 &transforms,
-                state.num_inputs,
-                state.num_inputs + 1,
+                state.pad_map().capacity,
+                state.pad_map().mv_pvw_base(),
                 &old_p,
                 &new_p,
                 ZONE_MORPH_MS,
@@ -951,7 +950,7 @@ impl PipelineManager {
         };
         (0..num_inputs)
             .map(|i| {
-                let pad = find_pad(mixer, &format!("sink_{}", i))?;
+                let pad = find_pad(mixer, &PadMap::sink(i))?;
                 let (w, h) = crate::gst::crop::source_dims_for_pad(&pad)?;
                 Some(strom_types::vision_mixer::InputResolution {
                     width: w as u32,
@@ -1015,8 +1014,9 @@ impl PipelineManager {
         // transitioning between source kinds. Clear control bindings first
         // so the alpha=0 actually takes effect (a stale binding from a
         // previous morph would otherwise override).
-        for i in 0..state.num_inputs {
-            if let Some(pad) = find_pad(mv_comp, &format!("sink_{}", state.num_inputs + 1 + i)) {
+        let pm = state.pad_map();
+        for i in 0..pm.capacity {
+            if let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(i))) {
                 clear_layout_bindings(&pad);
                 pad.set_property("alpha", 0.0f64);
             }
@@ -1051,8 +1051,8 @@ impl PipelineManager {
         });
         apply_pip_layout_to_region(
             mv_comp,
-            state.num_inputs + 1,
-            state.num_inputs,
+            state.pad_map().mv_pvw_base(),
+            state.pad_map().capacity,
             (r.x as i32, r.y as i32, r.w as i32, r.h as i32),
             bg,
             &zones,
@@ -1060,7 +1060,7 @@ impl PipelineManager {
             vision_mixer::MV_BIG_DISPLAY_ZORDER,
             vision_mixer::MV_PVW_PIP_OVERLAY_ZORDER,
             src_aspect,
-            &self.vision_mixer_source_aspects(block_instance_id, state.num_inputs),
+            &self.vision_mixer_source_aspects(block_instance_id, state.pad_map().capacity),
             pvw_underlay,
         );
 

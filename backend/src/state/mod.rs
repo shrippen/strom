@@ -2434,12 +2434,10 @@ impl AppState {
             drop(flows);
 
             if is_vision_mixer {
-                let num_inputs = self.get_vision_mixer_num_inputs(flow_id, block_id).await;
                 let new_pvw = old_pgm;
                 let pipelines = self.inner.pipelines.read().await;
                 if let Some(manager) = pipelines.get(flow_id) {
-                    let _ = manager
-                        .update_vision_mixer_after_take(block_id, new_pgm, new_pvw, num_inputs);
+                    let _ = manager.update_vision_mixer_after_take(block_id, new_pgm, new_pvw);
                 }
                 drop(pipelines);
 
@@ -2590,7 +2588,7 @@ impl AppState {
         flows
             .get(flow_id)
             .and_then(|flow| flow.blocks.iter().find(|b| b.id == block_instance_id))
-            .map(|block| vm_props::parse_num_inputs(&block.properties))
+            .map(|block| vm_props::num_inputs_or_max(&block.properties))
             .unwrap_or(4)
     }
 

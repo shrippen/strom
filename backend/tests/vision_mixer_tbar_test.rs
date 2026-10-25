@@ -1018,7 +1018,7 @@ async fn a_cut_to_and_from_a_pip_shows_no_black() {
             pad.disconnect(id);
         }
         manager
-            .update_vision_mixer_after_take(BLOCK, new_pgm, old_pgm, 2)
+            .update_vision_mixer_after_take(BLOCK, new_pgm, old_pgm)
             .expect("swap");
         let states = seen.lock().unwrap().clone();
         assert!(

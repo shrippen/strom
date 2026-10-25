@@ -258,7 +258,6 @@ fn pull(appsink: &gstreamer_app::AppSink) -> gstreamer::Sample {
 /// A running vision mixer flow with counters on the overlay upload.
 struct Running {
     block_id: &'static str,
-    num_inputs: usize,
     manager: PipelineManager,
     appsink: gstreamer_app::AppSink,
     /// Frames entering `glupload_overlay`.
@@ -282,7 +281,6 @@ struct Window {
 
 impl Running {
     fn start(block_id: &'static str, inputs: Inputs) -> Running {
-        let num_inputs = inputs.count;
         let main_loop = gstreamer::glib::MainLoop::new(None, false);
         let main_loop_thread = {
             let ml = main_loop.clone();
@@ -348,7 +346,6 @@ impl Running {
             .unwrap();
         let running = Running {
             block_id,
-            num_inputs,
             manager,
             appsink,
             uploads,
@@ -414,7 +411,7 @@ impl Running {
             .trigger_transition(self.block_id, 0, 1, "cut", 0)
             .expect("cut");
         self.manager
-            .update_vision_mixer_after_take(self.block_id, new_pgm, old_pgm, self.num_inputs)
+            .update_vision_mixer_after_take(self.block_id, new_pgm, old_pgm)
             .expect("multiview update after the cut");
         let mut frames = 0;
         loop {
@@ -598,7 +595,7 @@ async fn tally_follows_a_cut_on_the_same_frame_with_late_inputs() {
         .expect("cut");
     running
         .manager
-        .update_vision_mixer_after_take(running.block_id, new_pgm, old_pgm, 2)
+        .update_vision_mixer_after_take(running.block_id, new_pgm, old_pgm)
         .expect("multiview update after the cut");
     let mut picture_at = None;
     let mut tally_at = None;
