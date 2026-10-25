@@ -25,6 +25,10 @@ pub const DYNAMIC_INPUTS_PROPERTY: &str = "dynamic_inputs";
 /// cost nothing but pad indices; the real limit is what the machine can mix.
 pub const MAX_INPUT_CAPACITY: usize = 128;
 
+/// Highest `max_time_ms` of a dynamic input's inter channel (the Inter
+/// Input block offers up to 2000 ms).
+pub const MAX_INTER_MAX_TIME_MS: u64 = 10_000;
+
 /// Where a dynamic input's video comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
@@ -89,6 +93,12 @@ pub struct VisionMixerInputs {
     pub num_static: usize,
     /// Every input the mixer has, ascending by index.
     pub inputs: Vec<VisionMixerInputInfo>,
+    /// Stored dynamic inputs that failed to build when the flow started
+    /// (GStreamer refused them). They stay stored and are tried
+    /// again at the next start; removing one drops it, adding an input at
+    /// its index replaces it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unrestored: Vec<DynamicInput>,
 }
 
 /// Parse the `dynamic_inputs` property. An empty string is no inputs.
@@ -120,6 +130,15 @@ pub fn validate_dynamic_inputs(
         match &input.source {
             DynamicInputSource::Inter { channel, .. } if channel.trim().is_empty() => {
                 return Err(format!("dynamic input {} has no channel", input.index));
+            }
+            DynamicInputSource::Inter {
+                max_time_ms: Some(ms),
+                ..
+            } if *ms > MAX_INTER_MAX_TIME_MS => {
+                return Err(format!(
+                    "dynamic input {}: max_time_ms {} is above {}",
+                    input.index, ms, MAX_INTER_MAX_TIME_MS
+                ));
             }
             DynamicInputSource::Inter { .. } => {}
         }
@@ -168,5 +187,20 @@ mod tests {
         assert!(validate_dynamic_inputs(&[inter(4, "a")], 2, 4).is_err());
         assert!(validate_dynamic_inputs(&[inter(2, "a"), inter(2, "b")], 2, 4).is_err());
         assert!(validate_dynamic_inputs(&[inter(2, " ")], 2, 4).is_err());
+    }
+
+    #[test]
+    fn the_buffer_time_is_bounded() {
+        let with = |ms| DynamicInput {
+            index: 2,
+            source: DynamicInputSource::Inter {
+                channel: "a".into(),
+                max_time_ms: Some(ms),
+            },
+            label: None,
+        };
+        assert!(validate_dynamic_inputs(&[with(MAX_INTER_MAX_TIME_MS)], 2, 4).is_ok());
+        // Large enough to overflow in nanoseconds.
+        assert!(validate_dynamic_inputs(&[with(20_000_000_000_000)], 2, 4).is_err());
     }
 }

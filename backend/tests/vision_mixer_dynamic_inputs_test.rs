@@ -29,6 +29,8 @@ const NUM_INPUTS: usize = 2;
 const MAX_INPUTS: usize = 6;
 const NUM_PIPS: usize = 1;
 const NUM_DSK: usize = 1;
+/// Longest gap between two program frames at the sink (a frame is 33 ms).
+const MAX_ARRIVAL_GAP: Duration = Duration::from_millis(400);
 
 fn elem(id: &str, ty: &str, props: Vec<(&str, PV)>) -> strom_types::Element {
     strom_types::Element {
@@ -141,6 +143,9 @@ fn inter(channel: &str) -> AddVisionMixerInputRequest {
 #[derive(Default)]
 struct Program {
     pts: Vec<u64>,
+    /// When each buffer arrived: a stalled mixer still stamps its frames
+    /// evenly, but they arrive late.
+    arrivals: Vec<std::time::Instant>,
     caps_events: usize,
 }
 
@@ -219,6 +224,7 @@ impl Rig {
                         Some(gst::PadProbeData::Buffer(b)) => {
                             if let Some(pts) = b.pts() {
                                 p.pts.push(pts.nseconds());
+                                p.arrivals.push(std::time::Instant::now());
                             }
                         }
                         Some(gst::PadProbeData::Event(e)) if e.type_() == gst::EventType::Caps => {
@@ -331,6 +337,19 @@ impl Rig {
             "{what}: program timestamps went backwards"
         );
         assert_eq!(p.caps_events, 0, "{what}: the program renegotiated");
+        // The sink plays in sync, so frames arrive at the frame rate. Allow
+        // for a loaded machine, not for a stalled mixer.
+        let stall = p
+            .arrivals
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .max()
+            .unwrap_or_default();
+        assert!(
+            stall <= MAX_ARRIVAL_GAP,
+            "{what}: the program stalled for {} ms",
+            stall.as_millis()
+        );
     }
 
     async fn stop(self) {
@@ -405,6 +424,11 @@ async fn comes_and_goes(rig: Rig) {
         .static_pad(&PadMap::sink(Rig::pad_map().dist_input(index)))
         .unwrap();
     assert!(pad.property::<f64>("alpha") > 0.99, "not on program");
+    assert_eq!(
+        (pad.property::<i32>("width"), pad.property::<i32>("height")),
+        (W as i32, H as i32),
+        "the cut did not fit the input to program"
+    );
 
     // On program: refused. Back to a static input, then it goes.
     let message = conflict(rig.remove(index).await);
@@ -568,6 +592,55 @@ async fn a_removal_that_would_take_something_off_air_is_refused() {
     }
 
     rig.assert_program_unbroken("refused removals");
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_t_bar_stays_put_while_inputs_come_and_go() {
+    let rig = Rig::start().await;
+    let cam = rig.channel("dyn-cam-tbar");
+    let _cam = producer(&cam, "snow");
+    // A dynamic input that is there before the bar moves, removed under it.
+    let other = rig.add(inter(&cam)).await.unwrap();
+    rig.wait_for_video(other).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    rig.state
+        .select_vision_mixer_preview(&rig.flow_id, BLOCK, 1)
+        .await
+        .unwrap();
+    rig.state
+        .hold_vision_mixer_transition(&rig.flow_id, BLOCK, "fade", 0.5)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mixer = rig.element(&Rig::id("mixer")).await.unwrap();
+    let pm = Rig::pad_map();
+    let alphas = || {
+        [0, 1].map(|i| {
+            mixer
+                .static_pad(&PadMap::sink(pm.dist_input(i)))
+                .unwrap()
+                .property::<f64>("alpha")
+        })
+    };
+    let held = alphas();
+    assert!(
+        held.iter().all(|a| *a > 0.01),
+        "the bar does not mix 0 and 1: {held:?}"
+    );
+
+    // An input comes (its caps arrive, the multiview re-flows) and goes.
+    let index = rig.add(inter(&cam)).await.unwrap();
+    rig.wait_for_video(index).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(alphas(), held, "adding an input moved the held bar");
+    rig.remove(index).await.unwrap();
+    rig.remove(other).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(alphas(), held, "removing an input moved the held bar");
+
+    rig.assert_program_unbroken("held T-bar");
     rig.stop().await;
 }
 

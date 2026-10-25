@@ -653,9 +653,10 @@ inputs in free slots) is live and takes effect immediately.
 
 With **Input Slots** (`max_inputs`) above **Number of Inputs**, the mixer
 reserves the extra slots and inputs can be added to and removed from it while
-it runs, without a restart and without a glitch on program, audio or the
-outputs (CPU and CUDA backends; the OpenGL backend refuses `max_inputs` for
-now):
+it runs, without a restart and without interrupting program, audio or the
+outputs (CPU and CUDA backends; with **Auto** a mixer with free slots picks
+CUDA or the CPU instead of OpenGL, and asking for OpenGL with free slots fails
+for now):
 
 ```text
 GET    /api/flows/{flow}/blocks/{block}/inputs           the inputs and slots
@@ -665,13 +666,18 @@ DELETE /api/flows/{flow}/blocks/{block}/inputs/{index}
 
 A dynamic input is fed from an inter channel (an Inter Output block's
 channel), so it needs no flow link. It gets a multiview tile (the grid
-re-flows), can go on preview and program and into PiPs like any input, and
-is stored in the block property `dynamic_inputs`, so a restart builds it
-again. A removal is refused (409) while the input is on program or preview,
-part of a PiP, or a transition runs. Inputs `0 .. Number of Inputs` are
-static (flow links) and cannot be removed. Dynamic inputs have no audio input
-and no VU meter. Clients learn of changes from the `VisionMixerInputsChanged`
-event and `active_inputs` in the mixer state.
+re-flows), can go on preview and program and into PiPs like any input, and is
+stored in the block property `dynamic_inputs`, so a restart builds it again. A
+removal is refused (409) while the input is on program or preview, part of a
+PiP, or a transition runs. Inputs `0 .. Number of Inputs` are static (flow
+links) and cannot be removed. Dynamic inputs have no audio input and no VU
+meter. Set an **Output Pixel Format** (`output_format`) when inputs of
+different pixel formats come and go: without one the mixer picks its format
+from its inputs and may renegotiate program when one arrives. A stored input
+that does not build at the start (GStreamer refused it) is listed under
+`unrestored`, stays stored and is tried again at the next start; removing it
+drops it. Clients learn of changes from the `VisionMixerInputsChanged` event
+and `active_inputs` in the mixer state.
 
 ---
 

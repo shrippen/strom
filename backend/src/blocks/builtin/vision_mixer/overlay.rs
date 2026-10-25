@@ -109,11 +109,19 @@ pub struct VisionMixerOverlayState {
     /// The dynamic inputs and what building one needs. Its lock also
     /// serialises adding and removing inputs.
     pub(crate) dynamic: std::sync::Mutex<super::dynamic::DynamicInputs>,
+    /// Held from checking an input until it is stored on preview or in a
+    /// PiP, and by a removal from freeing the slot until it has checked
+    /// that nothing uses the input: a removal cannot slip in between.
+    pub(crate) selection_lock: std::sync::Mutex<()>,
     /// Whether Fade to Black is active.
     pub ftb_active: AtomicBool,
     /// An input changed size while a take or FTB was animating the layout,
     /// so the layout still has to be re-fitted once the animation is over.
     pub layout_refit_pending: AtomicBool,
+    /// The set of inputs changed (a dynamic input came or went), so the
+    /// multiview has to re-fit its thumbnails. The dist mixer does not: an
+    /// added input starts hidden there and a removed one was off air.
+    pub mv_relayout_pending: AtomicBool,
     /// The effect a held T-bar last showed (strom remembers no more of the
     /// hold than this): a different one rests the pads first.
     pub tbar_effect: std::sync::Mutex<Option<String>>,
@@ -281,9 +289,11 @@ impl VisionMixerOverlayState {
             active: (0..capacity)
                 .map(|i| AtomicBool::new(i < num_static))
                 .collect(),
+            selection_lock: std::sync::Mutex::new(()),
             dynamic: std::sync::Mutex::new(Default::default()),
             ftb_active: AtomicBool::new(false),
             layout_refit_pending: AtomicBool::new(false),
+            mv_relayout_pending: AtomicBool::new(false),
             tbar_effect: std::sync::Mutex::new(None),
             overlay_alpha: AtomicU64::new(1.0f64.to_bits()),
             dsk_enabled: (0..num_dsk_inputs)
@@ -422,21 +432,40 @@ impl VisionMixerOverlayState {
     /// input; `None` (caps not negotiated) is treated as "no news" rather
     /// than a change, so a not-yet-connected input doesn't suppress or force
     /// refreshes.
-    pub fn update_input_dims(&self, dims: &[Option<(i32, i32)>]) -> bool {
-        let mut changed = false;
-        for (slot, d) in self.input_dims.iter().zip(dims) {
+    pub fn update_input_dims(&self, dims: &[Option<(i32, i32)>]) -> Vec<usize> {
+        let mut changed = Vec::new();
+        for (i, (slot, d)) in self.input_dims.iter().zip(dims).enumerate() {
             let Some((w, h)) = d else { continue };
             let packed = ((*w as u64) << 32) | (*h as u64 & 0xFFFF_FFFF);
             if slot.swap(packed, Ordering::Relaxed) != packed {
-                changed = true;
+                changed.push(i);
             }
         }
         changed
     }
 
+    /// Whether input `i` is part of what program shows: the program input,
+    /// or the background or a zone source of the PiP on program.
+    pub fn on_program(&self, i: usize) -> bool {
+        match self.pgm_pip() {
+            Some(p) => {
+                self.pip_bg_input(p) == Some(i)
+                    || self.pip_zones(p).iter().any(|z| z.sources.contains(&i))
+            }
+            None => self.pgm_input() == Some(i),
+        }
+    }
+
     /// Sink pad indices of this mixer's compositors.
     pub fn pad_map(&self) -> vision_mixer::PadMap {
         vision_mixer::PadMap::new(self.capacity, self.num_dsk_inputs, self.num_pips)
+    }
+
+    /// Take [`Self::selection_lock`].
+    pub fn lock_selection(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.selection_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether slot `input` holds an input (static, or a dynamic one that

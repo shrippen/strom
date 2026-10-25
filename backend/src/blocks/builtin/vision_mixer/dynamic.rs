@@ -55,6 +55,10 @@ pub(crate) struct DynamicInputs {
     /// has no dynamic inputs yet.
     pub(crate) spec: Option<InputSpec>,
     slots: BTreeMap<usize, Slot>,
+    /// Stored inputs that failed to build at the flow's start. They stay
+    /// stored (and are tried again at the next start) until their slot
+    /// gets an input or they are removed.
+    unrestored: BTreeMap<usize, DynamicInput>,
 }
 
 struct Slot {
@@ -66,7 +70,24 @@ struct Slot {
 impl DynamicInputs {
     /// The dynamic inputs, ascending by index (what `dynamic_inputs` stores).
     pub(crate) fn inputs(&self) -> Vec<DynamicInput> {
-        self.slots.values().map(|s| s.input.clone()).collect()
+        let mut inputs: Vec<DynamicInput> = self
+            .slots
+            .values()
+            .map(|s| s.input.clone())
+            .chain(self.unrestored.values().cloned())
+            .collect();
+        inputs.sort_by_key(|i| i.index);
+        inputs
+    }
+
+    /// Stored inputs that failed to build at the flow's start.
+    pub(crate) fn unrestored(&self) -> Vec<DynamicInput> {
+        self.unrestored.values().cloned().collect()
+    }
+
+    /// Keep `input`, which failed to build at the flow's start, stored.
+    pub(crate) fn keep_unrestored(&mut self, input: DynamicInput) {
+        self.unrestored.insert(input.index, input);
     }
 
     /// The source of dynamic input `index`, if there is one.
@@ -136,7 +157,7 @@ pub(crate) fn add_input(
         }
         Some(i) => i,
         None => (first..capacity)
-            .find(|&i| !state.is_active(i))
+            .find(|&i| !state.is_active(i) && !dynamic.unrestored.contains_key(&i))
             .ok_or_else(|| {
                 DynamicInputError::Conflict(format!("all {} input slots are taken", capacity))
             })?,
@@ -212,6 +233,7 @@ pub(crate) fn add_input(
         }
     }
 
+    dynamic.unrestored.remove(&index);
     dynamic.slots.insert(
         index,
         Slot {
@@ -253,6 +275,15 @@ pub(crate) fn remove_input(
             index
         )));
     };
+    // A stored input that did not build at the start: removing it only
+    // takes it off the stored list.
+    if let Some(input) = dynamic.unrestored.remove(&index) {
+        info!(
+            "Vision mixer {}: dropped stored input {} that had not built",
+            block_id, index
+        );
+        return Ok(input);
+    }
     if !dynamic.slots.contains_key(&index) {
         return Err(DynamicInputError::NotFound(format!(
             "input {} is not a dynamic input",
@@ -262,12 +293,16 @@ pub(crate) fn remove_input(
     let mixer = by_name(pipeline, &spec.id("mixer"))?;
     let mv_comp = by_name(pipeline, &spec.id("mv_comp"))?;
 
-    // Free the slot first: from here on no selection, take or PiP change
-    // can pick the input. Then check that nothing uses it right now.
-    state.set_active(index, false);
-    if let Err(e) = check_unused(state, &mixer, &spec.pm, index) {
-        state.set_active(index, true);
-        return Err(e);
+    // Free the slot first: from here on no selection or PiP change can
+    // pick the input (one that checked it before stores it before the lock
+    // is ours). Then check that nothing uses it right now.
+    {
+        let _selection = state.lock_selection();
+        state.set_active(index, false);
+        if let Err(e) = check_unused(state, &mixer, &spec.pm, index) {
+            state.set_active(index, true);
+            return Err(e);
+        }
     }
     state.set_layout(spec.mv_layout(&state.active_inputs()));
 
@@ -347,7 +382,9 @@ fn build_chain(
         .property("producer-name", channel)
         .property(
             "max-time",
-            max_time_ms.unwrap_or(DEFAULT_MAX_TIME_MS) * 1_000_000,
+            max_time_ms
+                .unwrap_or(DEFAULT_MAX_TIME_MS)
+                .saturating_mul(1_000_000),
         )
         .build()
         .map_err(|e| format!("intersrc: {}", e))?;
@@ -425,6 +462,7 @@ fn assemble(
 /// elements and pads are skipped, so this also undoes a half-built add.
 fn teardown(pipeline: &gst::Pipeline, spec: &InputSpec, index: usize, names: &[String]) {
     let elements: Vec<gst::Element> = names.iter().filter_map(|n| pipeline.by_name(n)).collect();
+    crate::gst::underlay::quiesce_underlay_sources(&elements);
     for element in &elements {
         if element.set_state(gst::State::Null).is_err() {
             warn!("{}: could not stop", element.name());

@@ -349,6 +349,35 @@ pub(crate) fn quiesce_underlay_restarts(pipeline: &gst::Element) {
     }
 }
 
+/// Stop restarting the underlay sources among `elements`, which are about
+/// to leave a running pipeline, and wait for restarts already under way.
+/// Call before stopping them: a restart running meanwhile would bring a
+/// stopped source back to its pipeline's state.
+pub(crate) fn quiesce_underlay_sources(elements: &[gst::Element]) {
+    {
+        let mut stopping = stopping();
+        stopping.retain(|w| w.upgrade().is_some());
+        stopping.extend(elements.iter().map(|e| e.downgrade()));
+    }
+    let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+    loop {
+        let busy = restarts()
+            .iter()
+            .any(|(w, _)| w.upgrade().is_some_and(|src| elements.contains(&src)));
+        if !busy {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "Underlay restarts still running {}s into a removal",
+                QUIESCE_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Slack past the compositor's output position for a restarted frame. A held
 /// pad drops a frame that ends before its current one, and the current one
 /// may have been taken up to an output frame ahead of the position.
@@ -394,7 +423,7 @@ fn restart_underlay_src(src: &gst::Element) -> bool {
     let Some(parent) = src.parent().and_then(|p| p.downcast::<gst::Element>().ok()) else {
         return false;
     };
-    if is_stopping(&parent) {
+    if is_stopping(&parent) || is_stopping(src) {
         return false;
     }
     let (_, current, pending) = parent.state(gst::ClockTime::ZERO);

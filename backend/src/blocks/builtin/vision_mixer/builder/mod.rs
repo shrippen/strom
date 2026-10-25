@@ -194,7 +194,22 @@ impl BlockBuilder for VisionMixerBuilder {
                 _ => None,
             })
             .unwrap_or("auto");
-        let backend = super::elements::select_backend(pref)?;
+        let mut backend = super::elements::select_backend(pref)?;
+        // Free slots need runtime inputs, which the OpenGL mixer has not
+        // got yet: "auto" picks CUDA or the CPU instead; asking for "gpu"
+        // fails below.
+        if backend == CompositorBackend::OpenGL && capacity > num_inputs && pref != "gpu" {
+            backend = if gst::ElementFactory::find(super::elements::CUDA_COMPOSITOR).is_some() {
+                CompositorBackend::Cuda
+            } else {
+                CompositorBackend::Software
+            };
+            info!(
+                "Vision mixer: max_inputs {} needs dynamic inputs, using the {:?} backend \
+                 instead of OpenGL",
+                capacity, backend
+            );
+        }
         if backend == CompositorBackend::OpenGL && capacity > num_inputs {
             return Err(BlockBuildError::InvalidProperty(format!(
                 "max_inputs {} needs the CPU or CUDA backend: the OpenGL mixer has no \

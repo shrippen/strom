@@ -16072,6 +16072,13 @@
             "type": "integer",
             "description": "Static inputs (`num_inputs`): indices below this cannot be removed.",
             "minimum": 0
+          },
+          "unrestored": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicInput"
+            },
+            "description": "Stored dynamic inputs that failed to build when the flow started\n(GStreamer refused them). They stay stored and are tried\nagain at the next start; removing one drops it, adding an input at\nits index replaces it."
           }
         }
       },

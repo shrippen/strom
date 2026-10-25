@@ -92,8 +92,9 @@ pub fn install_caps_probes(
     );
 }
 
-/// Re-fit every pad after the set of inputs changed (a dynamic input came or
-/// went): the thumbnails move to the new layout. Runs on the main loop like
+/// Re-fit the multiview after the set of inputs changed (a dynamic input
+/// came or went): the thumbnails move to the new layout. The dist mixer is
+/// left alone, so a held T-bar or a running take on program is untouched. Runs on the main loop like
 /// the caps-driven refreshes, so the two never interleave.
 pub(crate) fn schedule_relayout(
     flow_id: FlowId,
@@ -102,7 +103,7 @@ pub(crate) fn schedule_relayout(
     mv_comp: &gst::Element,
 ) {
     if let Some(state) = overlay::get_overlay_state(&flow_id, block_id) {
-        state.layout_refit_pending.store(true, Ordering::Relaxed);
+        state.mv_relayout_pending.store(true, Ordering::Relaxed);
     }
     let block_id = block_id.to_string();
     let mixer_weak = mixer.downgrade();
@@ -148,8 +149,16 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     // refreshing on each of those events would clear control bindings and
     // kill the very animation producing them. Source dims are read upstream
     // of videocrop, so crop-induced caps events never count as changes.
-    let dims_changed = state.update_input_dims(&dims);
-    if !dims_changed && !state.layout_refit_pending.load(Ordering::Relaxed) {
+    let changed = state.update_input_dims(&dims);
+    // The dist mixer only re-fits for a size change of what program shows:
+    // takes and the T-bar fit their inputs themselves, and re-applying the
+    // layout would rest a held T-bar (an input coming, going or changing
+    // size off air must not touch program).
+    let dist_needed = state.layout_refit_pending.load(Ordering::Relaxed)
+        || changed.iter().any(|&i| state.on_program(i));
+    let mv_needed =
+        dist_needed || !changed.is_empty() || state.mv_relayout_pending.load(Ordering::Relaxed);
+    if !mv_needed {
         return;
     }
 
@@ -164,8 +173,12 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     let mv_busy = mv_animation.is_some();
     state
         .layout_refit_pending
-        .store(dist_busy || mv_busy, Ordering::Relaxed);
-    let retry = [dist_animation, mv_animation].into_iter().flatten().max();
+        .store(dist_needed && dist_busy, Ordering::Relaxed);
+    state.mv_relayout_pending.store(mv_busy, Ordering::Relaxed);
+    let retry = [dist_animation.filter(|_| dist_needed), mv_animation]
+        .into_iter()
+        .flatten()
+        .max();
     if let Some(wait) = retry {
         refit_after(flow_id, block_id, mixer, mv_comp, wait + REFIT_MARGIN);
     }
@@ -198,7 +211,7 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     });
 
     // --- Dist compositor (PGM). ---
-    if !dist_busy {
+    if dist_needed && !dist_busy {
         if let Some(p) = state.pgm_pip() {
             apply_pip_layout_to_region(
                 mixer,

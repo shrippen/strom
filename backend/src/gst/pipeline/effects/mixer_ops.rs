@@ -50,6 +50,8 @@ impl PipelineManager {
 
         let pm = state.pad_map();
 
+        // Until the input is stored on preview, it cannot be removed.
+        let _selection = state.lock_selection();
         // Validate first — don't mutate any state until we know we can complete.
         if input >= num_inputs || !state.is_active(input) {
             return Err(PipelineError::InvalidProperty {
@@ -568,6 +570,8 @@ impl PipelineManager {
                 ),
             });
         }
+        // Until the sources are stored in the PiP, none can be removed.
+        let _selection = state.lock_selection();
 
         // Validate bg + zone sources: indices must be in range, must not
         // overlap each other, must not equal bg, and must fit the zone's

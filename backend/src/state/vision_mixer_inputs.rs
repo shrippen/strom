@@ -94,15 +94,20 @@ impl AppState {
                 let index = input.index;
                 let request = AddVisionMixerInputRequest {
                     index: Some(index),
-                    source: input.source,
-                    label: input.label,
+                    source: input.source.clone(),
+                    label: input.label.clone(),
                 };
                 match dynamic::add_input(manager.pipeline(), &state, flow.id, &block.id, request) {
                     Ok(_) => info!("Vision mixer {}: restored input {}", block.id, index),
-                    Err(e) => warn!(
-                        "Vision mixer {}: could not restore input {}: {}",
-                        block.id, index, e
-                    ),
+                    Err(e) => {
+                        warn!(
+                            "Vision mixer {}: could not restore input {}: {}",
+                            block.id, index, e
+                        );
+                        if let Ok(mut d) = state.dynamic.lock() {
+                            d.keep_unrestored(input);
+                        }
+                    }
                 }
             }
             drop(pipelines);
@@ -184,9 +189,11 @@ fn describe(state: &VisionMixerOverlayState) -> VisionMixerInputs {
             source: dynamic.as_ref().ok().and_then(|d| d.source(index)),
         })
         .collect();
+    let unrestored = dynamic.as_ref().map(|d| d.unrestored()).unwrap_or_default();
     VisionMixerInputs {
         capacity: state.capacity,
         num_static: state.num_static,
         inputs,
+        unrestored,
     }
 }
