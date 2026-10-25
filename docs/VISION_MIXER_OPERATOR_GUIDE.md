@@ -593,6 +593,7 @@ Stinger takes also emit `StingerCued`, `StingerStarted`,
 |---|---|
 | Backend | Auto (GPU first, fall back to CPU) |
 | Number of inputs | 4 |
+| Input slots (`max_inputs`) | 0 (no slots beyond the inputs) |
 | Number of DSK inputs | 0 |
 | Number of PiPs | 0 |
 | PGM resolution | 1920×1080 |
@@ -635,18 +636,42 @@ Stinger takes also emit `StingerCued`, `StingerStarted`,
 
 | | Min | Max |
 |---|---|---|
-| Video inputs | 2 | 16 |
+| Video inputs | 2 | 32 |
+| Input slots (`max_inputs`, static + dynamic inputs) | Number of inputs | 128 |
 | DSK channels | 0 | 4 |
 | PiP compositions | 0 | 4 |
 | Overlay sources per PiP | 0 | 15 |
 | Transition duration | 0 ms | 60 000 ms |
 
-Input, DSK and PiP counts, resolutions, framerates, backend and Shader FX
-are **construction-time** properties — changing them requires restarting
-the flow. Everything else (PVW/PGM
-selection, transitions, DSK toggles, PiP configuration, overlay alpha,
-input labels)
-is live and takes effect immediately.
+Input, DSK and PiP counts, input slots, resolutions, framerates, backend
+and Shader FX are **construction-time** properties — changing them requires
+restarting the flow. Everything else (PVW/PGM selection, transitions, DSK
+toggles, PiP configuration, overlay alpha, input labels, adding and removing
+inputs in free slots) is live and takes effect immediately.
+
+### 9.1 Inputs added while the flow runs
+
+With **Input Slots** (`max_inputs`) above **Number of Inputs**, the mixer
+reserves the extra slots and inputs can be added to and removed from it while
+it runs, without a restart and without a glitch on program, audio or the
+outputs (CPU and CUDA backends; the OpenGL backend refuses `max_inputs` for
+now):
+
+```text
+GET    /api/flows/{flow}/blocks/{block}/inputs           the inputs and slots
+POST   /api/flows/{flow}/blocks/{block}/inputs           {"source": {"type": "inter", "channel": "<producer>"}, "index": 5, "label": "Guest"}
+DELETE /api/flows/{flow}/blocks/{block}/inputs/{index}
+```
+
+A dynamic input is fed from an inter channel (an Inter Output block's
+channel), so it needs no flow link. It gets a multiview tile (the grid
+re-flows), can go on preview and program and into PiPs like any input, and
+is stored in the block property `dynamic_inputs`, so a restart builds it
+again. A removal is refused (409) while the input is on program or preview,
+part of a PiP, or a transition runs. Inputs `0 .. Number of Inputs` are
+static (flow links) and cannot be removed. Dynamic inputs have no audio input
+and no VU meter. Clients learn of changes from the `VisionMixerInputsChanged`
+event and `active_inputs` in the mixer state.
 
 ---
 

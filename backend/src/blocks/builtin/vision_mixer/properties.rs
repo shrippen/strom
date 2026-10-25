@@ -1,6 +1,7 @@
 //! Property parsing helpers for vision mixer block.
 
 use std::collections::HashMap;
+use strom_types::vision_mixer;
 use strom_types::vision_mixer::{
     Source, DEFAULT_DSK_INPUTS, DEFAULT_NUM_INPUTS, DEFAULT_NUM_PIPS, DEFAULT_SHOW_VU_METERS,
     MAX_DSK_INPUTS, MAX_NUM_INPUTS, MAX_NUM_PIPS, MIN_NUM_INPUTS,
@@ -107,6 +108,63 @@ pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<u
 /// The build itself rejects it.
 pub fn num_inputs_or_max(properties: &HashMap<String, PropertyValue>) -> usize {
     parse_num_inputs(properties).unwrap_or(MAX_NUM_INPUTS)
+}
+
+/// Parse the pad capacity (`max_inputs`) for a mixer with `num_inputs`
+/// static inputs. Missing or `0` means `num_inputs` (no free slots). Below
+/// `num_inputs` or above [`vision_mixer::MAX_INPUT_CAPACITY`] is an error.
+pub fn parse_max_inputs(
+    properties: &HashMap<String, PropertyValue>,
+    num_inputs: usize,
+) -> Result<usize, String> {
+    use strom_types::vision_mixer::{MAX_INPUTS_PROPERTY, MAX_INPUT_CAPACITY};
+    let requested = properties
+        .get(MAX_INPUTS_PROPERTY)
+        .and_then(|v| match v {
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if requested == 0 {
+        return Ok(num_inputs);
+    }
+    if requested > MAX_INPUT_CAPACITY as u64 {
+        return Err(format!(
+            "max_inputs is {}, the vision mixer takes at most {} input slots",
+            requested, MAX_INPUT_CAPACITY
+        ));
+    }
+    if (requested as usize) < num_inputs {
+        return Err(format!(
+            "max_inputs is {}, below num_inputs {}",
+            requested, num_inputs
+        ));
+    }
+    Ok(requested as usize)
+}
+
+/// Pad capacity for callers that cannot fail: `max_inputs`, or `num_inputs`
+/// when the property is invalid (the build rejects it).
+pub fn capacity_or_num_inputs(properties: &HashMap<String, PropertyValue>) -> usize {
+    let num_inputs = num_inputs_or_max(properties);
+    parse_max_inputs(properties, num_inputs).unwrap_or(num_inputs)
+}
+
+/// Parse and check the `dynamic_inputs` property against the mixer's slots.
+pub fn parse_dynamic_inputs(
+    properties: &HashMap<String, PropertyValue>,
+    num_inputs: usize,
+    capacity: usize,
+) -> Result<Vec<vision_mixer::DynamicInput>, String> {
+    let inputs = match properties.get(vision_mixer::DYNAMIC_INPUTS_PROPERTY) {
+        Some(PropertyValue::String(s)) => vision_mixer::parse_dynamic_inputs(s)?,
+        None => Vec::new(),
+        Some(_) => return Err("dynamic_inputs must be a JSON string".to_string()),
+    };
+    vision_mixer::validate_dynamic_inputs(&inputs, num_inputs, capacity)?;
+    Ok(inputs)
 }
 
 /// Parse the initial PGM source from block properties.
@@ -228,7 +286,7 @@ pub fn apply_live_label(
         return Err(format!(
             "input {} is beyond the configured {} inputs",
             input + 1,
-            state.num_inputs
+            state.capacity
         ));
     }
     Ok(())

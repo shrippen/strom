@@ -143,7 +143,7 @@ impl PipelineManager {
                 let new_pvw_swap = state.pgm_input();
 
                 let dist_region = (0, 0, canvas_width, canvas_height);
-                let r = &state.layout.pvw_rect;
+                let r = &state.layout().pvw_rect;
                 let pvw_region = (r.x as i32, r.y as i32, r.w as i32, r.h as i32);
                 // Fallback aspect = PGM canvas aspect (typically 16:9), used
                 // for tile-grid cells and for inputs whose caps are unknown.
@@ -167,7 +167,7 @@ impl PipelineManager {
                         .mv_pvw_underlay_base()
                         .map(|base| crate::gst::underlay::UnderlayCtx {
                             base,
-                            scale: state.layout.pvw_rect.w / pgm_w,
+                            scale: state.layout().pvw_rect.w / pgm_w,
                         });
 
                 let old_dist_targets = pads_for_source(
@@ -345,8 +345,8 @@ impl PipelineManager {
 
                     let mv_controller = TransitionController::new(
                         mv_comp.clone(),
-                        state.layout.canvas_width as i32,
-                        state.layout.canvas_height as i32,
+                        state.layout().canvas_width as i32,
+                        state.layout().canvas_height as i32,
                     );
                     mv_controller
                         .animate_pad_transition(

@@ -278,7 +278,7 @@ impl PipelineManager {
         if !self.vision_mixer_fx_available(block_instance_id) {
             return;
         }
-        for i in 0..state.num_inputs {
+        for i in 0..state.capacity {
             if let Some(e) = self
                 .elements
                 .get(&format!("{}:fx_take_{}", block_instance_id, i))

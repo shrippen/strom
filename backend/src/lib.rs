@@ -233,6 +233,15 @@ pub async fn create_app_with_config(
             get(api::flows::get_vision_mixer_state),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/inputs",
+            get(api::vision_mixer_inputs::list_vision_mixer_inputs)
+                .post(api::vision_mixer_inputs::add_vision_mixer_input),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/inputs/{index}",
+            delete(api::vision_mixer_inputs::remove_vision_mixer_input),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/overlay-alpha",
             put(api::flows::set_overlay_alpha),
         )

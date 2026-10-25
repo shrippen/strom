@@ -48,16 +48,18 @@ fn preview_compositor(mv_comp: &gst::Element) -> Option<gst::Element> {
         .by_name(&format!("{}:pvw_comp", block))
 }
 
-/// Every underlay pad as (compositor, sink index, configured border color).
+/// The underlay pads of `inputs` as (compositor, sink index, configured
+/// border color).
 fn underlay_pads(
     state: &VisionMixerOverlayState,
     mixer: &gst::Element,
     mv_comp: &gst::Element,
+    inputs: impl IntoIterator<Item = usize>,
 ) -> Vec<(gst::Element, usize, Option<u32>)> {
     let mut pads = Vec::new();
     let (pgm_pip, pvw_pip) = (state.pgm_pip(), state.pvw_pip());
     let pvw_comp = preview_compositor(mv_comp);
-    for input in 0..state.num_inputs {
+    for input in inputs {
         if let Some(base) = state.dist_underlay_base() {
             let argb = shared_region_argb(state, pgm_pip, pvw_pip, input);
             pads.push((mixer.clone(), base + input, argb));
@@ -89,10 +91,15 @@ fn sink_pad(compositor: &gst::Element, idx: usize) -> Option<gst::Pad> {
     compositor.static_pad(&strom_types::vision_mixer::PadMap::sink(idx))
 }
 
-/// Register every underlay pad (from the element setup, once linked) and
-/// apply the initial zones.
-pub(crate) fn watch(state: &VisionMixerOverlayState, mixer: &gst::Element, mv_comp: &gst::Element) {
-    for (compositor, idx, _) in underlay_pads(state, mixer, mv_comp) {
+/// Register the underlay pads of `inputs` (from the element setup, once
+/// linked, or when a dynamic input is added) and apply the current zones.
+pub(crate) fn watch(
+    state: &VisionMixerOverlayState,
+    mixer: &gst::Element,
+    mv_comp: &gst::Element,
+    inputs: impl IntoIterator<Item = usize>,
+) {
+    for (compositor, idx, _) in underlay_pads(state, mixer, mv_comp, inputs) {
         if let Some(pad) = sink_pad(&compositor, idx) {
             underlay::watch_underlay_pad(&pad);
         }
@@ -109,7 +116,7 @@ pub(crate) fn refresh(
     mixer: &gst::Element,
     mv_comp: &gst::Element,
 ) {
-    for (compositor, idx, argb) in underlay_pads(state, mixer, mv_comp) {
+    for (compositor, idx, argb) in underlay_pads(state, mixer, mv_comp, state.active_inputs()) {
         let Some(pad) = sink_pad(&compositor, idx) else {
             continue;
         };

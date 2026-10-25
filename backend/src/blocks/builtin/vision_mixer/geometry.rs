@@ -92,6 +92,29 @@ pub fn install_caps_probes(
     );
 }
 
+/// Re-fit every pad after the set of inputs changed (a dynamic input came or
+/// went): the thumbnails move to the new layout. Runs on the main loop like
+/// the caps-driven refreshes, so the two never interleave.
+pub(crate) fn schedule_relayout(
+    flow_id: FlowId,
+    block_id: &str,
+    mixer: &gst::Element,
+    mv_comp: &gst::Element,
+) {
+    if let Some(state) = overlay::get_overlay_state(&flow_id, block_id) {
+        state.layout_refit_pending.store(true, Ordering::Relaxed);
+    }
+    let block_id = block_id.to_string();
+    let mixer_weak = mixer.downgrade();
+    let mv_weak = mv_comp.downgrade();
+    gst::glib::idle_add_once(move || {
+        let (Some(mixer), Some(mv_comp)) = (mixer_weak.upgrade(), mv_weak.upgrade()) else {
+            return;
+        };
+        refresh_geometry(flow_id, &block_id, &mixer, &mv_comp);
+    });
+}
+
 /// Read the UNCROPPED source `(width, height)` feeding a sink pad. On the
 /// CPU backend the pad's own caps are post-videocrop; this walks past it.
 fn pad_caps_dims(element: &gst::Element, pad_name: &str) -> Option<(i32, i32)> {
@@ -106,7 +129,7 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     let Some(state) = overlay::get_overlay_state(&flow_id, block_id) else {
         return;
     };
-    let n = state.num_inputs;
+    let n = state.capacity;
     let pm = state.pad_map();
 
     // Per-input UNCROPPED source dims from the dist mixer pads' negotiated
@@ -171,7 +194,7 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     });
     let pvw_underlay = state.mv_pvw_underlay_base().map(|base| UnderlayCtx {
         base,
-        scale: state.layout.pvw_rect.w / pgm_w,
+        scale: state.layout().pvw_rect.w / pgm_w,
     });
 
     // --- Dist compositor (PGM). ---
@@ -211,7 +234,7 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
         let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_thumb(i))) else {
             continue;
         };
-        let (tx, ty, tw, th) = super::layout::thumbnail_pad_position(&state.layout, i);
+        let (tx, ty, tw, th) = super::layout::thumbnail_pad_position(&state.layout(), i);
         let aspect = aspects.get(&i).copied().unwrap_or(fallback);
         let (x, y, w, h) = aspect_fit_rect(tx, ty, tw, th, aspect);
         pad.set_property("xpos", x);
@@ -225,7 +248,7 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     }
 
     // --- Multiview PVW big region. ---
-    let r = &state.layout.pvw_rect;
+    let r = &state.layout().pvw_rect;
     let pvw_region = (r.x as i32, r.y as i32, r.w as i32, r.h as i32);
     if let Some(p) = state.pvw_pip() {
         apply_pip_layout_to_region(
@@ -257,8 +280,9 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     }
 
     // --- Multiview PiP tiles (always rendered). ---
+    let layout = state.layout();
     for p in 0..state.num_pips {
-        let Some(tile) = state.layout.pip_tile_rects.get(p) else {
+        let Some(tile) = layout.pip_tile_rects.get(p) else {
             continue;
         };
         let region = (tile.x as i32, tile.y as i32, tile.w as i32, tile.h as i32);

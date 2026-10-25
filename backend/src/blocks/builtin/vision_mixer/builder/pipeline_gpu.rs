@@ -7,7 +7,7 @@ use strom_types::element::ElementPadRef;
 use strom_types::vision_mixer::PadMap;
 use tracing::info;
 
-use super::super::{elements, layout};
+use super::super::elements;
 use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
 
@@ -38,19 +38,7 @@ pub(super) fn build_gpu_pipeline(
     elems.push((mv_comp_id.clone(), mv_comp));
 
     // Compute multiview layout
-    let source_aspect = if p.pgm_h > 0 {
-        p.pgm_w as f64 / p.pgm_h as f64
-    } else {
-        16.0 / 9.0
-    };
-    let mv_layout = layout::compute_layout(
-        p.mv_w,
-        p.mv_h,
-        p.num_inputs,
-        p.num_pips,
-        source_aspect,
-        p.swap_pvw_pgm,
-    );
+    let mv_layout = p.mv_layout();
 
     // --- Distribution output chain ---
     // queue_post_dist decouples the compositor from downstream processing.
@@ -707,7 +695,7 @@ pub(super) fn build_gpu_pipeline(
             // Border underlays hold a frame only while their border is
             // configured or still visible.
             if num_pips > 0 {
-                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp);
+                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp, 0..num_inputs);
             }
         }));
     }

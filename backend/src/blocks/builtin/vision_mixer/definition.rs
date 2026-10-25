@@ -68,6 +68,26 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Input slots for dynamic inputs
+        ExposedProperty {
+            name: strom_types::vision_mixer::MAX_INPUTS_PROPERTY.to_string(),
+            label: "Input Slots".to_string(),
+            description: format!(
+                "Input slots, for inputs added while the flow runs (CPU and CUDA \
+                 backends; the API's inputs endpoint adds them). 0 = no free slots, \
+                 else at least Number of Inputs, at most {}.",
+                strom_types::vision_mixer::MAX_INPUT_CAPACITY
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::MAX_INPUTS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // PGM output resolution
         ExposedProperty {
             name: "pgm_resolution".to_string(),

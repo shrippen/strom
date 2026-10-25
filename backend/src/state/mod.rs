@@ -43,6 +43,7 @@ struct RegisteredEndpoints {
 }
 
 pub(crate) mod stinger;
+mod vision_mixer_inputs;
 #[doc(hidden)]
 pub use crate::gst::pipeline::effects::stinger::fail_stinger_programming_for_tests;
 #[doc(hidden)]
@@ -1420,6 +1421,9 @@ impl AppState {
             .events
             .broadcast(StromEvent::FlowUpdated { flow_id: *id });
 
+        // Dynamic vision mixer inputs are built into the running pipeline.
+        self.restore_vision_mixer_inputs(&flow).await;
+
         Ok(state)
     }
 
@@ -2499,7 +2503,7 @@ impl AppState {
 
         // Get num_inputs from block properties
         let num_inputs = self
-            .get_vision_mixer_num_inputs(flow_id, block_instance_id)
+            .get_vision_mixer_capacity(flow_id, block_instance_id)
             .await;
 
         let (new_pvw, pgm) =
@@ -2577,18 +2581,15 @@ impl AppState {
             .unwrap_or_else(|| vec![None; num_inputs])
     }
 
-    /// Get num_inputs for a vision mixer block from the flow definition.
-    async fn get_vision_mixer_num_inputs(
-        &self,
-        flow_id: &FlowId,
-        block_instance_id: &str,
-    ) -> usize {
+    /// Input slots (`max_inputs`, else `num_inputs`) of a vision mixer
+    /// block, from the flow definition.
+    async fn get_vision_mixer_capacity(&self, flow_id: &FlowId, block_instance_id: &str) -> usize {
         use crate::blocks::builtin::vision_mixer::properties as vm_props;
         let flows = self.inner.flows.read().await;
         flows
             .get(flow_id)
             .and_then(|flow| flow.blocks.iter().find(|b| b.id == block_instance_id))
-            .map(|block| vm_props::num_inputs_or_max(&block.properties))
+            .map(|block| vm_props::capacity_or_num_inputs(&block.properties))
             .unwrap_or(4)
     }
 
@@ -2602,7 +2603,7 @@ impl AppState {
         duration_ms: u64,
     ) -> Result<(), PipelineError> {
         let num_inputs = self
-            .get_vision_mixer_num_inputs(flow_id, block_instance_id)
+            .get_vision_mixer_capacity(flow_id, block_instance_id)
             .await;
         let pipelines = self.inner.pipelines.read().await;
         let manager = pipelines.get(flow_id).ok_or_else(|| {
@@ -2638,7 +2639,7 @@ impl AppState {
         alpha: f64,
     ) -> Result<(), PipelineError> {
         let num_inputs = self
-            .get_vision_mixer_num_inputs(flow_id, block_instance_id)
+            .get_vision_mixer_capacity(flow_id, block_instance_id)
             .await;
         let pipelines = self.inner.pipelines.read().await;
         let manager = pipelines.get(flow_id).ok_or_else(|| {

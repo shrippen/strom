@@ -1459,3 +1459,186 @@ fn test_parse_num_inputs_negative_and_padded() {
     );
     assert_eq!(properties::parse_num_inputs(&props), Ok(8));
 }
+
+#[test]
+fn test_parse_max_inputs() {
+    use strom_types::vision_mixer::MAX_INPUT_CAPACITY;
+    let mut props = HashMap::new();
+    // Missing or 0: no free slots.
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(4));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(0));
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(4));
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::String(" 16 ".into()),
+    );
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(16));
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::UInt(MAX_INPUT_CAPACITY as u64),
+    );
+    assert_eq!(
+        properties::parse_max_inputs(&props, 4),
+        Ok(MAX_INPUT_CAPACITY)
+    );
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::UInt(MAX_INPUT_CAPACITY as u64 + 1),
+    );
+    let err = properties::parse_max_inputs(&props, 4).expect_err("above the cap");
+    assert!(err.contains("at most"), "{err}");
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(3));
+    let err = properties::parse_max_inputs(&props, 4).expect_err("below num_inputs");
+    assert!(err.contains("below num_inputs 4"), "{err}");
+    // The fallback for callers that cannot fail.
+    assert_eq!(properties::capacity_or_num_inputs(&props), 4);
+}
+
+/// Free slots take tiles only once filled: the present inputs get the tiles
+/// a mixer with just them would give them, in index order.
+#[test]
+fn test_layout_with_free_slots() {
+    let full = layout::compute_layout(1280, 720, 3, 1, ASPECT_16_9, false);
+    let sparse = layout::compute_layout_for(1280, 720, &[0, 1, 5], 8, 1, ASPECT_16_9, false);
+    assert_eq!(sparse.num_inputs, 8);
+    assert_eq!(
+        sparse.visible,
+        vec![true, true, false, false, false, true, false, false]
+    );
+    for (input, tile) in [(0, 0), (1, 1), (5, 2)] {
+        assert_eq!(
+            sparse.thumbnail_rects[input].as_ints(),
+            full.thumbnail_rects[tile].as_ints(),
+            "input {input}"
+        );
+    }
+    assert_eq!(
+        sparse.pip_tile_rects[0].as_ints(),
+        full.pip_tile_rects[0].as_ints()
+    );
+    // A free slot's pad position is the off-screen placeholder.
+    assert_eq!(layout::thumbnail_pad_position(&sparse, 3), (0, 0, 1, 1));
+}
+
+/// With free slots, the static inputs keep their indices and every other
+/// pad (DSK, stinger, multiview, preview) moves up by the slot count, as the
+/// pad map says. No pad is linked for a free slot.
+#[test]
+fn test_cpu_build_with_free_slots_links_by_capacity() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+    use std::collections::BTreeSet;
+    use strom_types::vision_mixer::PadMap;
+
+    gstreamer::init().unwrap();
+    crate::gpu::detect_gpu_capabilities();
+    let (n, cap, d, p) = (3usize, 8usize, 2usize, 1usize);
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("cpu".into())),
+        ("num_inputs", PropertyValue::UInt(n as u64)),
+        ("max_inputs", PropertyValue::UInt(cap as u64)),
+        ("num_dsk_inputs", PropertyValue::String(d.to_string())),
+        ("num_pips", PropertyValue::String(p.to_string())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("CPU vision mixer with free slots builds");
+    let linked = |element: &str| -> BTreeSet<usize> {
+        built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect()
+    };
+    let pm = PadMap::new(cap, d, p);
+    let mut dist: BTreeSet<usize> = (0..n).map(|i| pm.dist_input(i)).collect();
+    dist.extend((0..d).map(|k| pm.dist_dsk(k)));
+    let ub = pm.dist_underlay_base().unwrap();
+    dist.extend((0..n).map(|i| ub + i));
+    dist.insert(pm.dist_stinger());
+    assert_eq!(linked("mixer"), dist);
+
+    let mut mv: BTreeSet<usize> = (0..n).map(|i| pm.mv_thumb(i)).collect();
+    mv.insert(pm.mv_pgm());
+    mv.extend((0..n).map(|i| pm.mv_pvw(i)));
+    mv.extend((0..n).map(|i| pm.mv_pip(0, i)));
+    mv.insert(pm.mv_overlay());
+    let pvu = pm.mv_pvw_underlay_base().unwrap();
+    mv.extend((0..n).map(|i| pvu + i));
+    let tu = pm.mv_pip_underlay_base(0).unwrap();
+    mv.extend((0..n).map(|i| tu + i));
+    assert_eq!(linked("mv_comp"), mv);
+
+    let mut pvw: BTreeSet<usize> = (0..n).map(|i| pm.pvw_out_input(i)).collect();
+    let ou = pm.pvw_out_underlay_base().unwrap();
+    pvw.extend((0..n).map(|i| ou + i));
+    assert_eq!(linked("pvw_comp"), pvw);
+
+    // No element of a free slot is built.
+    assert!(!built
+        .elements
+        .iter()
+        .any(|(id, _)| id == "vm:queue_3" || id == "vm:tee_3"));
+}
+
+/// A dynamic input joins hidden on every pad but its thumbnail.
+#[test]
+fn test_dynamic_input_pad_properties_start_hidden() {
+    use super::builder::{pad_layout, InputSpec};
+    use super::elements::CompositorBackend;
+    use strom_types::vision_mixer::PadMap;
+
+    let spec = InputSpec {
+        instance_id: "vm".into(),
+        backend: CompositorBackend::Software,
+        output_format: None,
+        num_pips: 1,
+        pm: PadMap::new(6, 1, 1),
+        underlay: Some((false, String::new())),
+        preview_out: true,
+        pgm_w: 1920,
+        pgm_h: 1080,
+        mv_w: 1280,
+        mv_h: 720,
+        source_aspect: ASPECT_16_9,
+        swap_pvw_pgm: false,
+    };
+    let layout = spec.mv_layout(&[0, 1, 4]);
+    let pads = pad_layout::dynamic_input_pad_properties(&spec, &layout, 4);
+    let alpha = |comp: &str, idx: usize| -> f64 {
+        let (_, _, props) = pads
+            .iter()
+            .find(|(c, p, _)| c == &format!("vm:{comp}") && p == &PadMap::sink(idx))
+            .unwrap_or_else(|| panic!("no props for {comp} sink_{idx}"));
+        match props["alpha"] {
+            PropertyValue::Float(a) => a,
+            ref v => panic!("alpha {v:?}"),
+        }
+    };
+    let pm = spec.pm;
+    assert_eq!(alpha("mixer", pm.dist_input(4)), 0.0);
+    assert_eq!(alpha("mv_comp", pm.mv_thumb(4)), 1.0);
+    assert_eq!(alpha("mv_comp", pm.mv_pvw(4)), 0.0);
+    assert_eq!(alpha("mv_comp", pm.mv_pip(0, 4)), 0.0);
+    assert_eq!(alpha("pvw_comp", pm.pvw_out_input(4)), 0.0);
+    assert_eq!(alpha("mixer", pm.dist_underlay_base().unwrap() + 4), 0.0);
+    assert_eq!(
+        alpha("pvw_comp", pm.pvw_out_underlay_base().unwrap() + 4),
+        0.0
+    );
+    // The thumbnail sits in the input's tile.
+    let (_, _, thumb) = pads
+        .iter()
+        .find(|(c, p, _)| c == "vm:mv_comp" && p == &PadMap::sink(pm.mv_thumb(4)))
+        .unwrap();
+    let (x, _, w, _) = layout.thumbnail_rects[4].as_ints();
+    assert!(matches!(thumb["xpos"], PropertyValue::Int(v) if v == x as i64));
+    assert!(matches!(thumb["width"], PropertyValue::Int(v) if v == w as i64));
+}
