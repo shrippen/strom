@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use strom_types::{block::*, element::ElementPadRef, FlowId, MediaType, PropertyValue};
 use tracing::{debug, info, warn};
 
+use super::buses::*;
 use super::elements::*;
 use super::metering::connect_mixer_meter_handler;
 use super::properties::*;
@@ -13,23 +14,6 @@ use super::{METER_INTERVAL_NS, MIN_KNEE_LINEAR};
 use strom_types::mixer::{
     DEFAULT_INTERNAL_BUS_LATENCY_MS, DEFAULT_LATENCY_MS, DEFAULT_MIN_UPSTREAM_LATENCY_MS,
 };
-
-/// Follow a bus mixer with its rate pin at `rate`. Returns the pin's id: the
-/// bus's output now leaves from there.
-fn push_rate_pin(
-    mixer_id: &str,
-    rate: u32,
-    elements: &mut Vec<(String, gst::Element)>,
-    internal_links: &mut Vec<(ElementPadRef, ElementPadRef)>,
-) -> Result<String, BlockBuildError> {
-    let pin_id = format!("{}_rate", mixer_id);
-    elements.push((pin_id.clone(), make_rate_pin(&pin_id, rate)?));
-    internal_links.push((
-        ElementPadRef::pad(mixer_id, "src"),
-        ElementPadRef::pad(&pin_id, "sink"),
-    ));
-    Ok(pin_id)
-}
 
 /// Mixer block builder.
 pub struct MixerBuilder;
@@ -112,6 +96,28 @@ impl BlockBuilder for MixerBuilder {
         let num_aux_buses = parse_num_aux_buses(properties);
         let num_groups = parse_num_groups(properties);
         let monitor_source = parse_monitor_source(properties, num_aux_buses);
+        let aux_capacity = parse_max_aux_buses(properties, num_aux_buses);
+        // A stored bus that no longer fits is left out, a list that does not
+        // parse leaves the mixer without its dynamic buses: either way
+        // rather than without sound. They stay stored.
+        let dynamic_aux_buses =
+            match parse_dynamic_aux_buses(properties, num_aux_buses, aux_capacity) {
+                Ok((buses, skipped)) => {
+                    for reason in skipped {
+                        warn!("Mixer {}: aux bus left out: {}", instance_id, reason);
+                    }
+                    buses
+                }
+                Err(e) => {
+                    warn!("Mixer {}: {}", instance_id, e);
+                    Vec::new()
+                }
+            };
+        // Every built aux bus, 0-based: the static ones, then the dynamic.
+        let built_aux_buses: Vec<usize> = (0..num_aux_buses)
+            .chain(dynamic_aux_buses.iter().map(|bus| bus.aux - 1))
+            .collect();
+        let spec = BusSpec::new(instance_id, properties);
         let sample_rate = parse_sample_rate(properties);
         // All buses of this block start alike (see `start_time`).
         let start = crate::blocks::builtin::start_time::parse_start_time(properties);
@@ -191,8 +197,7 @@ impl BlockBuilder for MixerBuilder {
             start,
         )?;
         elements.push((mixer_id.clone(), audiomixer.clone()));
-        let mixer_out_id =
-            push_rate_pin(&mixer_id, sample_rate, &mut elements, &mut internal_links)?;
+        let mixer_out_id = spec.push_rate_pin(&mixer_id, &mut elements, &mut internal_links)?;
 
         // ========================================================================
         // Main bus processing: comp → EQ → limiter
@@ -348,17 +353,13 @@ impl BlockBuilder for MixerBuilder {
         let solo_mixer = make_audiomixer(
             &solo_mixer_id,
             force_live,
-            bus_latency_ms(num_aux_buses + num_groups > 0),
+            // Dynamic aux buses join it later: count the free ones too.
+            bus_latency_ms(aux_capacity + num_groups > 0),
             min_upstream_latency_ms,
             start,
         )?;
         elements.push((solo_mixer_id.clone(), solo_mixer));
-        let solo_out_id = push_rate_pin(
-            &solo_mixer_id,
-            sample_rate,
-            &mut elements,
-            &mut internal_links,
-        )?;
+        let solo_out_id = spec.push_rate_pin(&solo_mixer_id, &mut elements, &mut internal_links)?;
 
         // Gates feeding monitor_mixer
         let solo_to_mon_id = format!("{}:solo_to_mon", instance_id);
@@ -403,12 +404,8 @@ impl BlockBuilder for MixerBuilder {
             start,
         )?;
         elements.push((monitor_mixer_id.clone(), monitor_mixer));
-        let monitor_out_id = push_rate_pin(
-            &monitor_mixer_id,
-            sample_rate,
-            &mut elements,
-            &mut internal_links,
-        )?;
+        let monitor_out_id =
+            spec.push_rate_pin(&monitor_mixer_id, &mut elements, &mut internal_links)?;
 
         // Monitor master volume (driven by `monitor_fader` exposed property)
         let monitor_master_vol_id = format!("{}:monitor_master_vol", instance_id);
@@ -489,111 +486,26 @@ impl BlockBuilder for MixerBuilder {
         // ========================================================================
         // Create Aux buses
         // ========================================================================
+        // The static buses leave through the block pads `aux_out_N`, the
+        // dynamic ones through their inter channel.
         for aux in 0..num_aux_buses {
-            let aux_mixer_id = format!("{}:aux{}_mixer", instance_id, aux);
-            let aux_mixer = make_audiomixer(
-                &aux_mixer_id,
-                force_live,
-                latency_ms,
-                min_upstream_latency_ms,
-                start,
-            )?;
-            elements.push((aux_mixer_id.clone(), aux_mixer));
-            let aux_out_id = push_rate_pin(
-                &aux_mixer_id,
-                sample_rate,
+            aux_master(&spec, aux, properties, &mut elements, &mut internal_links)?;
+        }
+        for bus in &dynamic_aux_buses {
+            aux_master(
+                &spec,
+                bus.aux - 1,
+                properties,
                 &mut elements,
                 &mut internal_links,
             )?;
-
-            let aux_fader = get_float_prop(properties, &format!("aux{}_fader", aux + 1), 1.0);
-            let aux_mute = get_bool_prop(properties, &format!("aux{}_mute", aux + 1), false);
-
-            let aux_volume_id = format!("{}:aux{}_volume", instance_id, aux);
-            let aux_volume = gst::ElementFactory::make("volume")
-                .name(&aux_volume_id)
-                .property("volume", aux_fader)
-                .property("mute", aux_mute)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("aux{}_volume: {}", aux, e))
-                })?;
-            elements.push((aux_volume_id.clone(), aux_volume));
-
-            let aux_level_id = format!("{}:aux{}_level", instance_id, aux);
-            let aux_level = gst::ElementFactory::make("level")
-                .name(&aux_level_id)
-                .property("interval", METER_INTERVAL_NS)
-                .property("post-messages", true)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("aux{}_level: {}", aux, e))
-                })?;
-            elements.push((aux_level_id.clone(), aux_level));
-
-            // Aux output tee (allow-not-linked so unconnected aux_out doesn't stall pipeline)
-            let aux_out_tee_id = format!("{}:aux{}_out_tee", instance_id, aux);
-            let aux_out_tee = gst::ElementFactory::make("tee")
-                .name(&aux_out_tee_id)
-                .property("allow-not-linked", true)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("aux{}_out_tee: {}", aux, e))
-                })?;
-            elements.push((aux_out_tee_id.clone(), aux_out_tee));
-
-            // Link: aux_mixer → aux_volume → aux_level → aux_out_tee
-            internal_links.push((
-                ElementPadRef::pad(&aux_out_id, "src"),
-                ElementPadRef::pad(&aux_volume_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&aux_volume_id, "src"),
-                ElementPadRef::pad(&aux_level_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&aux_level_id, "src"),
-                ElementPadRef::pad(&aux_out_tee_id, "sink"),
-            ));
-
-            // AFL tap on the aux master. Taps from `aux_out_tee` (post-master,
-            // post-mute, post-meter) so the operator hears exactly what is
-            // leaving the aux send. Like channel PFL/AFL, the gate volume is
-            // either 0 or 1 — `bool_to_volume` transforms the public Bool
-            // property to the underlying volume value.
-            let aux_afl_enabled = get_bool_prop(properties, &format!("aux{}_afl", aux + 1), false);
-            let aux_afl_volume_id = format!("{}:aux{}_afl_volume", instance_id, aux);
-            let aux_afl_volume = gst::ElementFactory::make("volume")
-                .name(&aux_afl_volume_id)
-                .property("volume", if aux_afl_enabled { 1.0 } else { 0.0 })
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("aux{}_afl_volume: {}", aux, e))
-                })?;
-            elements.push((aux_afl_volume_id.clone(), aux_afl_volume));
-
-            let aux_afl_queue_id = format!("{}:aux{}_afl_queue", instance_id, aux);
-            let aux_afl_queue = gst::ElementFactory::make("queue")
-                .name(&aux_afl_queue_id)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("aux{}_afl_queue: {}", aux, e))
-                })?;
-            elements.push((aux_afl_queue_id.clone(), aux_afl_queue));
-
-            // aux_out_tee → aux_afl_volume → aux_afl_queue → solo_mixer
-            internal_links.push((
-                ElementPadRef::element(&aux_out_tee_id),
-                ElementPadRef::pad(&aux_afl_volume_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&aux_afl_volume_id, "src"),
-                ElementPadRef::pad(&aux_afl_queue_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&aux_afl_queue_id, "src"),
-                ElementPadRef::element(&solo_mixer_id),
-            ));
+            aux_inter_output(
+                &spec,
+                bus.aux - 1,
+                &bus.channel,
+                &mut elements,
+                &mut internal_links,
+            )?;
         }
 
         // ========================================================================
@@ -609,12 +521,7 @@ impl BlockBuilder for MixerBuilder {
                 start,
             )?;
             elements.push((sg_mixer_id.clone(), sg_mixer));
-            let sg_out_id = push_rate_pin(
-                &sg_mixer_id,
-                sample_rate,
-                &mut elements,
-                &mut internal_links,
-            )?;
+            let sg_out_id = spec.push_rate_pin(&sg_mixer_id, &mut elements, &mut internal_links)?;
 
             let sg_fader = get_float_prop(properties, &format!("group{}_fader", sg + 1), 1.0);
             let sg_mute = get_bool_prop(properties, &format!("group{}_mute", sg + 1), false);
@@ -1042,68 +949,15 @@ impl BlockBuilder for MixerBuilder {
             // ----------------------------------------------------------------
             // Aux send paths (pre or post fader)
             // ----------------------------------------------------------------
-            for aux in 0..num_aux_buses {
-                let aux_send_level = get_float_prop(
+            for &aux in &built_aux_buses {
+                aux_send(
+                    &spec,
+                    ch,
+                    aux,
                     properties,
-                    &format!("ch{}_aux{}_level", ch_num, aux + 1),
-                    0.0,
-                );
-                let aux_pre = get_bool_prop(
-                    properties,
-                    &format!("ch{}_aux{}_pre", ch_num, aux + 1),
-                    false, // All aux sends default post-fader (matches definition.rs)
-                );
-
-                let aux_send_id = format!("{}:aux_send_{}_{}", instance_id, ch, aux);
-                let aux_send = gst::ElementFactory::make("volume")
-                    .name(&aux_send_id)
-                    .property("volume", aux_send_level)
-                    .build()
-                    .map_err(|e| {
-                        BlockBuildError::ElementCreation(format!(
-                            "aux_send ch{} aux{}: {}",
-                            ch_num,
-                            aux + 1,
-                            e
-                        ))
-                    })?;
-                elements.push((aux_send_id.clone(), aux_send));
-
-                let aux_queue_id = format!("{}:aux_queue_{}_{}", instance_id, ch, aux);
-                let aux_queue = gst::ElementFactory::make("queue")
-                    .name(&aux_queue_id)
-                    .build()
-                    .map_err(|e| {
-                        BlockBuildError::ElementCreation(format!(
-                            "aux_queue ch{} aux{}: {}",
-                            ch_num,
-                            aux + 1,
-                            e
-                        ))
-                    })?;
-                elements.push((aux_queue_id.clone(), aux_queue));
-
-                // Source tee depends on pre/post setting
-                let source_tee_id = if aux_pre {
-                    &pre_fader_tee_id
-                } else {
-                    &post_fader_tee_id
-                };
-
-                // Link: (pre|post)_fader_tee → aux_send → aux_queue → aux_mixer
-                let aux_mixer_id = format!("{}:aux{}_mixer", instance_id, aux);
-                internal_links.push((
-                    ElementPadRef::element(source_tee_id), // Request pad from tee
-                    ElementPadRef::pad(&aux_send_id, "sink"),
-                ));
-                internal_links.push((
-                    ElementPadRef::pad(&aux_send_id, "src"),
-                    ElementPadRef::pad(&aux_queue_id, "sink"),
-                ));
-                internal_links.push((
-                    ElementPadRef::pad(&aux_queue_id, "src"),
-                    ElementPadRef::element(&aux_mixer_id), // Request pad from aux_mixer
-                ));
+                    &mut elements,
+                    &mut internal_links,
+                )?;
             }
 
             // ----------------------------------------------------------------

@@ -156,9 +156,9 @@ Every channel can be independently routed to **Main**, to any of the
   (0.0 = no send, 2.0 = +6 dB send). Each aux send can independently
   be set to pre-fader or post-fader.
 - **All aux sends default to *post-fader***. Set the sends into a bus to
-  pre-fader when using it for stage monitors or IEMs. Pre/post is a
-  construction-time setting: changing it rebuilds the mixer when the
-  flow restarts, it does not switch live.
+  pre-fader when using it for stage monitors or IEMs. Pre/post switches
+  live: the send moves to the other tap point while the mixer runs
+  (`chN_auxM_pre`), at most one buffer of that send is lost or repeated.
 
 ### Quick routing matrix view
 
@@ -219,6 +219,42 @@ Aux buses are stereo. Each aux bus:
 ```
    Channel sends (per-ch level, pre or post) ──►  AUX MIX ──► AUX MASTER + MUTE ──► METER ──► AUX OUT
 ```
+
+#### Buses added while the flow runs
+
+With **Aux Bus Capacity** (`max_aux_buses`) above **Aux Buses**
+(`num_aux_buses`), the bus numbers in between are free. The API adds a bus
+there while the flow runs and removes it again, without rebuilding the
+mixer: Main, the other buses and the outputs play on.
+
+- `GET /api/flows/{flow}/blocks/{block}/aux_buses` lists the buses.
+- `POST …/aux_buses` with `{"channel": "…", "aux": 3, "pre_fader": true}`
+  adds one (`aux` optional: the lowest free number; `pre_fader` optional:
+  sets every channel's tap into the bus).
+- `DELETE …/aux_buses/{aux}` removes one. A bus built with the flow cannot
+  be removed.
+
+Such a bus has no output pad: it publishes its output on the inter channel
+`channel`, which an **Inter Input** block (or any `intersrc` with that
+producer name) in another flow picks up; in the mixer's own flow it would
+close a loop. A channel carries one bus: a channel that another mixer's bus
+or a running flow already publishes on, or that is an Inter Output block's
+(`strom_{flow}_{block}`, also in a stopped flow), is refused (409).
+
+Each channel gets a send into it at level 0; the bus takes the same
+properties as a static one (`auxM_fader`, `auxM_mute`,
+`auxM_afl`, `chN_auxM_level`, `chN_auxM_pre`). The buses are stored in the
+block property `dynamic_aux_buses` and built again on restart. A removed
+bus takes its stored properties with it, so a bus added later under its
+number starts from the defaults.
+
+A stored bus that no longer fits the numbers (after raising **Aux Buses**
+or lowering the capacity) is not built and stays stored: it comes back once
+the numbers fit again (`GET` lists it under `unbuilt`), or `DELETE`
+removes it. Changes to the numbers or the channel count take effect on the
+next start: until then `DELETE` removes the bus that runs. Saving in the
+mixer editor keeps the dynamic buses and their settings; copying or importing a flow
+leaves them out (the copy would publish on the same channels).
 
 ### 4.4 Monitor & Solo bus
 
@@ -355,21 +391,21 @@ discontinuity click of a hard step.
 | | Min | Max |
 |---|---|---|
 | Channels | 1 | 128 |
-| Aux buses | 0 | 32 |
+| Aux buses (with the flow, and capacity) | 0 | 32 |
 | Groups | 0 | 32 |
 | EQ bands per strip | — | 4 (Low / Low-Mid / Hi-Mid / High) |
 
 These are **construction-time properties** — they define how the mixer is
 built and require restarting the flow to change:
 
-- channel, aux-bus and group counts
-- aux send pre/post-fader
+- channel and group counts, the number of aux buses built with the flow
+  and the aux bus capacity (buses up to it come and go at runtime, see 4.3)
 - sample rate
 - DSP backend (Rust or LV2)
 - Force Live, Latency, Internal Bus Latency and Min Upstream Latency
 
-Everything else (faders, mutes, send levels, processing parameters,
-routing switches, PFL/AFL) is live-editable.
+Everything else (faders, mutes, send levels and their pre/post tap,
+processing parameters, routing switches, PFL/AFL) is live-editable.
 
 ---
 

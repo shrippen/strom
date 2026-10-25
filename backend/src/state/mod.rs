@@ -42,6 +42,7 @@ struct RegisteredEndpoints {
     whip: Vec<String>,
 }
 
+mod mixer_aux_buses;
 pub(crate) mod stinger;
 mod vision_mixer_inputs;
 #[doc(hidden)]
@@ -100,6 +101,9 @@ struct AppStateInner {
     ice_transport_policy: String,
     /// Flows pending save (debounced to avoid excessive disk writes)
     pending_saves: RwLock<HashSet<FlowId>>,
+    /// Serializes changes to mixers' aux buses (add, remove, a send's tap):
+    /// each reads the stored buses, changes the pipeline and stores again.
+    mixer_aux_buses: tokio::sync::Mutex<()>,
     /// Handle for reloading the tracing EnvFilter at runtime
     log_reload_handle: parking_lot::Mutex<Option<LogReloadHandle>>,
     /// The log filter string the server was started with
@@ -180,6 +184,7 @@ impl AppState {
                 ice_servers,
                 ice_transport_policy,
                 pending_saves: RwLock::new(HashSet::new()),
+                mixer_aux_buses: tokio::sync::Mutex::new(()),
                 log_reload_handle: parking_lot::Mutex::new(None),
                 default_log_filter: parking_lot::Mutex::new("info".to_string()),
                 gst_debug_filter: parking_lot::Mutex::new(String::new()),
@@ -1349,6 +1354,17 @@ impl AppState {
             }
         }
 
+        // Register the channels of the mixers' dynamic aux buses
+        for block in &flow.blocks {
+            if block.block_definition_id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID {
+                let buses = crate::blocks::builtin::mixer::dynamic::aux_buses(&block.properties);
+                for bus in buses.dynamic {
+                    self.register_aux_bus_channel(id, &block.id, &bus.channel)
+                        .await;
+                }
+            }
+        }
+
         // Register channels for InterOutput blocks
         for block in &flow.blocks {
             if block.block_definition_id == "builtin.inter_output" {
@@ -1725,6 +1741,8 @@ impl AppState {
                 }
             }
         }
+        // The rest of the flow's channels: the mixers' dynamic aux buses.
+        self.inner.channel_registry.unregister_flow(id).await;
 
         // Broadcast events
         // Note: FlowStateChanged is now broadcast from the bus watch on actual GStreamer
@@ -1852,6 +1870,17 @@ impl AppState {
                 PipelineError::InvalidFlow(format!("Block definition not found: {}", definition_id))
             })?;
 
+        // A send's tap moves under the lock of the aux bus changes, held until
+        // it is stored: a bus removed meanwhile would get it back otherwise.
+        let _aux_bus_serial = if definition.id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID
+            && properties.keys().any(|name| {
+                crate::blocks::builtin::mixer::dynamic::send_pre_property_target(name).is_some()
+            }) {
+            Some(self.inner.mixer_aux_buses.lock().await)
+        } else {
+            None
+        };
+
         // Live Audio Router: its crosspoint fade lives on the block, not on any
         // element, so resolve it here — a value sent in this same batch takes
         // precedence over the stored one.
@@ -1967,6 +1996,37 @@ impl AppState {
                     }
                 }
                 continue;
+            }
+
+            // A mixer send's tap (before or after the fader) is a link, not an
+            // element property: the send moves to the other tee. A bus not
+            // built yet takes the stored tap when it is. Handled before the
+            // `_block` rejection below.
+            if definition.id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID {
+                use crate::blocks::builtin::mixer::dynamic;
+                if let Some((ch, aux)) = dynamic::send_pre_property_target(&name) {
+                    let PropertyValue::Bool(pre) = value else {
+                        rejected.insert(name, "value must be a boolean".to_string());
+                        continue;
+                    };
+                    let applied = match self.inner.pipelines.read().await.get(flow_id) {
+                        Some(manager) => dynamic::set_send_tap(
+                            manager.pipeline(),
+                            block_instance_id,
+                            ch,
+                            aux,
+                            pre,
+                        ),
+                        None => Ok(()),
+                    };
+                    match applied {
+                        Ok(()) => to_persist.push((name, value)),
+                        Err(reason) => {
+                            rejected.insert(name, reason);
+                        }
+                    }
+                    continue;
+                }
             }
 
             // The `_block` element_id marker is a virtual element for properties that

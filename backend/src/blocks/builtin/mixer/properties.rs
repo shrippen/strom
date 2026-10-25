@@ -5,6 +5,10 @@ use gstreamer::prelude::*;
 use strom_types::{parse_common_audio_sample_rate, PropertyValue, DEFAULT_AUDIO_SAMPLE_RATE};
 use tracing::warn;
 
+use strom_types::mixer::{
+    buildable_dynamic_aux_buses, DynamicAuxBus, DYNAMIC_AUX_BUSES_PROPERTY, MAX_AUX_BUSES_PROPERTY,
+};
+
 use super::{DEFAULT_CHANNELS, MAX_AUX_BUSES, MAX_CHANNELS, MAX_GROUPS, MIN_KNEE_LINEAR};
 
 /// Read a count property. A negative integer counts as zero so the caller's
@@ -34,6 +38,50 @@ pub(super) fn parse_num_aux_buses(properties: &HashMap<String, PropertyValue>) -
         .and_then(parse_count)
         .unwrap_or(0)
         .clamp(0, MAX_AUX_BUSES)
+}
+
+/// Parse the bus capacity (`max_aux_buses`): at least `num_aux_buses`.
+pub(super) fn parse_max_aux_buses(
+    properties: &HashMap<String, PropertyValue>,
+    num_aux_buses: usize,
+) -> usize {
+    properties
+        .get(MAX_AUX_BUSES_PROPERTY)
+        .and_then(parse_count)
+        .unwrap_or(0)
+        .clamp(num_aux_buses, MAX_AUX_BUSES)
+}
+
+/// The stored dynamic aux buses (`dynamic_aux_buses`), as written: no
+/// check against the mixer's numbers. Errors when the property does not
+/// parse.
+pub(crate) fn stored_dynamic_aux_buses(
+    properties: &HashMap<String, PropertyValue>,
+) -> Result<Vec<DynamicAuxBus>, String> {
+    match properties.get(DYNAMIC_AUX_BUSES_PROPERTY) {
+        None => Ok(Vec::new()),
+        Some(PropertyValue::String(json)) => strom_types::mixer::parse_dynamic_aux_buses(json),
+        Some(other) => Err(format!(
+            "{} must be a JSON string, not {:?}",
+            DYNAMIC_AUX_BUSES_PROPERTY, other
+        )),
+    }
+}
+
+/// The stored dynamic aux buses the mixer builds, and why each other one is
+/// left out (see `buildable_dynamic_aux_buses`). Errors when the property
+/// does not parse.
+pub(super) fn parse_dynamic_aux_buses(
+    properties: &HashMap<String, PropertyValue>,
+    num_aux_buses: usize,
+    capacity: usize,
+) -> Result<(Vec<DynamicAuxBus>, Vec<String>), String> {
+    let stored = stored_dynamic_aux_buses(properties)?;
+    Ok(buildable_dynamic_aux_buses(
+        &stored,
+        num_aux_buses,
+        capacity,
+    ))
 }
 
 /// Parse the monitor's source from properties: the 0-based aux bus it

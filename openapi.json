@@ -990,6 +990,227 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/aux_buses": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "List the aux buses of an audio mixer: its capacity, the static buses\nand the dynamic ones with their channels.",
+        "operationId": "list_mixer_aux_buses",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mixer's aux buses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The stored bus list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add an aux bus to a running audio mixer. The bus takes the requested\nfree number (or the lowest free one), gets a send from every channel\n(level 0 until set with `chM_auxN_level`) and publishes its output on\nthe inter channel. It is stored with the flow and built again on\nrestart.",
+        "operationId": "add_mixer_aux_bus",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMixerAuxBusRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bus added; the mixer's aux buses afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or the mixer has no free buses (max_aux_buses)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested number or the channel is taken, or every number is",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GStreamer could not build the bus",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/aux_buses/{aux}": {
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a dynamic aux bus from an audio mixer. Its stored properties\n(fader, sends) go with it.",
+        "operationId": "remove_mixer_aux_bus",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "aux",
+            "in": "path",
+            "description": "Aux bus number (as in auxN_fader)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bus removed; the mixer's aux buses afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer, or no dynamic bus with this number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A static bus (num_aux_buses), or the stored bus list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/devtools/link": {
       "post": {
         "tags": [
@@ -7197,6 +7418,34 @@
           }
         }
       },
+      "AddMixerAuxBusRequest": {
+        "type": "object",
+        "description": "Request to add an aux bus to a running mixer.",
+        "required": [
+          "channel"
+        ],
+        "properties": {
+          "aux": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bus number to fill; `None` takes the lowest free one.",
+            "minimum": 0
+          },
+          "channel": {
+            "type": "string",
+            "description": "Inter channel to publish the bus's output on."
+          },
+          "pre_fader": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Tap every channel's send before the fader (`true`) or after it.\nSets each `chM_auxN_pre`; `None` keeps the stored values (post fader\nwhen there are none)."
+          }
+        }
+      },
       "AddPictureRequest": {
         "type": "object",
         "description": "Show a picture (video or still image) on a stage.",
@@ -8413,6 +8662,25 @@
           },
           "message": {
             "type": "string"
+          }
+        }
+      },
+      "DynamicAuxBus": {
+        "type": "object",
+        "description": "An aux bus added while the flow runs.",
+        "required": [
+          "aux",
+          "channel"
+        ],
+        "properties": {
+          "aux": {
+            "type": "integer",
+            "description": "Bus number, as in the properties `auxN_fader` and `chM_auxN_level`\n(`num_aux_buses < aux <= max_aux_buses`).",
+            "minimum": 0
+          },
+          "channel": {
+            "type": "string",
+            "description": "Inter channel the bus's output is published on (the producer name an\nInter Input block or `intersrc` subscribes to)."
           }
         }
       },
@@ -10056,6 +10324,41 @@
           "Audio",
           "Video"
         ]
+      },
+      "MixerAuxBuses": {
+        "type": "object",
+        "description": "The aux buses of a running mixer.",
+        "required": [
+          "capacity",
+          "num_static",
+          "dynamic"
+        ],
+        "properties": {
+          "capacity": {
+            "type": "integer",
+            "description": "Highest bus number (`max_aux_buses`).",
+            "minimum": 0
+          },
+          "dynamic": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicAuxBus"
+            },
+            "description": "The dynamic buses, ascending by number."
+          },
+          "num_static": {
+            "type": "integer",
+            "description": "Buses built with the flow (`num_aux_buses`): they cannot be removed.",
+            "minimum": 0
+          },
+          "unbuilt": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicAuxBus"
+            },
+            "description": "Stored buses the mixer does not build: they no longer fit the\nnumbers (`num_aux_buses`, `max_aux_buses`). They come back when the\nnumbers fit again; removing one takes it out of the store."
+          }
+        }
       },
       "MultiviewEndpointResponse": {
         "type": "object",
