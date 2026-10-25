@@ -74,9 +74,9 @@ fn vision_mixer_definition() -> BlockDefinition {
             label: "Input Slots".to_string(),
             description: format!(
                 "Input slots, for inputs added while the flow runs (CPU and CUDA \
-                 backends; with Auto, free slots pick CUDA or CPU over OpenGL; the \
-                 API's inputs endpoint adds them). 0 = no free slots, else at least \
-                 Number of Inputs, at most {}.",
+                 backends; with Auto and Shader FX off, free slots pick CUDA or CPU \
+                 over OpenGL; the API's inputs endpoint adds them). 0 = no free \
+                 slots, else at least Number of Inputs, at most {}.",
                 strom_types::vision_mixer::MAX_INPUT_CAPACITY
             ),
             property_type: PropertyType::UInt,

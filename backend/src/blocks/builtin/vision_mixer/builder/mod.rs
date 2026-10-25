@@ -196,9 +196,13 @@ impl BlockBuilder for VisionMixerBuilder {
             .unwrap_or("auto");
         let mut backend = super::elements::select_backend(pref)?;
         // Free slots need runtime inputs, which the OpenGL mixer has not
-        // got yet: "auto" picks CUDA or the CPU instead; asking for "gpu"
-        // fails below.
-        if backend == CompositorBackend::OpenGL && capacity > num_inputs && pref != "gpu" {
+        // got yet: "auto" picks CUDA or the CPU instead, unless that would
+        // lose the shader FX (OpenGL only), which fails below like "gpu".
+        if backend == CompositorBackend::OpenGL
+            && capacity > num_inputs
+            && pref != "gpu"
+            && !enable_fx
+        {
             backend = if gst::ElementFactory::find(super::elements::CUDA_COMPOSITOR).is_some() {
                 CompositorBackend::Cuda
             } else {
@@ -213,7 +217,9 @@ impl BlockBuilder for VisionMixerBuilder {
         if backend == CompositorBackend::OpenGL && capacity > num_inputs {
             return Err(BlockBuildError::InvalidProperty(format!(
                 "max_inputs {} needs the CPU or CUDA backend: the OpenGL mixer has no \
-                 dynamic inputs yet (set max_inputs to 0 or num_inputs {})",
+                 dynamic inputs yet, and the CPU and CUDA ones have no shader FX \
+                 (set max_inputs to 0 or num_inputs {}, or turn off shader FX, or \
+                 choose the cpu or cuda backend)",
                 capacity, num_inputs
             )));
         }

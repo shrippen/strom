@@ -654,9 +654,9 @@ inputs in free slots) is live and takes effect immediately.
 With **Input Slots** (`max_inputs`) above **Number of Inputs**, the mixer
 reserves the extra slots and inputs can be added to and removed from it while
 it runs, without a restart and without interrupting program, audio or the
-outputs (CPU and CUDA backends; with **Auto** a mixer with free slots picks
-CUDA or the CPU instead of OpenGL, and asking for OpenGL with free slots fails
-for now):
+outputs (CPU and CUDA backends, which have no shader FX; with **Auto** and
+shader FX off, a mixer with free slots picks CUDA or the CPU instead of
+OpenGL; OpenGL with free slots fails for now):
 
 ```text
 GET    /api/flows/{flow}/blocks/{block}/inputs           the inputs and slots
