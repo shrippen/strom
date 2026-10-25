@@ -1037,6 +1037,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "The stored bus list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       },
@@ -1189,7 +1199,7 @@
             }
           },
           "409": {
-            "description": "A static bus (num_aux_buses)",
+            "description": "A static bus (num_aux_buses), or the stored bus list does not parse",
             "content": {
               "application/json": {
                 "schema": {
@@ -10340,6 +10350,13 @@
             "type": "integer",
             "description": "Buses built with the flow (`num_aux_buses`): they cannot be removed.",
             "minimum": 0
+          },
+          "unbuilt": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicAuxBus"
+            },
+            "description": "Stored buses the mixer does not build: they no longer fit the\nnumbers (`num_aux_buses`, `max_aux_buses`). They come back when the\nnumbers fit again; removing one takes it out of the store."
           }
         }
       },

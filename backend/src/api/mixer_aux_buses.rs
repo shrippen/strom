@@ -46,6 +46,7 @@ fn error_response(what: &str, e: AuxBusError) -> ApiError {
     responses(
         (status = 200, description = "The mixer's aux buses", body = MixerAuxBuses),
         (status = 404, description = "No audio mixer with this ID", body = ErrorResponse),
+        (status = 409, description = "The stored bus list does not parse", body = ErrorResponse),
     )
 )]
 pub async fn list_mixer_aux_buses(
@@ -111,7 +112,7 @@ pub async fn add_mixer_aux_bus(
     responses(
         (status = 200, description = "Bus removed; the mixer's aux buses afterwards", body = MixerAuxBuses),
         (status = 404, description = "No audio mixer, or no dynamic bus with this number", body = ErrorResponse),
-        (status = 409, description = "A static bus (num_aux_buses)", body = ErrorResponse),
+        (status = 409, description = "A static bus (num_aux_buses), or the stored bus list does not parse", body = ErrorResponse),
     )
 )]
 pub async fn remove_mixer_aux_bus(

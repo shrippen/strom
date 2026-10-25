@@ -340,7 +340,15 @@ impl StromApp {
         flow_copy.name = format!("{} (copy)", flow.name);
 
         // Regenerate all IDs
-        let flow_copy = Self::regenerate_flow_ids(flow_copy);
+        let mut flow_copy = Self::regenerate_flow_ids(flow_copy);
+        // A mixer's dynamic aux buses publish on their inter channels; the
+        // copy would take the same ones, and the flow started second would
+        // not start.
+        for block in &mut flow_copy.blocks {
+            block
+                .properties
+                .remove(strom_types::mixer::DYNAMIC_AUX_BUSES_PROPERTY);
+        }
 
         let api = self.api.clone();
         let tx = self.channels.sender();

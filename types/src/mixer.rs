@@ -131,6 +131,11 @@ pub struct MixerAuxBuses {
     pub num_static: usize,
     /// The dynamic buses, ascending by number.
     pub dynamic: Vec<DynamicAuxBus>,
+    /// Stored buses the mixer does not build: they no longer fit the
+    /// numbers (`num_aux_buses`, `max_aux_buses`). They come back when the
+    /// numbers fit again; removing one takes it out of the store.
+    #[serde(default)]
+    pub unbuilt: Vec<DynamicAuxBus>,
 }
 
 /// Parse the `dynamic_aux_buses` property. An empty string is no buses.
@@ -230,8 +235,20 @@ pub fn keep_dynamic_aux_buses(
     let Ok(buses) = parse_dynamic_aux_buses(json) else {
         return;
     };
+    // A bus whose number the flow now builds itself is the editor's.
+    let num_static = match new
+        .get("num_aux_buses")
+        .or_else(|| old.get("num_aux_buses"))
+    {
+        Some(crate::PropertyValue::Int(n)) => usize::try_from(*n).unwrap_or(0),
+        Some(crate::PropertyValue::UInt(n)) => usize::try_from(*n).unwrap_or(0),
+        _ => 0,
+    };
     for (name, value) in old {
-        if buses.iter().any(|bus| is_aux_bus_property(name, bus.aux)) {
+        if buses
+            .iter()
+            .any(|bus| bus.aux > num_static && is_aux_bus_property(name, bus.aux))
+        {
             new.entry(name.clone()).or_insert_with(|| value.clone());
         }
     }
@@ -319,5 +336,24 @@ mod tests {
         let mut reset = HashMap::new();
         keep_dynamic_aux_buses(&old, &mut reset, false);
         assert_eq!(reset.len(), 2);
+    }
+
+    #[test]
+    fn a_bus_now_static_is_the_editors() {
+        use crate::PropertyValue;
+        use std::collections::HashMap;
+        let json = serde_json::to_string(&[bus(2, "stage")]).unwrap();
+        let old: HashMap<String, PropertyValue> = [
+            (DYNAMIC_AUX_BUSES_PROPERTY, PropertyValue::String(json)),
+            ("aux2_fader", PropertyValue::Float(0.5)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        // The editor shows bus 2 and leaves its fader at the default out.
+        let mut saved: HashMap<String, PropertyValue> =
+            [("num_aux_buses".to_string(), PropertyValue::Int(2))].into();
+        keep_dynamic_aux_buses(&old, &mut saved, true);
+        assert!(!saved.contains_key("aux2_fader"));
     }
 }

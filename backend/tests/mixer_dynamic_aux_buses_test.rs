@@ -294,6 +294,10 @@ async fn a_bus_comes_and_goes_while_main_plays() {
     let buses = rig.add(Some(false)).await.expect("add a bus");
     assert_eq!(buses.dynamic.len(), 1);
     assert_eq!(buses.dynamic[0].aux, 2, "the lowest free number");
+    assert!(
+        rig.state.channels().get(&rig.channel).await.is_some(),
+        "the channel is not registered"
+    );
     assert!(matches!(
         rig.stored("ch1_aux2_pre").await,
         Some(PV::Bool(false))
@@ -328,6 +332,7 @@ async fn a_bus_comes_and_goes_while_main_plays() {
         .await
         .expect("remove the bus");
     assert!(buses.dynamic.is_empty());
+    assert!(rig.state.channels().get(&rig.channel).await.is_none());
     assert_eq!(rig.element_count().await, baseline, "elements left behind");
     assert!(rig.element(&format!("{BLOCK}:aux1_mixer")).await.is_none());
     for name in ["ch1_aux2_level", "ch1_aux2_pre", "dynamic_aux_buses"] {
@@ -405,6 +410,11 @@ async fn a_bus_that_no_longer_fits_stays_stored() {
         .await
         .unwrap();
     assert!(buses.dynamic.is_empty(), "bus 2 is not built as dynamic");
+    assert_eq!(
+        buses.unbuilt.len(),
+        1,
+        "the stored bus 2 is listed as unbuilt"
+    );
     // A new bus neither takes the stored one's channel nor drops it.
     assert!(matches!(
         rig.add_on("mixer_aux_test_fit_a").await,
@@ -441,6 +451,18 @@ async fn a_channel_carries_one_bus_across_flows_and_requests() {
         Err(AuxBusError::Conflict(_))
     ));
 
+    // Two adds at once on one channel: one gets it.
+    let (a, b) = tokio::join!(
+        rig.add_on("mixer_aux_test_one_d"),
+        rig.add_on("mixer_aux_test_one_d")
+    );
+    assert!(a.is_ok() != b.is_ok(), "{a:?} / {b:?}");
+    let aux = a.or(b).unwrap().dynamic[0].aux;
+    rig.state
+        .remove_mixer_aux_bus(&rig.flow_id, BLOCK, aux)
+        .await
+        .unwrap();
+
     // Two adds at once get a number each and are both stored.
     let (a, b) = tokio::join!(
         rig.add_on("mixer_aux_test_one_a"),
@@ -451,5 +473,64 @@ async fn a_channel_carries_one_bus_across_flows_and_requests() {
     let mut numbers: Vec<usize> = rig.stored_buses().await.iter().map(|b| b.aux).collect();
     numbers.sort();
     assert_eq!(numbers, [2, 3]);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_running_bus_is_removed_whatever_the_store_says() {
+    let rig = Rig::start("mixer_aux_test_store_a").await;
+    let baseline = rig.element_count().await;
+    let buses = rig.add_on("mixer_aux_test_store_a").await.unwrap();
+    let aux = buses.dynamic[0].aux;
+    rig.add_on("mixer_aux_test_store_b").await.unwrap();
+    // While it runs, the store loses the room for the second bus and a
+    // channel: both take effect on the next start.
+    let mut flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
+    let block = flow.blocks.iter_mut().find(|b| b.id == BLOCK).unwrap();
+    block
+        .properties
+        .insert("max_aux_buses".to_string(), PV::UInt(2));
+    block
+        .properties
+        .insert("num_channels".to_string(), PV::UInt(1));
+    rig.state.upsert_flow(flow).await.unwrap();
+    for bus in [aux + 1, aux] {
+        rig.state
+            .remove_mixer_aux_bus(&rig.flow_id, BLOCK, bus)
+            .await
+            .unwrap_or_else(|e| panic!("remove bus {bus}: {e}"));
+    }
+    assert_eq!(rig.element_count().await, baseline, "elements left behind");
+    assert!(rig
+        .state
+        .channels()
+        .get("mixer_aux_test_store_b")
+        .await
+        .is_none());
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_list_that_does_not_parse_is_kept() {
+    let rig = Rig::start("mixer_aux_test_parse").await;
+    let mut flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
+    let block = flow.blocks.iter_mut().find(|b| b.id == BLOCK).unwrap();
+    block
+        .properties
+        .insert("dynamic_aux_buses".to_string(), PV::String("[{".into()));
+    rig.state.upsert_flow(flow).await.unwrap();
+    assert!(matches!(
+        rig.state.mixer_aux_buses(&rig.flow_id, BLOCK).await,
+        Err(AuxBusError::Conflict(_))
+    ));
+    assert!(matches!(rig.add(None).await, Err(AuxBusError::Conflict(_))));
+    assert!(matches!(
+        rig.state.remove_mixer_aux_bus(&rig.flow_id, BLOCK, 2).await,
+        Err(AuxBusError::Conflict(_))
+    ));
+    assert!(matches!(
+        rig.stored("dynamic_aux_buses").await,
+        Some(PV::String(s)) if s == "[{"
+    ));
     rig.stop().await;
 }

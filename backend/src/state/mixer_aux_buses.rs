@@ -22,9 +22,9 @@ impl AppState {
         flow_id: &FlowId,
         block_id: &str,
     ) -> Result<MixerAuxBuses, AuxBusError> {
-        Ok(dynamic::aux_buses(
-            &self.mixer_properties(flow_id, block_id).await?,
-        ))
+        let properties = self.mixer_properties(flow_id, block_id).await?;
+        stored_list(&properties)?;
+        Ok(dynamic::aux_buses(&properties))
     }
 
     /// Add an aux bus to a running mixer. Returns the mixer's buses
@@ -52,6 +52,7 @@ impl AppState {
         })?;
         let added = dynamic::added_bus_properties(&properties, aux, &request);
         properties.extend(added.iter().cloned());
+        let bus_channel = request.channel.clone();
         let bus = DynamicAuxBus {
             aux,
             channel: request.channel,
@@ -62,6 +63,10 @@ impl AppState {
         let stored = self
             .store_aux_buses(flow_id, block_id, |buses| buses.push(bus), added, None)
             .await;
+        if stored.is_ok() {
+            self.register_aux_bus_channel(flow_id, block_id, &bus_channel)
+                .await;
+        }
         if stored.is_err() {
             // The block went while the bus was built: a bus nobody stored
             // would run on unseen.
@@ -87,7 +92,14 @@ impl AppState {
         let properties = self.mixer_properties(flow_id, block_id).await?;
         let buses = dynamic::aux_buses(&properties);
         let stored = stored_list(&properties)?;
-        if !stored.iter().any(|b| b.aux == aux) {
+        let listed = stored.iter().find(|b| b.aux == aux).cloned();
+        // What runs is the pipeline's: the stored numbers may have changed
+        // since it was built, or the list lost the bus.
+        let mut pipelines = self.inner.pipelines.write().await;
+        let built = pipelines
+            .get(flow_id)
+            .is_some_and(|m| dynamic::is_built_dynamic(m.pipeline(), block_id, aux));
+        if listed.is_none() && !built {
             return Err(if (1..=buses.num_static).contains(&aux) {
                 AuxBusError::Conflict(format!(
                     "aux bus {} is built with the flow (num_aux_buses) and cannot be removed",
@@ -97,14 +109,18 @@ impl AppState {
                 AuxBusError::NotFound(format!("aux bus {} is not a dynamic bus", aux))
             });
         }
-        let built = buses.dynamic.iter().any(|b| b.aux == aux);
+        let mut channel = listed.as_ref().map(|b| b.channel.clone());
         if built {
-            let mut pipelines = self.inner.pipelines.write().await;
             if let Some(manager) = pipelines.get_mut(flow_id) {
+                channel = dynamic::bus_channel(manager.pipeline(), block_id, aux).or(channel);
                 let removed =
                     dynamic::remove_aux_bus(manager.pipeline(), block_id, &properties, aux);
                 manager.forget_elements(&removed);
             }
+        }
+        drop(pipelines);
+        if let Some(channel) = channel {
+            self.channels().unregister(&channel).await;
         }
         // The bus's settings go with it, so one added later under its number
         // starts from the defaults; a number the flow now builds itself keeps
@@ -128,6 +144,25 @@ impl AppState {
                 .await;
         }
         result
+    }
+
+    /// Enter a dynamic bus's channel in the channel registry, so a second
+    /// producer on it is refused (see `check_channel_free`). The flow's stop
+    /// takes it out again with its other channels.
+    pub(crate) async fn register_aux_bus_channel(
+        &self,
+        flow_id: &FlowId,
+        block_id: &str,
+        channel: &str,
+    ) {
+        self.channels()
+            .register(crate::sharing::ChannelInfo {
+                source_flow_id: *flow_id,
+                output_name: format!("{}:aux_bus", block_id),
+                channel_name: channel.to_string(),
+                media_type: strom_types::MediaType::Audio,
+            })
+            .await;
     }
 
     /// Refuse `channel` for a new bus when another mixer stores a bus on it

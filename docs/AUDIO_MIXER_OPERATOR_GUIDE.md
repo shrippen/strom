@@ -247,8 +247,11 @@ number starts from the defaults.
 
 A stored bus that no longer fits the numbers (after raising **Aux Buses**
 or lowering the capacity) is not built and stays stored: it comes back once
-the numbers fit again, or `DELETE` removes it. Saving in the mixer editor
-keeps the dynamic buses and their settings.
+the numbers fit again (`GET` lists it under `unbuilt`), or `DELETE`
+removes it. Changes to the numbers or the channel count take effect on the
+next start: until then `DELETE` removes the bus that runs. Saving in the
+mixer editor keeps the dynamic buses and their settings; copying a flow
+leaves them out (the copy would publish on the same channels).
 
 ### 4.4 Monitor & Solo bus
 

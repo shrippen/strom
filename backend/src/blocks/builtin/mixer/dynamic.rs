@@ -65,12 +65,19 @@ pub enum AuxBusError {
 pub fn aux_buses(properties: &HashMap<String, PropertyValue>) -> MixerAuxBuses {
     let num_static = parse_num_aux_buses(properties);
     let capacity = parse_max_aux_buses(properties, num_static);
+    let dynamic = parse_dynamic_aux_buses(properties, num_static, capacity)
+        .map(|(buses, _)| buses)
+        .unwrap_or_default();
+    let unbuilt = stored_dynamic_aux_buses(properties)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|bus| !dynamic.contains(bus))
+        .collect();
     MixerAuxBuses {
         capacity,
         num_static,
-        dynamic: parse_dynamic_aux_buses(properties, num_static, capacity)
-            .map(|(buses, _)| buses)
-            .unwrap_or_default(),
+        dynamic,
+        unbuilt,
     }
 }
 
@@ -157,6 +164,34 @@ pub fn is_built(pipeline: &gst::Pipeline, instance_id: &str, aux: usize) -> bool
         .is_some()
 }
 
+/// Whether the running mixer `instance_id` has built aux bus `aux`
+/// (1-based) as a dynamic bus: one with its output on an inter channel.
+pub fn is_built_dynamic(pipeline: &gst::Pipeline, instance_id: &str, aux: usize) -> bool {
+    pipeline
+        .by_name(&format!("{}:{}", instance_id, aux_intersink_id(aux - 1)))
+        .is_some()
+}
+
+/// The inter channel dynamic aux bus `aux` (1-based) of the running mixer
+/// `instance_id` publishes on.
+pub fn bus_channel(pipeline: &gst::Pipeline, instance_id: &str, aux: usize) -> Option<String> {
+    let sink = pipeline.by_name(&format!("{}:{}", instance_id, aux_intersink_id(aux - 1)))?;
+    Some(sink.property::<String>("producer-name"))
+}
+
+/// The channels the running mixer `instance_id` has: the stored
+/// `num_channels` may have changed since it was built (it takes effect on
+/// the next start), the sends follow the pipeline.
+fn running_channels(pipeline: &gst::Pipeline, instance_id: &str) -> usize {
+    (0..)
+        .take_while(|ch| {
+            pipeline
+                .by_name(&format!("{}:{}", instance_id, send_tap_tee(*ch, true)))
+                .is_some()
+        })
+        .count()
+}
+
 /// Build dynamic aux bus `bus` into the running mixer `instance_id`, whose
 /// block properties are `properties` (with the values `added_bus_properties`
 /// gave). Returns the new elements, for the flow's element map.
@@ -174,7 +209,7 @@ pub fn add_aux_bus(
     let mut taps = Vec::new();
     aux_master(&spec, aux, properties, &mut elements, &mut links).map_err(failed)?;
     aux_inter_output(&spec, aux, &bus.channel, &mut elements, &mut links).map_err(failed)?;
-    for ch in 0..parse_num_channels(properties) {
+    for ch in 0..running_channels(pipeline, instance_id) {
         aux_send(&spec, ch, aux, properties, &mut elements, &mut links).map_err(failed)?;
         // `aux_send` puts the link from the channel's tap tee last.
         taps.push(links.pop().expect("aux_send links its tap"));
@@ -193,7 +228,8 @@ pub fn add_aux_bus(
     for (from, to) in &links {
         link(pipeline, from, to).map_err(undo)?;
     }
-    // Sinks first, so no element pushes into one that is not running yet.
+    // In reverse order of building, sends first; nothing pushes into the
+    // bus yet: the sends reach the channels' tees only below.
     for (id, element) in elements.iter().rev() {
         element
             .sync_state_with_parent()
@@ -226,7 +262,7 @@ pub fn remove_aux_bus(
     aux: usize,
 ) -> Vec<String> {
     let spec = BusSpec::new(instance_id, properties);
-    let names = bus_element_names(&spec, aux - 1, parse_num_channels(properties));
+    let names = bus_element_names(&spec, aux - 1, running_channels(pipeline, instance_id));
     teardown(pipeline, &spec, aux - 1, &names);
     // The latency is left as it is: lowering it while the mixer runs would
     // make every sink skip the difference, an audible jump on Main.

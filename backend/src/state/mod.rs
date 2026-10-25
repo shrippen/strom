@@ -1354,6 +1354,17 @@ impl AppState {
             }
         }
 
+        // Register the channels of the mixers' dynamic aux buses
+        for block in &flow.blocks {
+            if block.block_definition_id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID {
+                let buses = crate::blocks::builtin::mixer::dynamic::aux_buses(&block.properties);
+                for bus in buses.dynamic {
+                    self.register_aux_bus_channel(id, &block.id, &bus.channel)
+                        .await;
+                }
+            }
+        }
+
         // Register channels for InterOutput blocks
         for block in &flow.blocks {
             if block.block_definition_id == "builtin.inter_output" {
@@ -1730,6 +1741,8 @@ impl AppState {
                 }
             }
         }
+        // The rest of the flow's channels: the mixers' dynamic aux buses.
+        self.inner.channel_registry.unregister_flow(id).await;
 
         // Broadcast events
         // Note: FlowStateChanged is now broadcast from the bus watch on actual GStreamer
@@ -1856,6 +1869,17 @@ impl AppState {
             .ok_or_else(|| {
                 PipelineError::InvalidFlow(format!("Block definition not found: {}", definition_id))
             })?;
+
+        // A send's tap moves under the lock of the aux bus changes, held until
+        // it is stored: a bus removed meanwhile would get it back otherwise.
+        let _aux_bus_serial = if definition.id == crate::blocks::builtin::mixer::MIXER_BLOCK_ID
+            && properties.keys().any(|name| {
+                crate::blocks::builtin::mixer::dynamic::send_pre_property_target(name).is_some()
+            }) {
+            Some(self.inner.mixer_aux_buses.lock().await)
+        } else {
+            None
+        };
 
         // Live Audio Router: its crosspoint fade lives on the block, not on any
         // element, so resolve it here — a value sent in this same batch takes
@@ -1985,7 +2009,6 @@ impl AppState {
                         rejected.insert(name, "value must be a boolean".to_string());
                         continue;
                     };
-                    let _serial = self.inner.mixer_aux_buses.lock().await;
                     let applied = match self.inner.pipelines.read().await.get(flow_id) {
                         Some(manager) => dynamic::set_send_tap(
                             manager.pipeline(),
