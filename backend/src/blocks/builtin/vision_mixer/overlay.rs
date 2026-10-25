@@ -65,7 +65,8 @@ pub fn get_overlay_state(flow_id: &FlowId, block_id: &str) -> Option<Arc<VisionM
     )
 }
 
-/// Shared state read by the cairooverlay draw callback.
+/// Shared state of a running vision mixer, read by the overlay renderer and
+/// the runtime operations.
 ///
 /// Updated atomically from the API thread; read lock-free from the streaming thread.
 pub struct VisionMixerOverlayState {

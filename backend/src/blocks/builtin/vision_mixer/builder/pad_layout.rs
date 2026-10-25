@@ -81,8 +81,9 @@ fn underlay_initial_props(props: &mut HashMap<String, PropertyValue>, zorder: u3
 ///
 /// Since glvideomixerelement uses auto-created request pads (the linker uses
 /// link_pads(src, None)), pads are created sequentially in link order.
-/// The pipeline builders link in pad-index order (see `PadMap`), so the names
-/// here match the pads the GL mixer auto-creates.
+/// The GL builder links in pad-index order (see `PadMap`), so the names here
+/// match the pads the GL mixer auto-creates. The CPU `compositor` gets its
+/// pads requested by name, in any order.
 pub(super) fn build_pad_properties(
     p: &PipelineParams,
     mv_layout: &layout::OverlayLayout,

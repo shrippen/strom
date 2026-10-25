@@ -1406,3 +1406,56 @@ fn test_cpu_build_links_the_same_sink_pads_as_before_pad_map() {
     assert!(with_props("mixer").is_subset(&dist));
     assert_eq!(with_props("mv_comp"), mv);
 }
+
+/// The GL mixer names its auto-created pads in link order, so the GPU
+/// builder must link every compositor's sink pads in index order, with no
+/// gap: otherwise a pad named `sink_k` in the pad properties and the
+/// runtime operations is a different pad than the one linked for it.
+#[test]
+fn test_gpu_build_links_sink_pads_in_index_order() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+
+    gstreamer::init().unwrap();
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("gpu".into())),
+        ("num_inputs", PropertyValue::UInt(3)),
+        ("num_dsk_inputs", PropertyValue::String("2".into())),
+        ("num_pips", PropertyValue::String("2".into())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("GPU vision mixer builds (needs the GL plugins, not a GL context)");
+
+    for element in ["mixer", "mv_comp", "pvw_comp"] {
+        let order: Vec<usize> = built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect();
+        let expected: Vec<usize> = (0..order.len()).collect();
+        assert!(!order.is_empty(), "{element} has no sink links");
+        assert_eq!(order, expected, "{element} sink pads out of link order");
+    }
+}
+
+/// `num_inputs` given as a negative number counts as the minimum (it was
+/// the maximum through an unsigned wrap), and a string is read trimmed.
+#[test]
+fn test_parse_num_inputs_negative_and_padded() {
+    let mut props = HashMap::new();
+    props.insert("num_inputs".to_string(), PropertyValue::Int(-1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert(
+        "num_inputs".to_string(),
+        PropertyValue::String(" 8 ".to_string()),
+    );
+    assert_eq!(properties::parse_num_inputs(&props), Ok(8));
+}

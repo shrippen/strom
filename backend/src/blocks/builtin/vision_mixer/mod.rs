@@ -13,15 +13,19 @@
 //!
 //! GPU pipeline (per input; pad indices come from `strom_types::vision_mixer::PadMap`):
 //! ```text
-//! queue_i → glupload_i → glcolorconvert_i → tee_i
-//!   tee_i.src_0 → dist_comp.sink_i
-//!   tee_i.src_1 → mv_comp.sink_i          (thumbnail)
-//!   tee_i.src_2 → mv_comp.sink_{N+1+i}    (PVW big display candidate)
+//! queue_i → glupload_i → glcolorconvert_i → [fx_look_i] → tee_i
+//!   tee_i.src_0 → queue_to_dist_i → [fx_take_i] → mixer.sink_i
+//!   tee_i.src_1 → queue_to_mv_thumb_i → mv_comp.sink_i       (thumbnail)
+//!   tee_i.src_2 → queue_to_mv_pvw_i → mv_comp.sink_{N+1+i}   (PVW big display candidate)
 //! ```
+//! The CPU and CUDA pipelines have the same branches, with a convert (and
+//! on CUDA an upload) in front of the tee and a `videocrop` in front of
+//! every croppable compositor pad.
 //!
-//! Distribution output: `dist_comp → capsfilter_dist → tee_pgm → [pgm_out]`
-//! Multiview output: `mv_comp → [download] → capsfilter_mv → tee_mv → [multiview_out]`
-//! (the overlay is an `appsrc` pad on `mv_comp`, not a cairooverlay element)
+//! The outputs (see the builders for the exact chains): `mixer` feeds
+//! `tee_pgm` and `[pgm_out]` through `capsfilter_dist`, `mv_comp` feeds
+//! `[multiview_out]` through `capsfilter_mv`. The multiview overlay is an
+//! `appsrc` pad on `mv_comp`, not a cairooverlay element.
 
 mod builder;
 mod definition;

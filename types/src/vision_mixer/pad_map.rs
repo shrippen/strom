@@ -23,6 +23,9 @@
 //! sink_{overlay+1+i}              PVW border underlays (only with PiPs)
 //! sink_{overlay+1+C*(1+p)+i}      PiP tile border underlays (only with PiPs)
 //! ```
+//! The dist pad of input `i` is `sink_i` on purpose: transitions, the T-bar
+//! and the stinger address it by input index (an invariant of this map).
+//!
 //! Preview output compositor (`pvw_comp`): inputs at `sink_i`, border
 //! underlays (only with PiPs) at `sink_{C+i}`.
 
@@ -58,7 +61,9 @@ impl PadMap {
 
     // --- Distribution compositor ---
 
-    /// Dist pad of input `i`.
+    /// Dist pad of input `i`. Always `i`: transitions, the T-bar and the
+    /// stinger address a dist input pad by its input index, so this is an
+    /// invariant, not a detail of the layout.
     pub fn dist_input(&self, i: usize) -> usize {
         i
     }
