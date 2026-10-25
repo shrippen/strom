@@ -175,6 +175,68 @@ pub fn validate_dynamic_aux_buses(
     Ok(())
 }
 
+/// The buses of `buses` a mixer can build, in order, and why each other one
+/// is left out: outside `num_static + 1..=capacity`, a number or channel
+/// already taken by an earlier entry, or no channel. A stored list that
+/// stopped fitting (the operator changed `num_aux_buses` or `max_aux_buses`)
+/// so loses only the buses that no longer fit, and keeps them stored.
+pub fn buildable_dynamic_aux_buses(
+    buses: &[DynamicAuxBus],
+    num_static: usize,
+    capacity: usize,
+) -> (Vec<DynamicAuxBus>, Vec<String>) {
+    let mut built: Vec<DynamicAuxBus> = Vec::new();
+    let mut skipped = Vec::new();
+    for bus in buses {
+        let mut with = built.clone();
+        with.push(bus.clone());
+        match validate_dynamic_aux_buses(&with, num_static, capacity) {
+            Ok(()) => built = with,
+            Err(reason) => skipped.push(reason),
+        }
+    }
+    (built, skipped)
+}
+
+/// Whether block property `name` belongs to aux bus `aux` (1-based): its
+/// master (`auxN_…`) or a send into it (`chM_auxN_…`). They go with the bus.
+pub fn is_aux_bus_property(name: &str, aux: usize) -> bool {
+    let master = format!("aux{}_", aux);
+    let send = format!("_aux{}_", aux);
+    name.starts_with(&master) || (name.starts_with("ch") && name.contains(&send))
+}
+
+/// Carry the dynamic aux buses of a mixer's stored properties `old` over
+/// into `new`, properties written by a client that does not know them (the
+/// mixer editor): `max_aux_buses`, `dynamic_aux_buses` and, with
+/// `settings`, every property of a stored dynamic bus that `new` does not
+/// set. Without it, saving the editor would drop buses added at runtime.
+pub fn keep_dynamic_aux_buses(
+    old: &std::collections::HashMap<String, crate::PropertyValue>,
+    new: &mut std::collections::HashMap<String, crate::PropertyValue>,
+    settings: bool,
+) {
+    for name in [MAX_AUX_BUSES_PROPERTY, DYNAMIC_AUX_BUSES_PROPERTY] {
+        if let Some(value) = old.get(name) {
+            new.entry(name.to_string()).or_insert_with(|| value.clone());
+        }
+    }
+    if !settings {
+        return;
+    }
+    let Some(crate::PropertyValue::String(json)) = old.get(DYNAMIC_AUX_BUSES_PROPERTY) else {
+        return;
+    };
+    let Ok(buses) = parse_dynamic_aux_buses(json) else {
+        return;
+    };
+    for (name, value) in old {
+        if buses.iter().any(|bus| is_aux_bus_property(name, bus.aux)) {
+            new.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +265,59 @@ mod tests {
         assert!(validate_dynamic_aux_buses(&[bus(2, "a"), bus(2, "b")], 1, 4).is_err());
         assert!(validate_dynamic_aux_buses(&[bus(2, "a"), bus(3, "a")], 1, 4).is_err());
         assert!(validate_dynamic_aux_buses(&[bus(2, " ")], 1, 4).is_err());
+    }
+
+    #[test]
+    fn buses_that_stopped_fitting_are_left_out_one_by_one() {
+        let stored = [
+            bus(2, "stage"),
+            bus(4, "stream"),
+            bus(3, "stage"),
+            bus(5, "x"),
+        ];
+        let (built, skipped) = buildable_dynamic_aux_buses(&stored, 2, 4);
+        // Bus 2 is static now and 5 beyond the capacity; 3 takes the
+        // channel of 2, which is left out.
+        assert_eq!(built, [bus(4, "stream"), bus(3, "stage")]);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+    }
+
+    #[test]
+    fn the_editor_keeps_the_dynamic_buses() {
+        use crate::PropertyValue;
+        use std::collections::HashMap;
+        let json = serde_json::to_string(&[bus(3, "stream")]).unwrap();
+        let old: HashMap<String, PropertyValue> = [
+            (MAX_AUX_BUSES_PROPERTY, PropertyValue::UInt(4)),
+            (DYNAMIC_AUX_BUSES_PROPERTY, PropertyValue::String(json)),
+            ("aux3_fader", PropertyValue::Float(0.5)),
+            ("ch1_aux3_level", PropertyValue::Float(0.7)),
+            ("aux1_fader", PropertyValue::Float(0.2)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut saved: HashMap<String, PropertyValue> =
+            [("ch1_aux3_level".to_string(), PropertyValue::Float(0.9))].into();
+        keep_dynamic_aux_buses(&old, &mut saved, true);
+        let float = |name: &str| match saved.get(name) {
+            Some(PropertyValue::Float(f)) => Some(*f),
+            _ => None,
+        };
+        assert_eq!(float("aux3_fader"), Some(0.5));
+        assert_eq!(
+            float("ch1_aux3_level"),
+            Some(0.9),
+            "the editor's value wins"
+        );
+        assert!(saved.contains_key(DYNAMIC_AUX_BUSES_PROPERTY));
+        assert!(
+            !saved.contains_key("aux1_fader"),
+            "a static bus is the editor's"
+        );
+
+        let mut reset = HashMap::new();
+        keep_dynamic_aux_buses(&old, &mut reset, false);
+        assert_eq!(reset.len(), 2);
     }
 }

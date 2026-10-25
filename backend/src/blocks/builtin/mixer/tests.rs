@@ -1639,9 +1639,26 @@ fn loudest(bus: &gst::Bus, name: &str, window: Duration) -> f64 {
     loudest
 }
 
+/// A pipeline listening to an inter channel; stopped when dropped, also when
+/// an assertion fails first.
+struct Listener(gst::Pipeline);
+
+impl std::ops::Deref for Listener {
+    type Target = gst::Pipeline;
+    fn deref(&self) -> &gst::Pipeline {
+        &self.0
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self.0.set_state(gst::State::Null);
+    }
+}
+
 /// A pipeline that listens to inter channel `channel` through a `level`
 /// named `level_name`.
-fn listen(channel: &str, level_name: &str) -> gst::Pipeline {
+fn listen(channel: &str, level_name: &str) -> Listener {
     let pipeline = gst::Pipeline::new();
     let src = gst::ElementFactory::make("intersrc")
         .property("producer-name", channel)
@@ -1661,7 +1678,7 @@ fn listen(channel: &str, level_name: &str) -> gst::Pipeline {
     pipeline.add_many([&src, &level, &sink]).unwrap();
     gst::Element::link_many([&src, &level, &sink]).unwrap();
     pipeline.set_state(gst::State::Playing).unwrap();
-    pipeline
+    Listener(pipeline)
 }
 
 fn dyn_bus(aux: usize, channel: &str) -> DynamicAuxBus {
@@ -1763,7 +1780,6 @@ fn test_aux_bus_added_at_runtime_is_heard_and_removed_cleanly() {
     dynamic::add_aux_bus(&m.pipeline, INSTANCE, &properties, &dyn_bus(2, channel))
         .expect("add the bus again");
     assert!(loudest(&ears_bus, "ears", Duration::from_secs(2)) > -40.0);
-    let _ = ears.set_state(gst::State::Null);
 }
 
 #[test]
@@ -1859,7 +1875,7 @@ fn test_bus_property_names() {
         assert_eq!(dynamic::send_pre_property_target(name), None, "{name}");
     }
     for name in ["aux2_fader", "aux2_afl", "ch1_aux2_level", "ch12_aux2_pre"] {
-        assert!(dynamic::is_bus_property(name, 2), "{name}");
+        assert!(strom_types::mixer::is_aux_bus_property(name, 2), "{name}");
     }
     for name in [
         "aux12_fader",
@@ -1867,7 +1883,7 @@ fn test_bus_property_names() {
         "ch2_fader",
         "group2_fader",
     ] {
-        assert!(!dynamic::is_bus_property(name, 2), "{name}");
+        assert!(!strom_types::mixer::is_aux_bus_property(name, 2), "{name}");
     }
     let props = small_mixer_props(&[]);
     let mut req = request(None, "a");

@@ -227,7 +227,8 @@ impl StromApp {
 
             // Handle mixer save request
             if editor.needs_save() {
-                let props = if editor.is_reset() {
+                let reset = editor.is_reset();
+                let mut props = if reset {
                     editor.collect_structural_properties()
                 } else {
                     editor.collect_properties()
@@ -238,6 +239,13 @@ impl StromApp {
 
                 if let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id) {
                     if let Some(block) = flow.blocks.iter_mut().find(|b| b.id == block_id) {
+                        // The editor does not show buses added at runtime;
+                        // they stay, a reset only clears their settings.
+                        strom_types::mixer::keep_dynamic_aux_buses(
+                            &block.properties,
+                            &mut props,
+                            !reset,
+                        );
                         block.properties = props;
                     }
                     let flow_clone = flow.clone();

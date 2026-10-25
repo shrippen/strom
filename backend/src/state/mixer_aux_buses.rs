@@ -5,11 +5,13 @@
 use std::collections::HashMap;
 
 use strom_types::mixer::{
-    AddMixerAuxBusRequest, DynamicAuxBus, MixerAuxBuses, DYNAMIC_AUX_BUSES_PROPERTY,
+    is_aux_bus_property, AddMixerAuxBusRequest, DynamicAuxBus, MixerAuxBuses,
+    DYNAMIC_AUX_BUSES_PROPERTY,
 };
-use strom_types::{FlowId, PropertyValue};
+use strom_types::{FlowId, PropertyValue, StromEvent};
 
 use super::AppState;
+use crate::blocks::builtin::mixer::dynamic::stored_dynamic_aux_buses;
 use crate::blocks::builtin::mixer::dynamic::{self, AuxBusError};
 use crate::blocks::builtin::mixer::MIXER_BLOCK_ID;
 
@@ -33,11 +35,14 @@ impl AppState {
         block_id: &str,
         request: AddMixerAuxBusRequest,
     ) -> Result<MixerAuxBuses, AuxBusError> {
+        // One change at a time: a second add would not see the first one's
+        // number or channel until it is stored.
+        let _serial = self.inner.mixer_aux_buses.lock().await;
         // Read before the pipelines are locked: no lock on the flows is
-        // taken while one on the pipelines is held. The write lock on the
-        // pipelines keeps a second add from building the same number
-        // (`is_built`) between the check and the build.
+        // taken while one on the pipelines is held.
         let mut properties = self.mixer_properties(flow_id, block_id).await?;
+        self.check_channel_free(flow_id, block_id, &request.channel)
+            .await?;
         let mut pipelines = self.inner.pipelines.write().await;
         let manager = pipelines
             .get_mut(flow_id)
@@ -54,52 +59,113 @@ impl AppState {
         let elements = dynamic::add_aux_bus(manager.pipeline(), block_id, &properties, &bus)?;
         manager.adopt_elements(elements);
         drop(pipelines);
-        self.store_aux_buses(flow_id, block_id, |buses| buses.push(bus), added, None)
-            .await
+        let stored = self
+            .store_aux_buses(flow_id, block_id, |buses| buses.push(bus), added, None)
+            .await;
+        if stored.is_err() {
+            // The block went while the bus was built: a bus nobody stored
+            // would run on unseen.
+            if let Some(manager) = self.inner.pipelines.write().await.get_mut(flow_id) {
+                let removed =
+                    dynamic::remove_aux_bus(manager.pipeline(), block_id, &properties, aux);
+                manager.forget_elements(&removed);
+            }
+        }
+        stored
     }
 
-    /// Remove a dynamic aux bus from a running mixer. Returns the mixer's
-    /// buses afterwards.
+    /// Remove a dynamic aux bus from a mixer, running or not. Returns the
+    /// mixer's buses afterwards. A stored bus that no longer fits the
+    /// mixer's numbers (not built) can be removed too.
     pub async fn remove_mixer_aux_bus(
         &self,
         flow_id: &FlowId,
         block_id: &str,
         aux: usize,
     ) -> Result<MixerAuxBuses, AuxBusError> {
+        let serial = self.inner.mixer_aux_buses.lock().await;
         let properties = self.mixer_properties(flow_id, block_id).await?;
         let buses = dynamic::aux_buses(&properties);
-        if (1..=buses.num_static).contains(&aux) {
+        let stored = stored_list(&properties)?;
+        if !stored.iter().any(|b| b.aux == aux) {
+            return Err(if (1..=buses.num_static).contains(&aux) {
+                AuxBusError::Conflict(format!(
+                    "aux bus {} is built with the flow (num_aux_buses) and cannot be removed",
+                    aux
+                ))
+            } else {
+                AuxBusError::NotFound(format!("aux bus {} is not a dynamic bus", aux))
+            });
+        }
+        let built = buses.dynamic.iter().any(|b| b.aux == aux);
+        if built {
+            let mut pipelines = self.inner.pipelines.write().await;
+            if let Some(manager) = pipelines.get_mut(flow_id) {
+                let removed =
+                    dynamic::remove_aux_bus(manager.pipeline(), block_id, &properties, aux);
+                manager.forget_elements(&removed);
+            }
+        }
+        // The bus's settings go with it, so one added later under its number
+        // starts from the defaults; a number the flow now builds itself keeps
+        // them (they are that bus's).
+        let dropped = (aux > buses.num_static).then_some(aux);
+        let result = self
+            .store_aux_buses(
+                flow_id,
+                block_id,
+                |buses| buses.retain(|b| b.aux != aux),
+                Vec::new(),
+                dropped,
+            )
+            .await;
+        drop(serial);
+        if built {
+            // An AFL on the bus goes with it.
+            self.set_mixer_solo_intent(flow_id, block_id, &format!("aux{}_afl", aux), false)
+                .await;
+            self.refresh_mixer_monitor_gates(flow_id, block_id, None)
+                .await;
+        }
+        result
+    }
+
+    /// Refuse `channel` for a new bus when another mixer stores a bus on it
+    /// or a running flow publishes on it: two producers on one inter channel
+    /// fail, and the flow that starts second would not start at all.
+    async fn check_channel_free(
+        &self,
+        flow_id: &FlowId,
+        block_id: &str,
+        channel: &str,
+    ) -> Result<(), AuxBusError> {
+        let taken = {
+            let flows = self.inner.flows.read().await;
+            flows.values().find_map(|flow| {
+                flow.blocks
+                    .iter()
+                    .filter(|b| b.block_definition_id == MIXER_BLOCK_ID)
+                    .filter(|b| !(flow.id == *flow_id && b.id == block_id))
+                    .find_map(|b| {
+                        let stored = stored_dynamic_aux_buses(&b.properties).ok()?;
+                        let bus = stored.iter().find(|bus| bus.channel == channel)?;
+                        Some(format!(
+                            "channel {} is taken by aux bus {} of block {} in flow {}",
+                            channel, bus.aux, b.id, flow.id
+                        ))
+                    })
+            })
+        };
+        if let Some(reason) = taken {
+            return Err(AuxBusError::Conflict(reason));
+        }
+        if let Some(info) = self.channels().get(channel).await {
             return Err(AuxBusError::Conflict(format!(
-                "aux bus {} is built with the flow (num_aux_buses) and cannot be removed",
-                aux
+                "channel {} is published by flow {}",
+                channel, info.source_flow_id
             )));
         }
-        if !buses.dynamic.iter().any(|b| b.aux == aux) {
-            return Err(AuxBusError::NotFound(format!(
-                "aux bus {} is not a dynamic bus",
-                aux
-            )));
-        }
-        // A stopped flow only loses the stored bus.
-        let mut pipelines = self.inner.pipelines.write().await;
-        if let Some(manager) = pipelines.get_mut(flow_id) {
-            let removed = dynamic::remove_aux_bus(manager.pipeline(), block_id, &properties, aux);
-            manager.forget_elements(&removed);
-        }
-        drop(pipelines);
-        // An AFL on the bus goes with it.
-        self.set_mixer_solo_intent(flow_id, block_id, &format!("aux{}_afl", aux), false)
-            .await;
-        self.refresh_mixer_monitor_gates(flow_id, block_id, None)
-            .await;
-        self.store_aux_buses(
-            flow_id,
-            block_id,
-            |buses| buses.retain(|b| b.aux != aux),
-            Vec::new(),
-            Some(aux),
-        )
-        .await
+        Ok(())
     }
 
     /// The stored properties of mixer block `block_id`.
@@ -144,13 +210,15 @@ impl AppState {
                 .ok_or_else(|| {
                     AuxBusError::NotFound(format!("no block {} in flow {}", block_id, flow_id))
                 })?;
-            let mut list = dynamic::aux_buses(&block.properties).dynamic;
+            // Every stored bus, also one that no longer fits and is not
+            // built: it comes back when the numbers fit again.
+            let mut list = stored_list(&block.properties)?;
             change(&mut list);
             list.sort_by_key(|b| b.aux);
             if let Some(aux) = dropped {
                 block
                     .properties
-                    .retain(|name, _| !dynamic::is_bus_property(name, aux));
+                    .retain(|name, _| !is_aux_bus_property(name, aux));
             }
             block.properties.extend(set);
             if list.is_empty() {
@@ -165,8 +233,23 @@ impl AppState {
             dynamic::aux_buses(&block.properties)
         };
         self.mark_flow_dirty(*flow_id).await;
+        // Clients holding the flow (the mixer editor) see the new list
+        // before they save theirs.
+        self.inner
+            .events
+            .broadcast(StromEvent::FlowUpdated { flow_id: *flow_id });
         Ok(buses)
     }
+}
+
+/// The stored bus list of a mixer with these properties. One that does not
+/// parse is refused rather than replaced: storing over it would lose every
+/// bus in it.
+fn stored_list(
+    properties: &HashMap<String, PropertyValue>,
+) -> Result<Vec<DynamicAuxBus>, AuxBusError> {
+    stored_dynamic_aux_buses(properties)
+        .map_err(|e| AuxBusError::Conflict(format!("{}; fix or remove it first", e)))
 }
 
 fn not_running(flow_id: &FlowId) -> AuxBusError {

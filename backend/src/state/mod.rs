@@ -101,6 +101,9 @@ struct AppStateInner {
     ice_transport_policy: String,
     /// Flows pending save (debounced to avoid excessive disk writes)
     pending_saves: RwLock<HashSet<FlowId>>,
+    /// Serializes changes to mixers' aux buses (add, remove, a send's tap):
+    /// each reads the stored buses, changes the pipeline and stores again.
+    mixer_aux_buses: tokio::sync::Mutex<()>,
     /// Handle for reloading the tracing EnvFilter at runtime
     log_reload_handle: parking_lot::Mutex<Option<LogReloadHandle>>,
     /// The log filter string the server was started with
@@ -181,6 +184,7 @@ impl AppState {
                 ice_servers,
                 ice_transport_policy,
                 pending_saves: RwLock::new(HashSet::new()),
+                mixer_aux_buses: tokio::sync::Mutex::new(()),
                 log_reload_handle: parking_lot::Mutex::new(None),
                 default_log_filter: parking_lot::Mutex::new("info".to_string()),
                 gst_debug_filter: parking_lot::Mutex::new(String::new()),
@@ -1981,6 +1985,7 @@ impl AppState {
                         rejected.insert(name, "value must be a boolean".to_string());
                         continue;
                     };
+                    let _serial = self.inner.mixer_aux_buses.lock().await;
                     let applied = match self.inner.pipelines.read().await.get(flow_id) {
                         Some(manager) => dynamic::set_send_tap(
                             manager.pipeline(),

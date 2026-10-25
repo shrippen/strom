@@ -236,12 +236,19 @@ mixer: Main, the other buses and the outputs play on.
 
 Such a bus has no output pad: it publishes its output on the inter channel
 `channel`, which an **Inter Input** block (or any `intersrc` with that
-producer name) picks up. Each channel gets a send into it at level 0; the
+producer name) in another flow picks up; in the mixer's own flow it would
+close a loop. A channel carries one bus: a channel that another mixer's bus
+or a running flow already publishes on is refused (409). Each channel gets a send into it at level 0; the
 bus takes the same properties as a static one (`auxM_fader`, `auxM_mute`,
 `auxM_afl`, `chN_auxM_level`, `chN_auxM_pre`). The buses are stored in the
 block property `dynamic_aux_buses` and built again on restart. A removed
 bus takes its stored properties with it, so a bus added later under its
 number starts from the defaults.
+
+A stored bus that no longer fits the numbers (after raising **Aux Buses**
+or lowering the capacity) is not built and stays stored: it comes back once
+the numbers fit again, or `DELETE` removes it. Saving in the mixer editor
+keeps the dynamic buses and their settings.
 
 ### 4.4 Monitor & Solo bus
 

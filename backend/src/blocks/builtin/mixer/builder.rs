@@ -97,13 +97,22 @@ impl BlockBuilder for MixerBuilder {
         let num_groups = parse_num_groups(properties);
         let monitor_source = parse_monitor_source(properties, num_aux_buses);
         let aux_capacity = parse_max_aux_buses(properties, num_aux_buses);
-        // A stored bus list that does not parse leaves the mixer without its
-        // dynamic buses rather than without sound.
-        let dynamic_aux_buses = parse_dynamic_aux_buses(properties, num_aux_buses, aux_capacity)
-            .unwrap_or_else(|e| {
-                warn!("Mixer {}: {}", instance_id, e);
-                Vec::new()
-            });
+        // A stored bus that no longer fits is left out, a list that does not
+        // parse leaves the mixer without its dynamic buses: either way
+        // rather than without sound. They stay stored.
+        let dynamic_aux_buses =
+            match parse_dynamic_aux_buses(properties, num_aux_buses, aux_capacity) {
+                Ok((buses, skipped)) => {
+                    for reason in skipped {
+                        warn!("Mixer {}: aux bus left out: {}", instance_id, reason);
+                    }
+                    buses
+                }
+                Err(e) => {
+                    warn!("Mixer {}: {}", instance_id, e);
+                    Vec::new()
+                }
+            };
         // Every built aux bus, 0-based: the static ones, then the dynamic.
         let built_aux_buses: Vec<usize> = (0..num_aux_buses)
             .chain(dynamic_aux_buses.iter().map(|bus| bus.aux - 1))

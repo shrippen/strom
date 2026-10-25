@@ -360,3 +360,96 @@ async fn a_bus_comes_back_after_a_restart() {
     drop(ears);
     rig.stop().await;
 }
+
+impl Rig {
+    async fn add_on(&self, channel: &str) -> Result<MixerAuxBuses, AuxBusError> {
+        self.state
+            .add_mixer_aux_bus(
+                &self.flow_id,
+                BLOCK,
+                AddMixerAuxBusRequest {
+                    aux: None,
+                    channel: channel.to_string(),
+                    pre_fader: None,
+                },
+            )
+            .await
+    }
+
+    async fn stored_buses(&self) -> Vec<strom_types::mixer::DynamicAuxBus> {
+        match self.stored("dynamic_aux_buses").await {
+            Some(PV::String(json)) => strom_types::mixer::parse_dynamic_aux_buses(&json).unwrap(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bus_that_no_longer_fits_stays_stored() {
+    let rig = Rig::start("mixer_aux_test_fit_a").await;
+    rig.add(None).await.expect("add bus 2");
+    rig.set("aux2_fader", PV::Float(0.5)).await;
+    rig.state.stop_flow(&rig.flow_id).await.unwrap();
+    // The operator builds two buses with the flow: bus 2 is now static.
+    let mut flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
+    let block = flow.blocks.iter_mut().find(|b| b.id == BLOCK).unwrap();
+    block
+        .properties
+        .insert("num_aux_buses".to_string(), PV::UInt(2));
+    rig.state.upsert_flow(flow).await.unwrap();
+    rig.start_flow().await;
+
+    let buses = rig
+        .state
+        .mixer_aux_buses(&rig.flow_id, BLOCK)
+        .await
+        .unwrap();
+    assert!(buses.dynamic.is_empty(), "bus 2 is not built as dynamic");
+    // A new bus neither takes the stored one's channel nor drops it.
+    assert!(matches!(
+        rig.add_on("mixer_aux_test_fit_a").await,
+        Err(AuxBusError::Conflict(_))
+    ));
+    let buses = rig.add_on("mixer_aux_test_fit_b").await.expect("add bus 3");
+    assert_eq!(buses.dynamic.len(), 1);
+    assert_eq!(buses.dynamic[0].aux, 3);
+    assert_eq!(rig.stored_buses().await.len(), 2, "the stored bus 2 went");
+
+    // Removing the stored bus 2 leaves the settings of the static bus 2.
+    rig.state
+        .remove_mixer_aux_bus(&rig.flow_id, BLOCK, 2)
+        .await
+        .expect("remove the stored bus 2");
+    let left: Vec<usize> = rig.stored_buses().await.iter().map(|b| b.aux).collect();
+    assert_eq!(left, [3]);
+    assert!(matches!(rig.stored("aux2_fader").await, Some(PV::Float(_))));
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_carries_one_bus_across_flows_and_requests() {
+    let rig = Rig::start("mixer_aux_test_one_a").await;
+    // Another flow, not running, stores a bus on a channel.
+    let mut other = mixer_flow();
+    let json = r#"[{"aux":2,"channel":"mixer_aux_test_one_b"}]"#;
+    other.blocks[0]
+        .properties
+        .insert("dynamic_aux_buses".to_string(), PV::String(json.into()));
+    rig.state.upsert_flow(other).await.unwrap();
+    assert!(matches!(
+        rig.add_on("mixer_aux_test_one_b").await,
+        Err(AuxBusError::Conflict(_))
+    ));
+
+    // Two adds at once get a number each and are both stored.
+    let (a, b) = tokio::join!(
+        rig.add_on("mixer_aux_test_one_a"),
+        rig.add_on("mixer_aux_test_one_c")
+    );
+    a.expect("first add");
+    b.expect("second add");
+    let mut numbers: Vec<usize> = rig.stored_buses().await.iter().map(|b| b.aux).collect();
+    numbers.sort();
+    assert_eq!(numbers, [2, 3]);
+    rig.stop().await;
+}

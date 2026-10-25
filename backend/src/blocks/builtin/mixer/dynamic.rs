@@ -36,6 +36,7 @@ use strom_types::PropertyValue;
 use tracing::{info, warn};
 
 use super::buses::*;
+pub(crate) use super::properties::stored_dynamic_aux_buses;
 use super::properties::{
     parse_dynamic_aux_buses, parse_max_aux_buses, parse_num_aux_buses, parse_num_channels,
 };
@@ -67,7 +68,9 @@ pub fn aux_buses(properties: &HashMap<String, PropertyValue>) -> MixerAuxBuses {
     MixerAuxBuses {
         capacity,
         num_static,
-        dynamic: parse_dynamic_aux_buses(properties, num_static, capacity).unwrap_or_default(),
+        dynamic: parse_dynamic_aux_buses(properties, num_static, capacity)
+            .map(|(buses, _)| buses)
+            .unwrap_or_default(),
     }
 }
 
@@ -103,7 +106,17 @@ pub fn choose_aux(
             capacity
         )));
     }
-    let taken = |aux: usize| buses.dynamic.iter().any(|b| b.aux == aux) || built(aux);
+    // Stored buses that no longer fit (not built) keep their number and
+    // channel: they come back when the numbers fit again.
+    let stored = stored_dynamic_aux_buses(properties)
+        .map_err(|e| AuxBusError::Conflict(format!("{}; fix or remove it to add buses", e)))?;
+    if let Some(bus) = stored.iter().find(|b| b.channel == request.channel) {
+        return Err(AuxBusError::Conflict(format!(
+            "channel {} is taken by aux bus {}",
+            request.channel, bus.aux
+        )));
+    }
+    let taken = |aux: usize| stored.iter().any(|b| b.aux == aux) || built(aux);
     let aux = match request.aux {
         Some(aux) if aux < first || aux > capacity => {
             return Err(AuxBusError::Invalid(format!(
@@ -215,6 +228,8 @@ pub fn remove_aux_bus(
     let spec = BusSpec::new(instance_id, properties);
     let names = bus_element_names(&spec, aux - 1, parse_num_channels(properties));
     teardown(pipeline, &spec, aux - 1, &names);
+    // The latency is left as it is: lowering it while the mixer runs would
+    // make every sink skip the difference, an audible jump on Main.
     info!("Mixer {}: removed aux bus {}", instance_id, aux);
     names
 }
@@ -240,22 +255,36 @@ pub fn set_send_tap(
     let sink = send
         .static_pad("sink")
         .ok_or_else(|| format!("{} has no sink pad", send.name()))?;
+    let mut old_tee = None;
     if let Some(old) = sink.peer() {
         if old.parent_element().as_ref() == Some(&tee) {
             return Ok(());
         }
-        if let Some(old_tee) = old.parent_element() {
-            old_tee.release_request_pad(&old);
+        if let Some(parent) = old.parent_element() {
+            parent.release_request_pad(&old);
+            old_tee = Some(parent);
         }
     }
-    let new = tee
+    let linked = tee
         .request_pad_simple("src_%u")
-        .ok_or_else(|| format!("{} gave no pad", tee_id))?;
-    new.link(&sink).map_err(|e| {
-        tee.release_request_pad(&new);
-        format!("cannot link {} to {}: {:?}", tee_id, send.name(), e)
-    })?;
-    Ok(())
+        .ok_or_else(|| format!("{} gave no pad", tee_id))
+        .and_then(|new| {
+            new.link(&sink).map(|_| ()).map_err(|e| {
+                tee.release_request_pad(&new);
+                format!("cannot link {} to {}: {:?}", tee_id, send.name(), e)
+            })
+        });
+    if linked.is_err() {
+        // Back on the tee it had, so the send keeps its sound.
+        if let Some(old_tee) = old_tee {
+            if let Some(pad) = old_tee.request_pad_simple("src_%u") {
+                if pad.link(&sink).is_err() {
+                    old_tee.release_request_pad(&pad);
+                }
+            }
+        }
+    }
+    linked
 }
 
 /// The channel and aux bus (both 0-based) of a send's tap property
@@ -265,14 +294,6 @@ pub fn send_pre_property_target(name: &str) -> Option<(usize, usize)> {
     let (ch, aux) = rest.split_once("_aux")?;
     let (ch, aux) = (ch.parse::<usize>().ok()?, aux.parse::<usize>().ok()?);
     (ch >= 1 && aux >= 1).then(|| (ch - 1, aux - 1))
-}
-
-/// Whether block property `name` belongs to aux bus `aux` (1-based): its
-/// master (`auxN_…`) or a send into it (`chM_auxN_…`). They go with the bus.
-pub fn is_bus_property(name: &str, aux: usize) -> bool {
-    let master = format!("aux{}_", aux);
-    let send = format!("_aux{}_", aux);
-    name.starts_with(&master) || (name.starts_with("ch") && name.contains(&send))
 }
 
 /// Every element of aux bus `aux` (0-based), sends first, so stopping them
