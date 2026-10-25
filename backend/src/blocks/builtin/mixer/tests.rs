@@ -705,6 +705,15 @@ fn test_monitor_source_is_an_aux_bus_instead_of_main() {
     );
     // Solo still does, through its own gate.
     assert!(m.downstream("solo_mixer").contains("monitor_out_tee"));
+
+    // Bus 2 of two is aux1, not aux0, that feeds the monitor's gate (aux0
+    // still reaches the monitor through its AFL tap and the solos).
+    let m = assemble(&small_mixer_props(&[
+        ("num_aux_buses", PropertyValue::UInt(2)),
+        ("monitor_source", PropertyValue::UInt(2)),
+    ]));
+    assert!(m.downstream("aux1_out_tee").contains("main_to_mon"));
+    assert!(!m.downstream("aux0_out_tee").contains("main_to_mon"));
 }
 
 #[test]
