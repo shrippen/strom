@@ -192,21 +192,37 @@ impl AppState {
     ) -> Result<(), AuxBusError> {
         let taken = {
             let flows = self.inner.flows.read().await;
-            flows.values().find_map(|flow| {
+            // Inter Output blocks publish on `strom_{flow}_{block}`, also those
+            // of flows not running now.
+            let inter_output = flows.values().find_map(|flow| {
                 flow.blocks
                     .iter()
-                    .filter(|b| b.block_definition_id == MIXER_BLOCK_ID)
-                    .filter(|b| !(flow.id == *flow_id && b.id == block_id))
-                    .find_map(|b| {
-                        // A list that does not parse is refused until it is
-                        // fixed; its channels are not known here.
-                        let stored = stored_dynamic_aux_buses(&b.properties).ok()?;
-                        let bus = stored.iter().find(|bus| bus.channel == channel)?;
-                        Some(format!(
-                            "channel {} is taken by aux bus {} of block {} in flow {}",
-                            channel, bus.aux, b.id, flow.id
-                        ))
+                    .filter(|b| b.block_definition_id == "builtin.inter_output")
+                    .find(|b| format!("strom_{}_{}", flow.id, b.id) == channel)
+                    .map(|b| {
+                        format!(
+                            "channel {} is the one of Inter Output {} in flow {}",
+                            channel, b.id, flow.id
+                        )
                     })
+            });
+            inter_output.or_else(|| {
+                flows.values().find_map(|flow| {
+                    flow.blocks
+                        .iter()
+                        .filter(|b| b.block_definition_id == MIXER_BLOCK_ID)
+                        .filter(|b| !(flow.id == *flow_id && b.id == block_id))
+                        .find_map(|b| {
+                            // A list that does not parse is refused until it is
+                            // fixed; its channels are not known here.
+                            let stored = stored_dynamic_aux_buses(&b.properties).ok()?;
+                            let bus = stored.iter().find(|bus| bus.channel == channel)?;
+                            Some(format!(
+                                "channel {} is taken by aux bus {} of block {} in flow {}",
+                                channel, bus.aux, b.id, flow.id
+                            ))
+                        })
+                })
             })
         };
         if let Some(reason) = taken {

@@ -23,8 +23,8 @@
 //! the Solo pad is released and the elements leave the pipeline.
 //!
 //! **Tap**: a send's tee pad is released and one on the other tee linked.
-//! Both tees run on the channel's streaming thread, so the send misses at
-//! most the buffer in between.
+//! Both tees run on the channel's streaming thread, so the send misses or
+//! repeats at most the buffer in between (the bus mixer drops an overlap).
 
 use std::collections::HashMap;
 
@@ -202,11 +202,14 @@ pub fn add_aux_bus(
     properties: &HashMap<String, PropertyValue>,
     bus: &DynamicAuxBus,
 ) -> Result<Vec<(String, gst::Element)>, AuxBusError> {
-    // The bus's mixer starts at its first buffer, the running time of now.
-    // At zero (the block's default) it would first make every buffer since
-    // the flow started, and the sends' queues would fill and stall the
-    // channels' streaming threads, Main with them, for as long as the flow
-    // has run.
+    // The bus's mixer starts now: with "first", GStreamer 1.26 and later
+    // pick the running time when its task first runs in PLAYING (force-live),
+    // 1.24 the running time of the first buffer. `Bin::add` hands the element
+    // the pipeline's base time, so the 1.26 race of `make_audiomixer` (a base
+    // time not yet distributed) cannot hit. At zero (the block's default) it
+    // would first make every buffer since the flow started, and the sends'
+    // queues would fill and stall the channels' streaming threads, Main with
+    // them, for as long as the flow has run.
     let spec = BusSpec {
         start: StartTime::First,
         ..BusSpec::new(instance_id, properties)

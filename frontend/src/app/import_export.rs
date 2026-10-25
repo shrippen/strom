@@ -279,6 +279,14 @@ impl StromApp {
         // Generate new flow ID
         flow.id = uuid::Uuid::new_v4();
 
+        // A mixer's dynamic aux buses publish on their inter channels; a copy
+        // or an import would take the same ones next to the original.
+        for block in &mut flow.blocks {
+            block
+                .properties
+                .remove(strom_types::mixer::DYNAMIC_AUX_BUSES_PROPERTY);
+        }
+
         // Reset state to Null
         flow.set_gst_state(Some(PipelineState::Null));
 
@@ -340,15 +348,7 @@ impl StromApp {
         flow_copy.name = format!("{} (copy)", flow.name);
 
         // Regenerate all IDs
-        let mut flow_copy = Self::regenerate_flow_ids(flow_copy);
-        // A mixer's dynamic aux buses publish on their inter channels; the
-        // copy would take the same ones, and the flow started second would
-        // not start.
-        for block in &mut flow_copy.blocks {
-            block
-                .properties
-                .remove(strom_types::mixer::DYNAMIC_AUX_BUSES_PROPERTY);
-        }
+        let flow_copy = Self::regenerate_flow_ids(flow_copy);
 
         let api = self.api.clone();
         let tx = self.channels.sender();
