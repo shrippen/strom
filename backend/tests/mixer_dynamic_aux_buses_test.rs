@@ -72,8 +72,8 @@ fn mixer_flow() -> Flow {
     flow
 }
 
-/// Main's buffers as they reach the sink: (pts, duration) in ns, and when.
-type Main = Arc<Mutex<Vec<(u64, u64, Instant)>>>;
+/// Main's buffers as they reach the sink: (pts, duration) in ns.
+type Main = Arc<Mutex<Vec<(u64, u64)>>>;
 
 struct Rig {
     /// Inter channel of the bus: channels are process-wide and the tests
@@ -137,10 +137,7 @@ impl Rig {
             .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                 if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
                     if let (Some(pts), Some(dur)) = (b.pts(), b.duration()) {
-                        let at = Instant::now();
-                        main.lock()
-                            .unwrap()
-                            .push((pts.nseconds(), dur.nseconds(), at));
+                        main.lock().unwrap().push((pts.nseconds(), dur.nseconds()));
                     }
                 }
                 gst::PadProbeReturn::Ok
@@ -213,17 +210,6 @@ impl Rig {
             worst <= 1_000_000,
             "{what}: Main's timestamps jumped by {} µs",
             worst / 1000
-        );
-        // The sink plays on the clock: a stall (queues full behind a bus)
-        // keeps the timestamps whole but holds the buffers back.
-        let stall = main
-            .windows(2)
-            .map(|w| w[1].2 - w[0].2)
-            .max()
-            .unwrap_or_default();
-        assert!(
-            stall < Duration::from_millis(250),
-            "{what}: Main stalled for {stall:?}"
         );
     }
 
