@@ -147,12 +147,17 @@ pub async fn set_playlist(
                 FlowUpdateError::Rejected(message) => {
                     (StatusCode::NOT_FOUND, Json(ErrorResponse::new(message)))
                 }
-                FlowUpdateError::IdChanged | FlowUpdateError::Save(_) => (
+                FlowUpdateError::Save(e) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse::with_details(
                         "Failed to save flow",
-                        format!("{e:?}"),
+                        e.to_string(),
                     )),
+                ),
+                // The change keeps the id.
+                FlowUpdateError::IdChanged => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("Failed to save flow")),
                 ),
             }
         })?;
