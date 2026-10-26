@@ -247,6 +247,85 @@ async fn test_delete_running_flow_releases_pipeline() {
     );
 }
 
+/// A flow of `chains` live sources each into a fakesink: big enough that
+/// building and starting it takes a while.
+fn build_wide_flow(name: &str, chains: usize) -> Flow {
+    let mut flow = Flow::new(name);
+    for i in 0..chains {
+        for (id, element_type) in [
+            (format!("src{i}"), "audiotestsrc"),
+            (format!("sink{i}"), "fakesink"),
+        ] {
+            let mut properties = HashMap::new();
+            if element_type == "audiotestsrc" {
+                properties.insert(
+                    "is-live".to_string(),
+                    strom_types::PropertyValue::Bool(true),
+                );
+            }
+            flow.elements.push(strom_types::Element {
+                id,
+                element_type: element_type.to_string(),
+                properties,
+                position: [100.0, 200.0].into(),
+                pad_properties: HashMap::new(),
+            });
+        }
+        flow.links.push(Link {
+            from: format!("src{i}:src"),
+            to: format!("sink{i}:sink"),
+        });
+    }
+    flow
+}
+
+/// A delete while the flow is still starting must stop what the start
+/// builds. The start puts the pipeline into AppState only once it plays;
+/// a delete in between found nothing to stop, and the pipeline went on
+/// running without a flow (seen in lmix: a rebuilt mixer could not publish
+/// on its inter channels, the old one still held them).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_delete_during_start_stops_the_pipeline() {
+    gstreamer::init().unwrap();
+
+    let storage_file = NamedTempFile::new().unwrap();
+    let blocks_file = NamedTempFile::new().unwrap();
+    let state = AppState::new(
+        JsonFileStorage::new(storage_file.path()),
+        blocks_file.path(),
+        std::env::temp_dir(),
+        vec![],
+        "all".to_string(),
+        vec![],
+        false,
+        false,
+    );
+
+    for round in 0..5 {
+        let flow = build_wide_flow("delete_during_start_test", 150);
+        let flow_id = flow.id;
+        state.upsert_flow(flow).await.expect("upsert_flow failed");
+
+        let starting = {
+            let state = state.clone();
+            tokio::spawn(async move { state.start_flow(&flow_id).await })
+        };
+        // Inside the start: it takes far longer than this to build.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        state
+            .delete_flow(&flow_id)
+            .await
+            .expect("delete_flow failed");
+        let _ = starting.await.expect("start task panicked");
+
+        let pipelines = state.pipelines_read().await;
+        assert!(
+            !pipelines.contains_key(&flow_id),
+            "round {round}: the pipeline of a deleted flow still runs"
+        );
+    }
+}
+
 /// Regression test for the WHIP session-teardown P0: an element removed from
 /// its parent bin while it is still above NULL is disposed without ever running
 /// its READY→NULL transition, leaking every socket, thread and fd it holds.

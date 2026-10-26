@@ -104,6 +104,12 @@ struct AppStateInner {
     /// Serializes changes to mixers' aux buses (add, remove, a send's tap):
     /// each reads the stored buses, changes the pipeline and stores again.
     mixer_aux_buses: tokio::sync::Mutex<()>,
+    /// One lock per flow, held across a start, a stop or a delete of it.
+    /// A start builds and starts the pipeline before it is in `pipelines`:
+    /// a stop in between found nothing to stop, and the pipeline went on
+    /// running after its flow was deleted (holding its inter channels, so
+    /// the next start of the flow could not publish on them).
+    flow_lifecycle: parking_lot::Mutex<HashMap<FlowId, Arc<tokio::sync::Mutex<()>>>>,
     /// Handle for reloading the tracing EnvFilter at runtime
     log_reload_handle: parking_lot::Mutex<Option<LogReloadHandle>>,
     /// The log filter string the server was started with
@@ -185,6 +191,7 @@ impl AppState {
                 ice_transport_policy,
                 pending_saves: RwLock::new(HashSet::new()),
                 mixer_aux_buses: tokio::sync::Mutex::new(()),
+                flow_lifecycle: parking_lot::Mutex::new(HashMap::new()),
                 log_reload_handle: parking_lot::Mutex::new(None),
                 default_log_filter: parking_lot::Mutex::new("info".to_string()),
                 gst_debug_filter: parking_lot::Mutex::new(String::new()),
@@ -791,6 +798,38 @@ impl AppState {
 
     /// Delete a flow and persist to storage.
     pub async fn delete_flow(&self, id: &FlowId) -> anyhow::Result<bool> {
+        let guard = self.lock_flow_lifecycle(id).await;
+        let deleted = self.delete_flow_locked(id).await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        deleted
+    }
+
+    /// The lifecycle lock of flow `id` (see `flow_lifecycle`).
+    async fn lock_flow_lifecycle(&self, id: &FlowId) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .inner
+            .flow_lifecycle
+            .lock()
+            .entry(*id)
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+
+    /// Drop the lock of flow `id` unless someone holds or waits for it: the
+    /// map keeps only locks in use (a start of an unknown id adds none).
+    fn forget_flow_lifecycle(&self, id: &FlowId) {
+        let mut locks = self.inner.flow_lifecycle.lock();
+        if locks
+            .get(id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(id);
+        }
+    }
+
+    async fn delete_flow_locked(&self, id: &FlowId) -> anyhow::Result<bool> {
         // Check if flow exists
         let exists = {
             let flows = self.inner.flows.read().await;
@@ -810,7 +849,7 @@ impl AppState {
         };
         let mut stopped = true;
         if pipeline_active {
-            if let Err(e) = self.stop_flow(id).await {
+            if let Err(e) = self.stop_flow_locked(id).await {
                 stopped = false;
                 error!(
                     "Failed to stop flow {} before delete: {} — pipeline resources may leak",
@@ -931,6 +970,14 @@ impl AppState {
 
     /// Start a flow (create and start its pipeline).
     pub async fn start_flow(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
+        let guard = self.lock_flow_lifecycle(id).await;
+        let state = self.start_flow_locked(id).await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        state
+    }
+
+    async fn start_flow_locked(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
         info!("start_flow called for flow ID: {}", id);
 
         // Get the flow definition
@@ -1632,6 +1679,14 @@ impl AppState {
     }
 
     pub async fn stop_flow(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
+        let guard = self.lock_flow_lifecycle(id).await;
+        let state = self.stop_flow_locked(id).await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        state
+    }
+
+    async fn stop_flow_locked(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
         info!("Stopping flow: {}", id);
 
         // Drop any cached mixer solo intent — PFL/AFL bools are `persist: false`
