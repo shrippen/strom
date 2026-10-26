@@ -306,15 +306,18 @@ fn inter_input_definition() -> BlockDefinition {
             ExposedProperty {
                 name: "channel".to_string(),
                 label: "Source".to_string(),
-                description: "Select an Inter Output block to subscribe to".to_string(),
+                description: "Select an Inter Output block to subscribe to. Live: the input moves to the other channel while the flow plays".to_string(),
                 property_type: PropertyType::String,
                 default_value: None,
+                // The intersrc unsubscribes and subscribes again when its
+                // producer name changes, so a running flow can switch (e.g.
+                // an output taking another mix's sound).
                 mapping: PropertyMapping {
-                    element_id: "_block".to_string(),
-                    property_name: "channel".to_string(),
+                    element_id: "intersrc".to_string(),
+                    property_name: "producer-name".to_string(),
                     transform: None,
                 },
-                live: false,
+                live: true,
                 persist: None,
             },
             ExposedProperty {
