@@ -817,7 +817,8 @@ impl AppState {
         lock.lock_owned().await
     }
 
-    /// Drop the lock of a deleted flow unless someone holds or waits for it.
+    /// Drop the lock of flow `id` unless someone holds or waits for it: the
+    /// map keeps only locks in use (a start of an unknown id adds none).
     fn forget_flow_lifecycle(&self, id: &FlowId) {
         let mut locks = self.inner.flow_lifecycle.lock();
         if locks
@@ -969,8 +970,11 @@ impl AppState {
 
     /// Start a flow (create and start its pipeline).
     pub async fn start_flow(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
-        let _guard = self.lock_flow_lifecycle(id).await;
-        self.start_flow_locked(id).await
+        let guard = self.lock_flow_lifecycle(id).await;
+        let state = self.start_flow_locked(id).await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        state
     }
 
     async fn start_flow_locked(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
@@ -1675,8 +1679,11 @@ impl AppState {
     }
 
     pub async fn stop_flow(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
-        let _guard = self.lock_flow_lifecycle(id).await;
-        self.stop_flow_locked(id).await
+        let guard = self.lock_flow_lifecycle(id).await;
+        let state = self.stop_flow_locked(id).await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        state
     }
 
     async fn stop_flow_locked(&self, id: &FlowId) -> Result<PipelineState, PipelineError> {
