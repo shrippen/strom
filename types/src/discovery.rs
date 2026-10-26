@@ -67,8 +67,15 @@ pub enum DeviceCategory {
 
 impl DeviceCategory {
     /// Parse device category from GStreamer device class string.
+    /// A class may name more parts after the first two
+    /// (`Video/Source/Hardware` from DeckLink); they do not change it.
     pub fn from_device_class(class: &str) -> Self {
-        match class {
+        let mut parts = class.splitn(3, '/');
+        let head = match (parts.next(), parts.next()) {
+            (Some(kind), Some(role)) => format!("{kind}/{role}"),
+            _ => class.to_string(),
+        };
+        match head.as_str() {
             "Audio/Source" => Self::AudioSource,
             "Audio/Sink" => Self::AudioSink,
             "Video/Source" => Self::VideoSource,

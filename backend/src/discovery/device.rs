@@ -46,7 +46,7 @@ pub struct DiscoveredDevice {
 }
 
 /// Device properties strom keeps from a provider's list.
-const KEPT_PROPERTIES: [&str; 21] = [
+const KEPT_PROPERTIES: [&str; 23] = [
     "device.api",
     "device.class",
     "device.name",
@@ -69,7 +69,23 @@ const KEPT_PROPERTIES: [&str; 21] = [
     "ip",
     "url-address",
     "ndi-name",
+    // DeckLink-specific: the card's index and its stable id
+    "device-number",
+    "persistent-id",
 ];
+
+/// GType name of the devices the DeckLink provider announces.
+const DECKLINK_DEVICE_TYPE: &str = "GstDecklinkDevice";
+
+/// Property `key` as text: strings as they are, numbers and other
+/// values in their GLib text form (DeckLink's `device-number` is a uint).
+fn property_text(props: &gst::StructureRef, key: &str) -> Option<String> {
+    let value = props.value(key).ok()?;
+    if let Ok(text) = value.get::<String>() {
+        return Some(text);
+    }
+    value.transform::<String>().ok()?.get::<String>().ok()
+}
 
 impl DiscoveredDevice {
     /// The record for `device`, first and last seen now.
@@ -77,7 +93,7 @@ impl DiscoveredDevice {
         let name = device.display_name().to_string();
         let device_class = device.device_class().to_string();
         let props = device.properties();
-        let get = |key: &str| props.as_ref().and_then(|p| p.get::<String>(key).ok());
+        let get = |key: &str| props.as_ref().and_then(|p| property_text(p, key));
         let properties = KEPT_PROPERTIES
             .iter()
             .filter_map(|key| Some((key.to_string(), get(key)?)))
@@ -340,8 +356,9 @@ impl DeviceDiscovery {
             "object.path",
             "api.v4l2.path",
             "device.serial",
+            "persistent-id",
         ] {
-            if let Ok(v) = props.get::<String>(key) {
+            if let Some(v) = property_text(&props, key) {
                 if !v.is_empty() {
                     return Some(v);
                 }
@@ -352,6 +369,10 @@ impl DeviceDiscovery {
 
     /// Get provider name from device properties or infer from device class.
     fn get_provider_name(device: &gst::Device, device_class: &str) -> String {
+        if device.type_().name() == DECKLINK_DEVICE_TYPE {
+            return "decklinkdeviceprovider".to_string();
+        }
+
         if let Some(props) = device.properties() {
             // Try to get from device.api property
             if let Ok(api) = props.get::<String>("device.api") {
@@ -548,6 +569,46 @@ mod tests {
         );
         assert_eq!(
             DeviceCategory::from_device_class("Unknown/Class"),
+            DeviceCategory::Other
+        );
+    }
+
+    // DeckLink devices carry their number and id as integers; a client
+    // needs them to address the card.
+    #[test]
+    fn integer_properties_are_kept_as_text() {
+        gst::init().unwrap();
+        let props = gst::Structure::builder("properties")
+            .field("device-number", 2u32)
+            .field("persistent-id", 1972104050i64)
+            .field("device.path", "/dev/video0")
+            .build();
+        assert_eq!(property_text(&props, "device-number").as_deref(), Some("2"));
+        assert_eq!(
+            property_text(&props, "persistent-id").as_deref(),
+            Some("1972104050")
+        );
+        assert_eq!(
+            property_text(&props, "device.path").as_deref(),
+            Some("/dev/video0")
+        );
+        assert_eq!(property_text(&props, "missing"), None);
+    }
+
+    // DeckLink cards announce "Video/Source/Hardware"; the monitor's
+    // "Video/Source" filter lets them through, so the category must too.
+    #[test]
+    fn a_class_with_more_parts_keeps_its_category() {
+        assert_eq!(
+            DeviceCategory::from_device_class("Video/Source/Hardware"),
+            DeviceCategory::VideoSource
+        );
+        assert_eq!(
+            DeviceCategory::from_device_class("Audio/Source/Hardware"),
+            DeviceCategory::AudioSource
+        );
+        assert_eq!(
+            DeviceCategory::from_device_class("Video/Sink/Hardware"),
             DeviceCategory::Other
         );
     }
