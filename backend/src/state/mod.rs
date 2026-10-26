@@ -50,6 +50,19 @@ pub use crate::gst::pipeline::effects::stinger::fail_stinger_programming_for_tes
 #[doc(hidden)]
 pub use stinger::{hold_takes_for_tests, takes_held_for_tests};
 
+/// Why `AppState::update_flow_with` changed nothing.
+#[derive(Debug)]
+pub enum FlowUpdateError<E> {
+    /// No flow with that id.
+    NotFound,
+    /// The change refused the flow.
+    Rejected(E),
+    /// The change gave the flow another id.
+    IdChanged,
+    /// The changed flow could not be stored.
+    Save(anyhow::Error),
+}
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -738,6 +751,34 @@ impl AppState {
         self.persist_flow(&flow, is_new).await
     }
 
+    /// Change stored flow `id` with `change` and persist it, under the
+    /// flow's lifecycle lock: a delete in between a read and the write of
+    /// the change no longer brings a deleted flow back. Returns the flow
+    /// before and after the change.
+    pub async fn update_flow_with<E>(
+        &self,
+        id: &FlowId,
+        change: impl FnOnce(&mut Flow) -> Result<(), E>,
+    ) -> Result<(Flow, Flow), FlowUpdateError<E>> {
+        let guard = self.lock_flow_lifecycle(id).await;
+        let updated = async {
+            let old = self.get_flow(id).await.ok_or(FlowUpdateError::NotFound)?;
+            let mut flow = old.clone();
+            change(&mut flow).map_err(FlowUpdateError::Rejected)?;
+            if flow.id != *id {
+                return Err(FlowUpdateError::IdChanged);
+            }
+            self.upsert_flow(flow.clone())
+                .await
+                .map_err(FlowUpdateError::Save)?;
+            Ok((old, flow))
+        }
+        .await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        updated
+    }
+
     /// Insert a flow only if its id is not already taken.
     ///
     /// Returns `Ok(false)`, leaving the stored flow untouched, when a flow with
@@ -858,21 +899,19 @@ impl AppState {
             }
         }
 
-        // Delete from storage first (skip for ephemeral flows)
-        let is_ephemeral = {
-            let flows = self.inner.flows.read().await;
-            flows.get(id).is_some_and(|f| f.properties.ephemeral)
-        };
-        if !is_ephemeral {
-            if let Err(e) = self.inner.storage.delete_flow(id).await {
-                error!("Failed to delete flow from storage: {}", e);
-                return Err(e.into());
-            }
-        }
-
-        // Delete from in-memory state
+        // Delete from storage first (skip for ephemeral flows), then from
+        // memory, both under the write lock: the debounced save writes the
+        // flows under the read lock and would store the flow again in
+        // between.
         {
             let mut flows = self.inner.flows.write().await;
+            let is_ephemeral = flows.get(id).is_some_and(|f| f.properties.ephemeral);
+            if !is_ephemeral {
+                if let Err(e) = self.inner.storage.delete_flow(id).await {
+                    error!("Failed to delete flow from storage: {}", e);
+                    return Err(e.into());
+                }
+            }
             flows.remove(id);
         }
 
