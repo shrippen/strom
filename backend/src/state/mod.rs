@@ -50,6 +50,19 @@ pub use crate::gst::pipeline::effects::stinger::fail_stinger_programming_for_tes
 #[doc(hidden)]
 pub use stinger::{hold_takes_for_tests, takes_held_for_tests};
 
+/// Why `AppState::update_flow_with` changed nothing.
+#[derive(Debug)]
+pub enum FlowUpdateError<E> {
+    /// No flow with that id.
+    NotFound,
+    /// The change refused the flow.
+    Rejected(E),
+    /// The change gave the flow another id.
+    IdChanged,
+    /// The changed flow could not be stored.
+    Save(anyhow::Error),
+}
+
 /// Shared application state.
 #[derive(Clone)]
 pub struct AppState {
@@ -736,6 +749,34 @@ impl AppState {
         };
 
         self.persist_flow(&flow, is_new).await
+    }
+
+    /// Change stored flow `id` with `change` and persist it, under the
+    /// flow's lifecycle lock: a delete in between a read and the write of
+    /// the change no longer brings a deleted flow back. Returns the flow
+    /// before and after the change.
+    pub async fn update_flow_with<E>(
+        &self,
+        id: &FlowId,
+        change: impl FnOnce(&mut Flow) -> Result<(), E>,
+    ) -> Result<(Flow, Flow), FlowUpdateError<E>> {
+        let guard = self.lock_flow_lifecycle(id).await;
+        let updated = async {
+            let old = self.get_flow(id).await.ok_or(FlowUpdateError::NotFound)?;
+            let mut flow = old.clone();
+            change(&mut flow).map_err(FlowUpdateError::Rejected)?;
+            if flow.id != *id {
+                return Err(FlowUpdateError::IdChanged);
+            }
+            self.upsert_flow(flow.clone())
+                .await
+                .map_err(FlowUpdateError::Save)?;
+            Ok((old, flow))
+        }
+        .await;
+        drop(guard);
+        self.forget_flow_lifecycle(id);
+        updated
     }
 
     /// Insert a flow only if its id is not already taken.

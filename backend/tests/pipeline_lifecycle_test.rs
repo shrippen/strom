@@ -326,6 +326,62 @@ async fn test_delete_during_start_stops_the_pipeline() {
     }
 }
 
+/// A delete that comes while an update has read the flow and not yet
+/// stored it waits for the update: the flow stays deleted, the update does
+/// not bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_delete_during_update_keeps_the_flow_deleted() {
+    gstreamer::init().unwrap();
+
+    let storage_file = NamedTempFile::new().unwrap();
+    let blocks_file = NamedTempFile::new().unwrap();
+    let state = AppState::new(
+        JsonFileStorage::new(storage_file.path()),
+        blocks_file.path(),
+        std::env::temp_dir(),
+        vec![],
+        "all".to_string(),
+        vec![],
+        false,
+        false,
+    );
+    let flow = build_wide_flow("delete_during_update_test", 2);
+    let flow_id = flow.id;
+    state.upsert_flow(flow).await.expect("upsert_flow failed");
+
+    let mut deleting = None;
+    state
+        .update_flow_with(&flow_id, |flow| {
+            flow.name = "renamed".into();
+            // The delete comes now, between the read and the write.
+            let state = state.clone();
+            deleting = Some(tokio::spawn(
+                async move { state.delete_flow(&flow_id).await },
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .await
+        .expect("update_flow_with failed");
+    let deleted = deleting.unwrap().await.expect("delete task panicked");
+    assert!(deleted.expect("delete_flow failed"), "delete found no flow");
+
+    assert!(
+        state.get_flow(&flow_id).await.is_none(),
+        "the update brought the deleted flow back"
+    );
+    assert!(
+        matches!(
+            state
+                .update_flow_with(&flow_id, |_| Ok::<(), std::convert::Infallible>(()))
+                .await,
+            Err(strom::state::FlowUpdateError::NotFound)
+        ),
+        "an update of a deleted flow stores it again"
+    );
+    assert!(state.get_flow(&flow_id).await.is_none());
+}
+
 /// Regression test for the WHIP session-teardown P0: an element removed from
 /// its parent bin while it is still above NULL is disposed without ever running
 /// its READY→NULL transition, leaking every socket, thread and fd it holds.
