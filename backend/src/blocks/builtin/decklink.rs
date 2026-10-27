@@ -266,6 +266,9 @@ impl BlockBuilder for DeckLinkInputBuilder {
 /// 1920x1080@25 UYVY) drives the videosink so the pipeline can reach PLAYING.
 pub struct DeckLinkOutputBuilder;
 
+/// GStreamer's own default for a sink's processing deadline.
+const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
+
 /// Internal video mode used to drive `decklinkvideosink` when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
 /// cards; the actual SDI output is irrelevant in this mode (just black frames).
@@ -367,12 +370,24 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             (AUDIO_ONLY_INTERNAL_MODE, AUDIO_ONLY_INTERNAL_FORMAT)
         };
 
+        let processing_deadline = gst::ClockTime::from_mseconds(
+            properties
+                .get("processing_deadline_ms")
+                .and_then(|v| match v {
+                    PropertyValue::UInt(u) => Some(*u),
+                    PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
+                    _ => None,
+                })
+                .unwrap_or(DEFAULT_PROCESSING_DEADLINE_MS),
+        );
+
         let videosink_id = format!("{}:decklinkvideosink", instance_id);
         let videosink = gst::ElementFactory::make("decklinkvideosink")
             .name(&videosink_id)
             .property("device-number", device_number)
             .property_from_str("mode", video_mode)
             .property_from_str("video-format", video_format)
+            .property("processing-deadline", processing_deadline)
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("decklinkvideosink: {}", e)))?;
         seed_card_clock_on_first_frame(&videosink);
@@ -428,6 +443,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             let audiosink = gst::ElementFactory::make("decklinkaudiosink")
                 .name(&audiosink_id)
                 .property("device-number", device_number)
+                .property("processing-deadline", processing_deadline)
                 .build()
                 .map_err(|e| {
                     BlockBuildError::ElementCreation(format!("decklinkaudiosink: {}", e))
@@ -436,11 +452,12 @@ impl BlockBuilder for DeckLinkOutputBuilder {
         }
 
         info!(
-            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}",
+            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}, lead time={}",
             device_number,
             stream_mode.as_str(),
             video_mode,
-            video_format
+            video_format,
+            processing_deadline
         );
 
         Ok(BlockBuildResult {
@@ -905,6 +922,25 @@ fn decklink_output_definition() -> BlockDefinition {
                 live: false,
                 persist: None,
             },
+            ExposedProperty {
+                name: "processing_deadline_ms".to_string(),
+                label: "Lead Time (ms)".to_string(),
+                description: "How long before its display time a frame or sound buffer is \
+                              handed to the card. Adds to the flow's latency. Raise it when \
+                              the input arrives later than the flow's latency says (fed by \
+                              another flow over inter, say): the card then shows frames late \
+                              or drops them."
+                    .to_string(),
+                property_type: PropertyType::UInt,
+                default_value: Some(PropertyValue::UInt(DEFAULT_PROCESSING_DEADLINE_MS)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "processing_deadline_ms".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
         ],
         // Static fallback — matches the default `audio_video` mode. Actual pads
         // are computed dynamically in `DeckLinkOutputBuilder::get_external_pads`.
@@ -986,6 +1022,45 @@ fn seed_calibration(card_clock: &gst::Clock, pipeline_clock: &gst::Clock) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output(properties: &[(&str, PropertyValue)]) -> BlockBuildResult {
+        gst::init().unwrap();
+        let properties = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        DeckLinkOutputBuilder
+            .build(
+                "out",
+                &properties,
+                &BlockBuildContext::new(Vec::new(), "all".to_string()),
+            )
+            .expect("DeckLink output block")
+    }
+
+    fn deadline_of(result: &BlockBuildResult, id: &str) -> gst::ClockTime {
+        let (_, element) = result
+            .elements
+            .iter()
+            .find(|(element_id, _)| element_id == id)
+            .unwrap_or_else(|| panic!("no element {id}"));
+        gst::ClockTime::from_nseconds(element.property::<u64>("processing-deadline"))
+    }
+
+    // Both sinks of the card take the lead time, so picture and sound
+    // keep together; without it they keep GStreamer's 20 ms.
+    #[test]
+    fn output_sinks_take_the_lead_time() {
+        let ahead = output(&[("processing_deadline_ms", PropertyValue::UInt(100))]);
+        let ms100 = gst::ClockTime::from_mseconds(100);
+        assert_eq!(deadline_of(&ahead, "out:decklinkvideosink"), ms100);
+        assert_eq!(deadline_of(&ahead, "out:decklinkaudiosink"), ms100);
+
+        let plain = output(&[]);
+        let ms20 = gst::ClockTime::from_mseconds(20);
+        assert_eq!(deadline_of(&plain, "out:decklinkvideosink"), ms20);
+        assert_eq!(deadline_of(&plain, "out:decklinkaudiosink"), ms20);
+    }
 
     fn system_clock() -> gst::Clock {
         gst::glib::Object::new::<gst::SystemClock>().upcast()
