@@ -22,12 +22,13 @@ use gstreamer::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use strom_types::{
     block::{StreamMode, *},
     element::ElementPadRef,
     EnumValue, MediaType, PropertyValue,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 /// DeckLink Input block builder.
 ///
@@ -266,6 +267,11 @@ impl BlockBuilder for DeckLinkInputBuilder {
 /// 1920x1080@25 UYVY) drives the videosink so the pipeline can reach PLAYING.
 pub struct DeckLinkOutputBuilder;
 
+/// GStreamer's own default for a sink's processing deadline.
+const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
+/// More lead time than this only delays the picture.
+const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
+
 /// Internal video mode used to drive `decklinkvideosink` when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
 /// cards; the actual SDI output is irrelevant in this mode (just black frames).
@@ -367,14 +373,28 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             (AUDIO_ONLY_INTERNAL_MODE, AUDIO_ONLY_INTERNAL_FORMAT)
         };
 
+        let processing_deadline = gst::ClockTime::from_mseconds(
+            properties
+                .get("processing_deadline_ms")
+                .and_then(|v| match v {
+                    PropertyValue::UInt(u) => Some(*u),
+                    PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
+                    _ => None,
+                })
+                .unwrap_or(DEFAULT_PROCESSING_DEADLINE_MS)
+                .min(MAX_PROCESSING_DEADLINE_MS),
+        );
+
         let videosink_id = format!("{}:decklinkvideosink", instance_id);
         let videosink = gst::ElementFactory::make("decklinkvideosink")
             .name(&videosink_id)
             .property("device-number", device_number)
             .property_from_str("mode", video_mode)
             .property_from_str("video-format", video_format)
+            .property("processing-deadline", processing_deadline)
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("decklinkvideosink: {}", e)))?;
+        seed_card_clock_on_first_frame(&videosink);
 
         let mut elements: Vec<(String, gst::Element)> = vec![(videosink_id.clone(), videosink)];
         let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
@@ -427,6 +447,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             let audiosink = gst::ElementFactory::make("decklinkaudiosink")
                 .name(&audiosink_id)
                 .property("device-number", device_number)
+                .property("processing-deadline", processing_deadline)
                 .build()
                 .map_err(|e| {
                     BlockBuildError::ElementCreation(format!("decklinkaudiosink: {}", e))
@@ -435,11 +456,12 @@ impl BlockBuilder for DeckLinkOutputBuilder {
         }
 
         info!(
-            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}",
+            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}, lead time={}",
             device_number,
             stream_mode.as_str(),
             video_mode,
-            video_format
+            video_format,
+            processing_deadline
         );
 
         Ok(BlockBuildResult {
@@ -904,6 +926,25 @@ fn decklink_output_definition() -> BlockDefinition {
                 live: false,
                 persist: None,
             },
+            ExposedProperty {
+                name: "processing_deadline_ms".to_string(),
+                label: "Lead Time (ms)".to_string(),
+                description: "How long before its display time a frame or sound buffer is \
+                              handed to the card. Adds to the flow's latency. Raise it when \
+                              the input arrives later than the flow's latency says (fed by \
+                              another flow over inter, say): the card then shows frames late \
+                              or drops them."
+                    .to_string(),
+                property_type: PropertyType::UInt,
+                default_value: Some(PropertyValue::UInt(DEFAULT_PROCESSING_DEADLINE_MS)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "processing_deadline_ms".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
         ],
         // Static fallback — matches the default `audio_video` mode. Actual pads
         // are computed dynamically in `DeckLinkOutputBuilder::get_external_pads`.
@@ -933,5 +974,255 @@ fn decklink_output_definition() -> BlockDefinition {
             height: Some(1.5),
             ..Default::default()
         }),
+    }
+}
+
+/// Lines the card's clock up with the pipeline clock before the first
+/// frame is scheduled.
+///
+/// `decklinkvideosink` slaves the card's clock to the pipeline clock when
+/// the first frame arrives, but the calibration takes a few seconds to
+/// settle. Until then it maps running time to card time one to one, which
+/// is only right while the running time is close to zero. With a running
+/// time far from zero (direct media timing: base time 0, the running time
+/// is the clock's time, hours after boot) the first seconds of frames are
+/// scheduled hours ahead, fill the card's queue, and the card then refuses
+/// every frame with E_FAIL. Seeding the calibration with "card time now is
+/// pipeline time now" makes those frames land on time; the slaving refines
+/// it from there.
+fn seed_card_clock_on_first_frame(videosink: &gst::Element) {
+    if let Some(pad) = videosink.static_pad("sink") {
+        seed_until_card_clock_runs(&pad, |sink| sink.provide_clock());
+    }
+}
+
+/// Seeds the card clock (`card_clock_of` the sink) on each buffer through
+/// `pad` until that clock is seen running, then removes the probe.
+///
+/// The card's clock stands until the card starts playing, and the card
+/// starts only once picture and sound have both arrived: a seed taken
+/// while it stands would be off by however long it stood. Re-seeding on
+/// each buffer keeps the seed fresh until the clock moves between two
+/// buffers; then the seed is right and stays. This is a BUFFER probe, but
+/// it lives for the first few buffers of a start only, keeps its state in
+/// an atomic and captures no GStreamer object.
+fn seed_until_card_clock_runs<F>(pad: &gst::Pad, card_clock_of: F)
+where
+    F: Fn(&gst::Element) -> Option<gst::Clock> + Send + Sync + 'static,
+{
+    let last_card_time = AtomicU64::new(u64::MAX);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
+        let Some(sink) = pad.parent_element() else {
+            return gst::PadProbeReturn::Remove;
+        };
+        let Some(pipeline_clock) = sink.clock() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(card_clock) = card_clock_of(&sink) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        if card_clock == pipeline_clock {
+            return gst::PadProbeReturn::Remove;
+        }
+        let card_time = card_clock.internal_time();
+        seed_calibration(&card_clock, card_time, &pipeline_clock);
+        let before = last_card_time.swap(card_time.nseconds(), Ordering::Relaxed);
+        if before != u64::MAX && before != card_time.nseconds() {
+            debug!("DeckLink Output: card clock seeded at {}", card_time);
+            gst::PadProbeReturn::Remove
+        } else {
+            gst::PadProbeReturn::Ok
+        }
+    });
+}
+
+/// Calibrates `card_clock` so that `card_time` (its internal time now)
+/// maps to the time of `pipeline_clock` now, at rate 1.
+fn seed_calibration(
+    card_clock: &gst::Clock,
+    card_time: gst::ClockTime,
+    pipeline_clock: &gst::Clock,
+) {
+    card_clock.set_calibration(card_time, pipeline_clock.time(), 1, 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(properties: &[(&str, PropertyValue)]) -> BlockBuildResult {
+        gst::init().unwrap();
+        let properties = properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        DeckLinkOutputBuilder
+            .build(
+                "out",
+                &properties,
+                &BlockBuildContext::new(Vec::new(), "all".to_string()),
+            )
+            .expect("DeckLink output block")
+    }
+
+    fn deadline_of(result: &BlockBuildResult, id: &str) -> gst::ClockTime {
+        let (_, element) = result
+            .elements
+            .iter()
+            .find(|(element_id, _)| element_id == id)
+            .unwrap_or_else(|| panic!("no element {id}"));
+        gst::ClockTime::from_nseconds(element.property::<u64>("processing-deadline"))
+    }
+
+    // Both sinks of the card take the lead time, so picture and sound
+    // keep together. Without the property they keep 20 ms, which is also
+    // GStreamer's own default: that half documents it and guards nothing.
+    #[test]
+    fn output_sinks_take_the_lead_time() {
+        let ahead = output(&[("processing_deadline_ms", PropertyValue::UInt(100))]);
+        let ms100 = gst::ClockTime::from_mseconds(100);
+        assert_eq!(deadline_of(&ahead, "out:decklinkvideosink"), ms100);
+        assert_eq!(deadline_of(&ahead, "out:decklinkaudiosink"), ms100);
+
+        let plain = output(&[]);
+        let ms20 = gst::ClockTime::from_mseconds(20);
+        assert_eq!(deadline_of(&plain, "out:decklinkvideosink"), ms20);
+        assert_eq!(deadline_of(&plain, "out:decklinkaudiosink"), ms20);
+    }
+
+    // A lead time of hours (or u64::MAX ms, which would overflow) is cut
+    // to a second.
+    #[test]
+    fn lead_time_has_a_ceiling() {
+        let huge = output(&[("processing_deadline_ms", PropertyValue::UInt(u64::MAX))]);
+        let second = gst::ClockTime::SECOND;
+        assert_eq!(deadline_of(&huge, "out:decklinkvideosink"), second);
+        assert_eq!(deadline_of(&huge, "out:decklinkaudiosink"), second);
+    }
+
+    // A clock that stands until the test moves it, as a card's clock
+    // does until the card plays.
+    mod standing {
+        use gstreamer as gst;
+        use gstreamer::glib;
+        use gstreamer::subclass::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Default)]
+        pub struct Imp {
+            pub time: AtomicU64,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Imp {
+            const NAME: &'static str = "StromTestStandingClock";
+            type Type = StandingClock;
+            type ParentType = gst::Clock;
+        }
+
+        impl ObjectImpl for Imp {}
+        impl GstObjectImpl for Imp {}
+        impl ClockImpl for Imp {
+            fn internal_time(&self) -> gst::ClockTime {
+                gst::ClockTime::from_nseconds(self.time.load(Ordering::Relaxed))
+            }
+        }
+
+        glib::wrapper! {
+            pub struct StandingClock(ObjectSubclass<Imp>) @extends gst::Clock, gst::Object;
+        }
+
+        impl StandingClock {
+            pub fn at(time: gst::ClockTime) -> Self {
+                let clock: Self = glib::Object::new();
+                clock.set(time);
+                clock
+            }
+
+            pub fn set(&self, time: gst::ClockTime) {
+                self.imp().time.store(time.nseconds(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    // The probe in a running pipeline whose clock is hours ahead of the
+    // card's. The card clock stands for two buffers (the card is not
+    // playing yet), then moves: the probe seeds on every buffer until it
+    // sees the move, and the seed that stays carries the card's time after
+    // the move, mapped to the pipeline's time then.
+    #[test]
+    fn running_pipeline_seeds_the_card_clock_until_it_runs() {
+        gst::init().unwrap();
+        let hours = gst::ClockTime::from_seconds(9 * 3600);
+        let standing_at = gst::ClockTime::from_seconds(5);
+        let running_at = gst::ClockTime::from_seconds(7);
+        let card = standing::StandingClock::at(standing_at);
+        let pipeline_clock = system_clock();
+        pipeline_clock.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
+
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true num-buffers=6 ! video/x-raw,framerate=50/1 \
+             ! fakesink name=sink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        pipeline.use_clock(Some(&pipeline_clock));
+        let sink = pipeline.by_name("sink").unwrap();
+        let before = pipeline_clock.time();
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let card_for_probe = card.clone();
+        let calls_in_probe = calls.clone();
+        seed_until_card_clock_runs(&sink.static_pad("sink").unwrap(), move |_| {
+            if calls_in_probe.fetch_add(1, Ordering::Relaxed) + 1 == 3 {
+                card_for_probe.set(running_at);
+            }
+            Some(card_for_probe.clone().upcast())
+        });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Eos])
+            .expect("EOS");
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let after = pipeline_clock.time();
+
+        let (internal, external, _, _) = card.calibration();
+        assert_eq!(internal, running_at, "the seed that stayed");
+        assert!(
+            external >= before && external <= after,
+            "card time {internal} maps to pipeline time {external}, not within {before}..{after}"
+        );
+        // Two buffers with the clock standing, the third sees it moved.
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    fn system_clock() -> gst::Clock {
+        gst::glib::Object::new::<gst::SystemClock>().upcast()
+    }
+
+    // A pipeline clock hours ahead of the card's: the seeded calibration
+    // maps a running time of "now + 1 s" to the card's now + 1 s, not to
+    // hours ahead.
+    #[test]
+    fn seeded_card_clock_maps_pipeline_time_to_card_time() {
+        gst::init().unwrap();
+        let hours = gst::ClockTime::from_seconds(9 * 3600);
+        let card = system_clock();
+        let pipeline = system_clock();
+        pipeline.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
+
+        seed_calibration(&card, card.internal_time(), &pipeline);
+
+        let frame = pipeline.time() + gst::ClockTime::from_seconds(1);
+        let (internal, external, rate_num, rate_denom) = card.calibration();
+        let on_card =
+            gst::Clock::unadjust_with_calibration(frame, internal, external, rate_num, rate_denom);
+        let ahead = on_card.nseconds() as i64 - card.internal_time().nseconds() as i64;
+        let second = gst::ClockTime::SECOND.nseconds() as i64;
+        assert!(
+            (ahead - second).abs() < 50_000_000,
+            "frame lands {ahead} ns ahead of the card's time"
+        );
     }
 }
