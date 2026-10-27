@@ -246,6 +246,8 @@ pub enum SoundState {
     /// Decoded, waiting for `play`.
     Ready,
     Playing,
+    /// Held where it was until resumed.
+    Paused,
     /// Played to its end, or stopped; gone on the next state read.
     Ended,
     /// Could not be played; `error` says why.

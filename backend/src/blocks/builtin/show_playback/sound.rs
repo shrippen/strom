@@ -47,6 +47,52 @@ pub struct Sound {
     started_at: Mutex<Option<gst::ClockTime>>,
     /// Zone branches whose end has not reached their mixer yet.
     open_zones: std::sync::atomic::AtomicUsize,
+    /// Set while paused.
+    pause: Mutex<Option<Pause>>,
+}
+
+/// A paused sound or picture: since when, and the blocking probes that
+/// hold its branches.
+pub(super) struct Pause {
+    since: gst::ClockTime,
+    probes: Vec<(glib::WeakRef<gst::Pad>, gst::PadProbeId)>,
+}
+
+impl Pause {
+    /// Hold every buffer on `pads` from the running time `now` on.
+    pub(super) fn hold(pads: impl IntoIterator<Item = gst::Pad>, now: gst::ClockTime) -> Self {
+        let probes = pads
+            .into_iter()
+            .filter_map(|pad| {
+                let probe = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_pad, _info| {
+                    gst::PadProbeReturn::Ok
+                })?;
+                Some((pad.downgrade(), probe))
+            })
+            .collect();
+        Self { since: now, probes }
+    }
+
+    /// Let the held buffers go, shifted by the time the pause took, so
+    /// they play from `now` on where they stopped.
+    pub(super) fn end(self, now: gst::ClockTime) {
+        let held = now.saturating_sub(self.since).nseconds() as i64;
+        for (pad, probe) in self.probes {
+            if let Some(pad) = pad.upgrade() {
+                pad.set_offset(pad.offset() + held);
+                pad.remove_probe(probe);
+            }
+        }
+    }
+
+    /// Let go without a shift (the branch is taken down).
+    pub(super) fn drop_probes(self) {
+        for (pad, probe) in self.probes {
+            if let Some(pad) = pad.upgrade() {
+                pad.remove_probe(probe);
+            }
+        }
+    }
 }
 
 /// The cue level: where it goes, and the ramp that takes it there, for
@@ -156,6 +202,7 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddSoundRequest) -> Result<(), S
         gate: Mutex::new(None),
         started_at: Mutex::new(None),
         open_zones: std::sync::atomic::AtomicUsize::new(0),
+        pause: Mutex::new(None),
     });
     let chain = [&decoder, &convert, &resample, &caps, &volume, &tee];
     for element in chain {
@@ -486,9 +533,50 @@ pub fn play(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        SoundState::Playing => Ok(()),
+        SoundState::Playing | SoundState::Paused => Ok(()),
         SoundState::Ended | SoundState::Failed => Err("the sound has ended".into()),
     }
+}
+
+/// Pause sound `id` (RUN.5): it goes silent and keeps its place. The
+/// zones hold it on the way into their mixers; what the mixers have
+/// taken already (a buffer or two) still plays. A fade runs on in the
+/// zones' time meanwhile.
+pub fn pause(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
+    let sound = find(block, id)?;
+    match sound.state().0 {
+        SoundState::Playing => {}
+        SoundState::Paused => return Ok(()),
+        _ => return Err("the sound does not play".into()),
+    }
+    let now = block.running_time().ok_or("the zones are not running")?;
+    let pads: Vec<gst::Pad> = sound
+        .mixer_pads
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter_map(|p| p.pad.upgrade().and_then(|pad| pad.peer()))
+        .collect();
+    *sound.pause.lock().unwrap_or_else(|p| p.into_inner()) = Some(Pause::hold(pads, now));
+    sound.set_state(SoundState::Paused, None);
+    info!("Show Playback {}: {} paused", block.block_id, sound.id);
+    Ok(())
+}
+
+/// Resume paused sound `id` where it was.
+pub fn resume(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
+    let sound = find(block, id)?;
+    let Some(pause) = sound.pause.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+        return match sound.state().0 {
+            SoundState::Playing => Ok(()),
+            _ => Err("the sound is not paused".into()),
+        };
+    };
+    let now = block.running_time().ok_or("the zones are not running")?;
+    sound.set_state(SoundState::Playing, None);
+    pause.end(now);
+    info!("Show Playback {}: {} resumed", block.block_id, sound.id);
+    Ok(())
 }
 
 /// Let a ready sound go: its start plays at the zones' running time now.
@@ -521,6 +609,7 @@ pub fn fade(block: &Arc<ShowPlayback>, id: &str, request: &SoundFadeRequest) -> 
 pub fn stop(block: &Arc<ShowPlayback>, id: &str, fade_ms: u64) -> Result<(), String> {
     let sound = find(block, id)?;
     let fade_ms = fade_ms.min(FADE_MAX_MS);
+    // A paused sound is silent: it goes at once.
     if sound.state().0 == SoundState::Playing && fade_ms > 0 {
         fade_sound(block, &sound, 0.0, fade_ms)?;
         stop_after(block, &sound, fade_ms);
@@ -711,6 +800,9 @@ fn stop_after(block: &Arc<ShowPlayback>, sound: &Arc<Sound>, delay_ms: u64) {
 
 /// Take the branch out of the pipeline and give the mixer pads back.
 fn teardown(block: &ShowPlayback, sound: &Sound) {
+    if let Some(pause) = sound.pause.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        pause.drop_probes();
+    }
     for MixerPad { mixer, pad, .. } in sound
         .mixer_pads
         .lock()

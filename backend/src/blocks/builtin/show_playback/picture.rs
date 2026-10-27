@@ -15,7 +15,7 @@
 //! frame until `play`, which shifts it to the stage's running time.
 
 use super::repeat::{self, Repeats, Seam};
-use super::sound::{program, MIN_RAMP_MS};
+use super::sound::{program, Pause, MIN_RAMP_MS};
 use super::ShowPlayback;
 use gstreamer as gst;
 use gstreamer::glib;
@@ -43,6 +43,8 @@ pub struct Picture {
     gate_probe: Mutex<Option<gst::PadProbeId>>,
     opacity: Mutex<Opacity>,
     repeats: Repeats,
+    /// Set while paused.
+    pause: Mutex<Option<Pause>>,
 }
 
 /// The pad's alpha and the control source its fades program.
@@ -151,6 +153,7 @@ pub fn add(block: &Arc<ShowPlayback>, request: &AddPictureRequest) -> Result<(),
             source,
         }),
         repeats: Repeats::new(request.repeat),
+        pause: Mutex::new(None),
     });
     picture.keep(&decoder);
     picture.keep(&gate);
@@ -399,9 +402,48 @@ pub fn play(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        SoundState::Playing => Ok(()),
+        SoundState::Playing | SoundState::Paused => Ok(()),
         SoundState::Ended | SoundState::Failed => Err("the picture has ended".into()),
     }
+}
+
+/// Pause picture `id` (RUN.5): its frame stays on the stage, a video
+/// holds its place.
+pub fn pause(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
+    let picture = find(block, id)?;
+    match picture.state().0 {
+        SoundState::Playing => {}
+        SoundState::Paused => return Ok(()),
+        _ => return Err("the picture does not show".into()),
+    }
+    let now = block.running_time().ok_or("the stage is not running")?;
+    let gate = picture.gate.upgrade().ok_or("the picture is gone")?;
+    let pad = gate.static_pad("src").ok_or("gate has no src pad")?;
+    *picture.pause.lock().unwrap_or_else(|p| p.into_inner()) = Some(Pause::hold([pad], now));
+    picture.set_state(SoundState::Paused, None);
+    info!("Show Playback {}: {} paused", block.block_id, picture.id);
+    Ok(())
+}
+
+/// Resume paused picture `id` where it was.
+pub fn resume(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
+    let picture = find(block, id)?;
+    let Some(pause) = picture
+        .pause
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    else {
+        return match picture.state().0 {
+            SoundState::Playing => Ok(()),
+            _ => Err("the picture is not paused".into()),
+        };
+    };
+    let now = block.running_time().ok_or("the stage is not running")?;
+    picture.set_state(SoundState::Playing, None);
+    pause.end(now);
+    info!("Show Playback {}: {} resumed", block.block_id, picture.id);
+    Ok(())
 }
 
 /// Let a ready picture go: its start shows at the stage's running time now.
@@ -442,7 +484,8 @@ pub fn fade(
 pub fn stop(block: &Arc<ShowPlayback>, id: &str, fade_ms: u64) -> Result<(), String> {
     let picture = find(block, id)?;
     let fade_ms = fade_ms.min(FADE_MAX_MS);
-    if picture.state().0 == SoundState::Playing && fade_ms > 0 {
+    // A paused picture fades out too: its frame stays on the stage.
+    if matches!(picture.state().0, SoundState::Playing | SoundState::Paused) && fade_ms > 0 {
         fade_to(block, &picture, 0.0, fade_ms)?;
         stop_after(block, &picture, fade_ms);
     } else {
@@ -573,6 +616,14 @@ fn stop_after(block: &Arc<ShowPlayback>, picture: &Arc<Picture>, delay_ms: u64) 
 
 /// Take the branch out of the pipeline and give the stage pad back.
 fn teardown(block: &ShowPlayback, picture: &Picture) {
+    if let Some(pause) = picture
+        .pause
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        pause.drop_probes();
+    }
     if let (Some(mixer), Some(pad)) = (picture.mixer.upgrade(), picture.mixer_pad.upgrade()) {
         if let Some(peer) = pad.peer() {
             let _ = peer.unlink(&pad);

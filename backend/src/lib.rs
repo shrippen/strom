@@ -436,6 +436,14 @@ pub async fn create_app_with_config(
             post(api::show_playback::stop_sound),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/pause",
+            post(api::show_playback::pause_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/resume",
+            post(api::show_playback::resume_sound),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/show_playback/zones/{zone}",
             post(api::show_playback::set_zone_level),
         )
@@ -454,6 +462,14 @@ pub async fn create_app_with_config(
         .route(
             "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/stop",
             post(api::show_playback::stop_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/pause",
+            post(api::show_playback::pause_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/resume",
+            post(api::show_playback::resume_picture),
         )
         .route(
             "/flows/{flow_id}/blocks/{block_id}/show_playback/stages/{stage}",

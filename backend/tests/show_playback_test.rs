@@ -511,3 +511,47 @@ fn a_route_to_a_missing_zone_is_refused() {
     request.routes[0].zone_channel = 5;
     assert!(sound::add(&block, &request).is_err());
 }
+
+/// RUN.5: a paused sound goes silent, keeps its place and plays on from
+/// there when resumed: a 3 s tone paused for 1 s ends 4 s after it began.
+#[test]
+fn a_paused_sound_resumes_where_it_was() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut request = hall_tone(&rig, "tone");
+    request.start = SoundStart::Play;
+    sound::add(&block, &request).unwrap();
+    wait_for("the Hall hears the tone", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    let heard = rig.ears[0].lock().unwrap().first_sound.unwrap();
+
+    std::thread::sleep(Duration::from_millis(1000));
+    sound::pause(&block, "tone").unwrap();
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Paused));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        rig.ears[0].lock().unwrap().peak < 0.01,
+        "still heard while paused"
+    );
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Paused));
+
+    let resumed = Instant::now();
+    sound::resume(&block, "tone").unwrap();
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Playing));
+    wait_for("the Hall hears the tone again", || {
+        rig.ears[0].lock().unwrap().peak > 0.05
+    });
+    let back = resumed.elapsed();
+    assert!(
+        back < Duration::from_millis(150),
+        "heard {back:?} after resume"
+    );
+    wait_for("the tone is over", || state_of(&rig, "tone").is_none());
+    let played = heard.elapsed();
+    assert!(
+        played > Duration::from_millis(3700),
+        "a 3 s tone paused for 1 s was over after {played:?}"
+    );
+}
