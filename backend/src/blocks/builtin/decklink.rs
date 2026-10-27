@@ -375,6 +375,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             .property_from_str("video-format", video_format)
             .build()
             .map_err(|e| BlockBuildError::ElementCreation(format!("decklinkvideosink: {}", e)))?;
+        seed_card_clock_on_first_frame(&videosink);
 
         let mut elements: Vec<(String, gst::Element)> = vec![(videosink_id.clone(), videosink)];
         let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
@@ -933,5 +934,85 @@ fn decklink_output_definition() -> BlockDefinition {
             height: Some(1.5),
             ..Default::default()
         }),
+    }
+}
+
+/// Lines the card's clock up with the pipeline clock before the first
+/// frame is scheduled.
+///
+/// `decklinkvideosink` slaves the card's clock to the pipeline clock when
+/// the first frame arrives, but the calibration takes a few seconds to
+/// settle. Until then it maps running time to card time one to one, which
+/// is only right while the running time is close to zero. With a running
+/// time far from zero (direct media timing: base time 0, the running time
+/// is the clock's time, hours after boot) the first seconds of frames are
+/// scheduled hours ahead, fill the card's queue, and the card then refuses
+/// every frame with E_FAIL. Seeding the calibration with "card time now is
+/// pipeline time now" makes those frames land on time; the slaving refines
+/// it from there.
+fn seed_card_clock_on_first_frame(videosink: &gst::Element) {
+    let Some(pad) = videosink.static_pad("sink") else {
+        return;
+    };
+    // Removes itself on the first buffer that finds a clock: in a running
+    // pipeline that is the first buffer.
+    pad.add_probe(gst::PadProbeType::BUFFER, |pad, _info| {
+        let Some(sink) = pad.parent_element() else {
+            return gst::PadProbeReturn::Remove;
+        };
+        let (Some(pipeline_clock), Some(card_clock)) = (sink.clock(), sink.provide_clock()) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        seed_calibration(&card_clock, &pipeline_clock);
+        gst::PadProbeReturn::Remove
+    });
+}
+
+/// Calibrates `card_clock` so that its internal time now maps to the time
+/// of `pipeline_clock` now, at rate 1.
+fn seed_calibration(card_clock: &gst::Clock, pipeline_clock: &gst::Clock) {
+    if card_clock == pipeline_clock {
+        return;
+    }
+    let internal = card_clock.internal_time();
+    let external = pipeline_clock.time();
+    card_clock.set_calibration(internal, external, 1, 1);
+    info!(
+        "DeckLink Output: card clock {} seeded to pipeline time {}",
+        internal, external
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn system_clock() -> gst::Clock {
+        gst::glib::Object::new::<gst::SystemClock>().upcast()
+    }
+
+    // A pipeline clock hours ahead of the card's: the seeded calibration
+    // maps a running time of "now + 1 s" to the card's now + 1 s, not to
+    // hours ahead.
+    #[test]
+    fn seeded_card_clock_maps_pipeline_time_to_card_time() {
+        gst::init().unwrap();
+        let hours = gst::ClockTime::from_seconds(9 * 3600);
+        let card = system_clock();
+        let pipeline = system_clock();
+        pipeline.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
+
+        seed_calibration(&card, &pipeline);
+
+        let frame = pipeline.time() + gst::ClockTime::from_seconds(1);
+        let (internal, external, rate_num, rate_denom) = card.calibration();
+        let on_card =
+            gst::Clock::unadjust_with_calibration(frame, internal, external, rate_num, rate_denom);
+        let ahead = on_card.nseconds() as i64 - card.internal_time().nseconds() as i64;
+        let second = gst::ClockTime::SECOND.nseconds() as i64;
+        assert!(
+            (ahead - second).abs() < 50_000_000,
+            "frame lands {ahead} ns ahead of the card's time"
+        );
     }
 }
