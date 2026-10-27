@@ -22,12 +22,13 @@ use gstreamer::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use strom_types::{
     block::{StreamMode, *},
     element::ElementPadRef,
     EnumValue, MediaType, PropertyValue,
 };
-use tracing::info;
+use tracing::{debug, info};
 
 /// DeckLink Input block builder.
 ///
@@ -268,6 +269,8 @@ pub struct DeckLinkOutputBuilder;
 
 /// GStreamer's own default for a sink's processing deadline.
 const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
+/// More lead time than this only delays the picture.
+const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
 
 /// Internal video mode used to drive `decklinkvideosink` when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
@@ -378,7 +381,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                     PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
                     _ => None,
                 })
-                .unwrap_or(DEFAULT_PROCESSING_DEADLINE_MS),
+                .unwrap_or(DEFAULT_PROCESSING_DEADLINE_MS)
+                .min(MAX_PROCESSING_DEADLINE_MS),
         );
 
         let videosink_id = format!("{}:decklinkvideosink", instance_id);
@@ -987,36 +991,56 @@ fn decklink_output_definition() -> BlockDefinition {
 /// pipeline time now" makes those frames land on time; the slaving refines
 /// it from there.
 fn seed_card_clock_on_first_frame(videosink: &gst::Element) {
-    let Some(pad) = videosink.static_pad("sink") else {
-        return;
-    };
-    // Removes itself on the first buffer that finds a clock: in a running
-    // pipeline that is the first buffer.
-    pad.add_probe(gst::PadProbeType::BUFFER, |pad, _info| {
+    if let Some(pad) = videosink.static_pad("sink") {
+        seed_until_card_clock_runs(&pad, |sink| sink.provide_clock());
+    }
+}
+
+/// Seeds the card clock (`card_clock_of` the sink) on each buffer through
+/// `pad` until that clock is seen running, then removes the probe.
+///
+/// The card's clock stands until the card starts playing, and the card
+/// starts only once picture and sound have both arrived: a seed taken
+/// while it stands would be off by however long it stood. Re-seeding on
+/// each buffer keeps the seed fresh until the clock moves between two
+/// buffers; then the seed is right and stays. This is a BUFFER probe, but
+/// it lives for the first few buffers of a start only, keeps its state in
+/// an atomic and captures no GStreamer object.
+fn seed_until_card_clock_runs<F>(pad: &gst::Pad, card_clock_of: F)
+where
+    F: Fn(&gst::Element) -> Option<gst::Clock> + Send + Sync + 'static,
+{
+    let last_card_time = AtomicU64::new(u64::MAX);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
         let Some(sink) = pad.parent_element() else {
             return gst::PadProbeReturn::Remove;
         };
-        let (Some(pipeline_clock), Some(card_clock)) = (sink.clock(), sink.provide_clock()) else {
+        let (Some(pipeline_clock), Some(card_clock)) = (sink.clock(), card_clock_of(&sink)) else {
             return gst::PadProbeReturn::Ok;
         };
-        seed_calibration(&card_clock, &pipeline_clock);
-        gst::PadProbeReturn::Remove
+        if card_clock == pipeline_clock {
+            return gst::PadProbeReturn::Remove;
+        }
+        let card_time = card_clock.internal_time();
+        seed_calibration(&card_clock, card_time, &pipeline_clock);
+        let before = last_card_time.swap(card_time.nseconds(), Ordering::Relaxed);
+        if before != u64::MAX && before != card_time.nseconds() {
+            debug!("DeckLink Output: card clock seeded at {}", card_time);
+            gst::PadProbeReturn::Remove
+        } else {
+            gst::PadProbeReturn::Ok
+        }
     });
 }
 
-/// Calibrates `card_clock` so that its internal time now maps to the time
-/// of `pipeline_clock` now, at rate 1.
-fn seed_calibration(card_clock: &gst::Clock, pipeline_clock: &gst::Clock) {
-    if card_clock == pipeline_clock {
-        return;
-    }
-    let internal = card_clock.internal_time();
-    let external = pipeline_clock.time();
-    card_clock.set_calibration(internal, external, 1, 1);
-    info!(
-        "DeckLink Output: card clock {} seeded to pipeline time {}",
-        internal, external
-    );
+/// Calibrates `card_clock` so that `card_time` (its internal time now)
+/// maps to the time of `pipeline_clock` now, at rate 1.
+fn seed_calibration(
+    card_clock: &gst::Clock,
+    card_time: gst::ClockTime,
+    pipeline_clock: &gst::Clock,
+) {
+    card_clock.set_calibration(card_time, pipeline_clock.time(), 1, 1);
 }
 
 #[cfg(test)]
@@ -1048,7 +1072,8 @@ mod tests {
     }
 
     // Both sinks of the card take the lead time, so picture and sound
-    // keep together; without it they keep GStreamer's 20 ms.
+    // keep together. Without the property they keep 20 ms, which is also
+    // GStreamer's own default: that half documents it and guards nothing.
     #[test]
     fn output_sinks_take_the_lead_time() {
         let ahead = output(&[("processing_deadline_ms", PropertyValue::UInt(100))]);
@@ -1060,6 +1085,60 @@ mod tests {
         let ms20 = gst::ClockTime::from_mseconds(20);
         assert_eq!(deadline_of(&plain, "out:decklinkvideosink"), ms20);
         assert_eq!(deadline_of(&plain, "out:decklinkaudiosink"), ms20);
+    }
+
+    // A lead time of hours (or u64::MAX ms, which would overflow) is cut
+    // to a second.
+    #[test]
+    fn lead_time_has_a_ceiling() {
+        let huge = output(&[("processing_deadline_ms", PropertyValue::UInt(u64::MAX))]);
+        let second = gst::ClockTime::SECOND;
+        assert_eq!(deadline_of(&huge, "out:decklinkvideosink"), second);
+        assert_eq!(deadline_of(&huge, "out:decklinkaudiosink"), second);
+    }
+
+    // The probe in a running pipeline: buffers through a sink whose
+    // pipeline clock is hours ahead of the "card" clock leave the card
+    // clock calibrated to the pipeline's time, and the probe goes once
+    // the card clock runs (a system clock always does).
+    #[test]
+    fn running_pipeline_seeds_the_card_clock() {
+        gst::init().unwrap();
+        let hours = gst::ClockTime::from_seconds(9 * 3600);
+        let card = system_clock();
+        let pipeline_clock = system_clock();
+        pipeline_clock.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
+
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true num-buffers=5 ! video/x-raw,framerate=50/1 \
+             ! fakesink name=sink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        pipeline.use_clock(Some(&pipeline_clock));
+        let sink = pipeline.by_name("sink").unwrap();
+        let seeds = std::sync::Arc::new(AtomicU64::new(0));
+        let card_for_probe = card.clone();
+        let seeds_in_probe = seeds.clone();
+        seed_until_card_clock_runs(&sink.static_pad("sink").unwrap(), move |_| {
+            seeds_in_probe.fetch_add(1, Ordering::Relaxed);
+            Some(card_for_probe.clone())
+        });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Eos])
+            .expect("EOS");
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let (internal, external, _, _) = card.calibration();
+        let offset = external.nseconds() as i64 - internal.nseconds() as i64;
+        assert!(
+            (offset - hours.nseconds() as i64).abs() < 50_000_000,
+            "card clock calibrated {offset} ns behind the pipeline, want 9 h"
+        );
+        // First buffer seeds, second sees the clock run and removes it.
+        assert_eq!(seeds.load(Ordering::Relaxed), 2);
     }
 
     fn system_clock() -> gst::Clock {
@@ -1077,7 +1156,7 @@ mod tests {
         let pipeline = system_clock();
         pipeline.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
 
-        seed_calibration(&card, &pipeline);
+        seed_calibration(&card, card.internal_time(), &pipeline);
 
         let frame = pipeline.time() + gst::ClockTime::from_seconds(1);
         let (internal, external, rate_num, rate_denom) = card.calibration();
