@@ -397,7 +397,7 @@ fn a_paused_video_holds_its_frame_and_resumes() {
     wait_for("the clip is gone", || state_of(&rig, "clip").is_none());
     let played = shown.elapsed();
     assert!(
-        played > Duration::from_millis(1300),
+        played > Duration::from_millis(1300) && played < Duration::from_millis(2000),
         "0.5 s of video paused for 1 s was gone after {played:?}"
     );
 }

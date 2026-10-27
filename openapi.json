@@ -3345,7 +3345,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Playing, or plays once decoded"
+            "description": "Playing, or plays once decoded; a paused one plays on"
           },
           "404": {
             "description": "No running Show Playback block",

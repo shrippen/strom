@@ -108,7 +108,7 @@ pub async fn add_sound(
         ("sound_id" = String, Path, description = "Sound ID")
     ),
     responses(
-        (status = 204, description = "Playing, or plays once decoded"),
+        (status = 204, description = "Playing, or plays once decoded; a paused one plays on"),
         (status = 404, description = "No running Show Playback block", body = ErrorResponse),
         (status = 422, description = "No such sound, or it has ended", body = ErrorResponse)
     )

@@ -402,7 +402,8 @@ pub fn play(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        SoundState::Playing | SoundState::Paused => Ok(()),
+        SoundState::Playing => Ok(()),
+        SoundState::Paused => resume(block, id),
         SoundState::Ended | SoundState::Failed => Err("the picture has ended".into()),
     }
 }
@@ -428,6 +429,8 @@ pub fn pause(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
 /// Resume paused picture `id` where it was.
 pub fn resume(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
     let picture = find(block, id)?;
+    // Before the pause is taken: without a time it stays as it is.
+    let now = block.running_time().ok_or("the stage is not running")?;
     let Some(pause) = picture
         .pause
         .lock()
@@ -439,7 +442,6 @@ pub fn resume(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
             _ => Err("the picture is not paused".into()),
         };
     };
-    let now = block.running_time().ok_or("the stage is not running")?;
     picture.set_state(SoundState::Playing, None);
     pause.end(now);
     info!("Show Playback {}: {} resumed", block.block_id, picture.id);

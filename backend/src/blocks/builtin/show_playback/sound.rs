@@ -533,7 +533,8 @@ pub fn play(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        SoundState::Playing | SoundState::Paused => Ok(()),
+        SoundState::Playing => Ok(()),
+        SoundState::Paused => resume(block, id),
         SoundState::Ended | SoundState::Failed => Err("the sound has ended".into()),
     }
 }
@@ -566,13 +567,14 @@ pub fn pause(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
 /// Resume paused sound `id` where it was.
 pub fn resume(block: &Arc<ShowPlayback>, id: &str) -> Result<(), String> {
     let sound = find(block, id)?;
+    // Before the pause is taken: without a time it stays as it is.
+    let now = block.running_time().ok_or("the zones are not running")?;
     let Some(pause) = sound.pause.lock().unwrap_or_else(|p| p.into_inner()).take() else {
         return match sound.state().0 {
             SoundState::Playing => Ok(()),
             _ => Err("the sound is not paused".into()),
         };
     };
-    let now = block.running_time().ok_or("the zones are not running")?;
     sound.set_state(SoundState::Playing, None);
     pause.end(now);
     info!("Show Playback {}: {} resumed", block.block_id, sound.id);
