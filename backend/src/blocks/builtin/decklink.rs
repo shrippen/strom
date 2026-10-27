@@ -1015,7 +1015,10 @@ where
         let Some(sink) = pad.parent_element() else {
             return gst::PadProbeReturn::Remove;
         };
-        let (Some(pipeline_clock), Some(card_clock)) = (sink.clock(), card_clock_of(&sink)) else {
+        let Some(pipeline_clock) = sink.clock() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Some(card_clock) = card_clock_of(&sink) else {
             return gst::PadProbeReturn::Ok;
         };
         if card_clock == pipeline_clock {
@@ -1097,20 +1100,68 @@ mod tests {
         assert_eq!(deadline_of(&huge, "out:decklinkaudiosink"), second);
     }
 
-    // The probe in a running pipeline: buffers through a sink whose
-    // pipeline clock is hours ahead of the "card" clock leave the card
-    // clock calibrated to the pipeline's time, and the probe goes once
-    // the card clock runs (a system clock always does).
+    // A clock that stands until the test moves it, as a card's clock
+    // does until the card plays.
+    mod standing {
+        use gstreamer as gst;
+        use gstreamer::glib;
+        use gstreamer::subclass::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Default)]
+        pub struct Imp {
+            pub time: AtomicU64,
+        }
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for Imp {
+            const NAME: &'static str = "StromTestStandingClock";
+            type Type = StandingClock;
+            type ParentType = gst::Clock;
+        }
+
+        impl ObjectImpl for Imp {}
+        impl GstObjectImpl for Imp {}
+        impl ClockImpl for Imp {
+            fn internal_time(&self) -> gst::ClockTime {
+                gst::ClockTime::from_nseconds(self.time.load(Ordering::Relaxed))
+            }
+        }
+
+        glib::wrapper! {
+            pub struct StandingClock(ObjectSubclass<Imp>) @extends gst::Clock, gst::Object;
+        }
+
+        impl StandingClock {
+            pub fn at(time: gst::ClockTime) -> Self {
+                let clock: Self = glib::Object::new();
+                clock.set(time);
+                clock
+            }
+
+            pub fn set(&self, time: gst::ClockTime) {
+                self.imp().time.store(time.nseconds(), Ordering::Relaxed);
+            }
+        }
+    }
+
+    // The probe in a running pipeline whose clock is hours ahead of the
+    // card's. The card clock stands for two buffers (the card is not
+    // playing yet), then moves: the probe seeds on every buffer until it
+    // sees the move, and the seed that stays carries the card's time after
+    // the move, mapped to the pipeline's time then.
     #[test]
-    fn running_pipeline_seeds_the_card_clock() {
+    fn running_pipeline_seeds_the_card_clock_until_it_runs() {
         gst::init().unwrap();
         let hours = gst::ClockTime::from_seconds(9 * 3600);
-        let card = system_clock();
+        let standing_at = gst::ClockTime::from_seconds(5);
+        let running_at = gst::ClockTime::from_seconds(7);
+        let card = standing::StandingClock::at(standing_at);
         let pipeline_clock = system_clock();
         pipeline_clock.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
 
         let pipeline = gst::parse::launch(
-            "videotestsrc is-live=true num-buffers=5 ! video/x-raw,framerate=50/1 \
+            "videotestsrc is-live=true num-buffers=6 ! video/x-raw,framerate=50/1 \
              ! fakesink name=sink sync=false",
         )
         .unwrap()
@@ -1118,12 +1169,15 @@ mod tests {
         .unwrap();
         pipeline.use_clock(Some(&pipeline_clock));
         let sink = pipeline.by_name("sink").unwrap();
-        let seeds = std::sync::Arc::new(AtomicU64::new(0));
+        let before = pipeline_clock.time();
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
         let card_for_probe = card.clone();
-        let seeds_in_probe = seeds.clone();
+        let calls_in_probe = calls.clone();
         seed_until_card_clock_runs(&sink.static_pad("sink").unwrap(), move |_| {
-            seeds_in_probe.fetch_add(1, Ordering::Relaxed);
-            Some(card_for_probe.clone())
+            if calls_in_probe.fetch_add(1, Ordering::Relaxed) + 1 == 3 {
+                card_for_probe.set(running_at);
+            }
+            Some(card_for_probe.clone().upcast())
         });
         pipeline.set_state(gst::State::Playing).unwrap();
         let bus = pipeline.bus().unwrap();
@@ -1131,14 +1185,16 @@ mod tests {
             .expect("EOS");
         pipeline.set_state(gst::State::Null).unwrap();
 
+        let after = pipeline_clock.time();
+
         let (internal, external, _, _) = card.calibration();
-        let offset = external.nseconds() as i64 - internal.nseconds() as i64;
+        assert_eq!(internal, running_at, "the seed that stayed");
         assert!(
-            (offset - hours.nseconds() as i64).abs() < 50_000_000,
-            "card clock calibrated {offset} ns behind the pipeline, want 9 h"
+            external >= before && external <= after,
+            "card time {internal} maps to pipeline time {external}, not within {before}..{after}"
         );
-        // First buffer seeds, second sees the clock run and removes it.
-        assert_eq!(seeds.load(Ordering::Relaxed), 2);
+        // Two buffers with the clock standing, the third sees it moved.
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     fn system_clock() -> gst::Clock {
