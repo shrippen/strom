@@ -372,6 +372,36 @@ fn a_repeated_video_plays_its_times_then_leaves() {
     );
 }
 
+/// RUN.5: a paused video holds its frame on the stage and plays on from
+/// there when resumed: half a second of video paused for a second leaves
+/// after about one and a half.
+#[test]
+fn a_paused_video_holds_its_frame_and_resumes() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut req = request("clip", green_video(rig.dir.path(), 15));
+    req.end = PictureEnd::Stop;
+    req.start = SoundStart::Play;
+    picture::add(&block, &req).unwrap();
+    wait_for("the stage shows green", || is_green(center(&rig)));
+    let shown = Instant::now();
+    std::thread::sleep(Duration::from_millis(200));
+    picture::pause(&block, "clip").unwrap();
+    assert_eq!(state_of(&rig, "clip"), Some(SoundState::Paused));
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(is_green(center(&rig)), "the paused frame went");
+    assert_eq!(state_of(&rig, "clip"), Some(SoundState::Paused));
+
+    picture::resume(&block, "clip").unwrap();
+    assert_eq!(state_of(&rig, "clip"), Some(SoundState::Playing));
+    wait_for("the clip is gone", || state_of(&rig, "clip").is_none());
+    let played = shown.elapsed();
+    assert!(
+        played > Duration::from_millis(1300) && played < Duration::from_millis(2000),
+        "0.5 s of video paused for 1 s was gone after {played:?}"
+    );
+}
+
 /// A pipeline with pictures on its stage is freed when it stops: the
 /// branches hold no strong reference to it (CLAUDE.md, closures).
 #[test]

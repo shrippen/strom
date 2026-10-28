@@ -2845,6 +2845,69 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/pause": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Pause a picture: its frame stays, a video keeps its place.",
+        "operationId": "pause_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture, or it does not play",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/play": {
       "post": {
         "tags": [
@@ -2897,6 +2960,69 @@
           },
           "422": {
             "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/resume": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Resume a paused picture where it was.",
+        "operationId": "resume_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Showing again"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture, or it is not paused",
             "content": {
               "application/json": {
                 "schema": {
@@ -3118,6 +3244,69 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/pause": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Pause a sound where it is (RUN.5).",
+        "operationId": "pause_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it does not play",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/play": {
       "post": {
         "tags": [
@@ -3156,7 +3345,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Playing, or plays once decoded"
+            "description": "Playing, or plays once decoded; a paused one plays on"
           },
           "404": {
             "description": "No running Show Playback block",
@@ -3170,6 +3359,69 @@
           },
           "422": {
             "description": "No such sound, or it has ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/resume": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Resume a paused sound where it was.",
+        "operationId": "resume_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Playing again"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it is not paused",
             "content": {
               "application/json": {
                 "schema": {
@@ -12029,6 +12281,7 @@
           "loading",
           "ready",
           "playing",
+          "paused",
           "ended",
           "failed"
         ]

@@ -511,3 +511,79 @@ fn a_route_to_a_missing_zone_is_refused() {
     request.routes[0].zone_channel = 5;
     assert!(sound::add(&block, &request).is_err());
 }
+
+/// RUN.5: a paused sound goes silent, keeps its place and plays on from
+/// there when resumed: a 3 s tone paused for 1 s ends 4 s after it began.
+#[test]
+fn a_paused_sound_resumes_where_it_was() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let mut request = hall_tone(&rig, "tone");
+    request.start = SoundStart::Play;
+    sound::add(&block, &request).unwrap();
+    wait_for("the Hall hears the tone", || {
+        rig.ears[0].lock().unwrap().first_sound.is_some()
+    });
+    let heard = rig.ears[0].lock().unwrap().first_sound.unwrap();
+
+    std::thread::sleep(Duration::from_millis(1000));
+    sound::pause(&block, "tone").unwrap();
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Paused));
+    std::thread::sleep(Duration::from_millis(200));
+    let quiet_from = rig.ears[0].lock().unwrap().peaks.len();
+    std::thread::sleep(Duration::from_millis(800));
+    let loudest = rig.ears[0].lock().unwrap().peaks[quiet_from..]
+        .iter()
+        .fold(0.0f32, |a, b| a.max(*b));
+    assert!(loudest < 0.01, "heard while paused ({loudest})");
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Paused));
+
+    let resumed = Instant::now();
+    sound::resume(&block, "tone").unwrap();
+    assert_eq!(state_of(&rig, "tone"), Some(SoundState::Playing));
+    wait_for("the Hall hears the tone again", || {
+        rig.ears[0].lock().unwrap().peak > 0.05
+    });
+    let back = resumed.elapsed();
+    assert!(
+        back < Duration::from_millis(150),
+        "heard {back:?} after resume"
+    );
+    wait_for("the tone is over", || state_of(&rig, "tone").is_none());
+    let played = heard.elapsed();
+    // Not from the start again (5 s).
+    assert!(
+        played > Duration::from_millis(3700) && played < Duration::from_millis(4500),
+        "a 3 s tone paused for 1 s was over after {played:?}"
+    );
+}
+
+/// A paused sound stops at once and leaves the pipeline; `play` resumes
+/// a paused one.
+#[test]
+fn a_paused_sound_stops_or_plays_on() {
+    let rig = rig();
+    let block = show_playback::running(&rig.key).unwrap();
+    let before = rig.pipeline.children().len();
+    for id in ["a", "b"] {
+        let mut request = hall_tone(&rig, id);
+        request.start = SoundStart::Play;
+        sound::add(&block, &request).unwrap();
+        wait_for("it plays", || {
+            state_of(&rig, id) == Some(SoundState::Playing)
+        });
+        sound::pause(&block, id).unwrap();
+    }
+    sound::play(&block, "a").unwrap();
+    assert_eq!(state_of(&rig, "a"), Some(SoundState::Playing));
+    sound::stop(&block, "a", 0).unwrap();
+    sound::stop(&block, "b", 500).unwrap();
+    wait_for("both are gone", || {
+        state_of(&rig, "a").is_none() && state_of(&rig, "b").is_none()
+    });
+    assert_eq!(
+        rig.pipeline.children().len(),
+        before,
+        "a branch stayed in the pipeline"
+    );
+}

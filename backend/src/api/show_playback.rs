@@ -108,7 +108,7 @@ pub async fn add_sound(
         ("sound_id" = String, Path, description = "Sound ID")
     ),
     responses(
-        (status = 204, description = "Playing, or plays once decoded"),
+        (status = 204, description = "Playing, or plays once decoded; a paused one plays on"),
         (status = 404, description = "No running Show Playback block", body = ErrorResponse),
         (status = 422, description = "No such sound, or it has ended", body = ErrorResponse)
     )
@@ -324,4 +324,100 @@ pub async fn set_stage_level(
 ) -> Result<StatusCode, ApiError> {
     let block = block(flow_id, block_id)?;
     call(move || picture::set_stage(&block, stage, &request)).await
+}
+
+/// Pause a sound where it is (RUN.5).
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/pause",
+    tag = "show_playback",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Block ID"),
+        ("sound_id" = String, Path, description = "Sound ID")
+    ),
+    responses(
+        (status = 204, description = "Paused"),
+        (status = 404, description = "No running Show Playback block", body = ErrorResponse),
+        (status = 422, description = "No such sound, or it does not play", body = ErrorResponse)
+    )
+)]
+pub async fn pause_sound(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id, sound_id)): Path<(FlowId, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let block = block(flow_id, block_id)?;
+    call(move || sound::pause(&block, &sound_id)).await
+}
+
+/// Resume a paused sound where it was.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/resume",
+    tag = "show_playback",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Block ID"),
+        ("sound_id" = String, Path, description = "Sound ID")
+    ),
+    responses(
+        (status = 204, description = "Playing again"),
+        (status = 404, description = "No running Show Playback block", body = ErrorResponse),
+        (status = 422, description = "No such sound, or it is not paused", body = ErrorResponse)
+    )
+)]
+pub async fn resume_sound(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id, sound_id)): Path<(FlowId, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let block = block(flow_id, block_id)?;
+    call(move || sound::resume(&block, &sound_id)).await
+}
+
+/// Pause a picture: its frame stays, a video keeps its place.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/pause",
+    tag = "show_playback",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Block ID"),
+        ("picture_id" = String, Path, description = "Picture ID")
+    ),
+    responses(
+        (status = 204, description = "Paused"),
+        (status = 404, description = "No running Show Playback block", body = ErrorResponse),
+        (status = 422, description = "No such picture, or it does not play", body = ErrorResponse)
+    )
+)]
+pub async fn pause_picture(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id, picture_id)): Path<(FlowId, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let block = block(flow_id, block_id)?;
+    call(move || picture::pause(&block, &picture_id)).await
+}
+
+/// Resume a paused picture where it was.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/resume",
+    tag = "show_playback",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Block ID"),
+        ("picture_id" = String, Path, description = "Picture ID")
+    ),
+    responses(
+        (status = 204, description = "Showing again"),
+        (status = 404, description = "No running Show Playback block", body = ErrorResponse),
+        (status = 422, description = "No such picture, or it is not paused", body = ErrorResponse)
+    )
+)]
+pub async fn resume_picture(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id, picture_id)): Path<(FlowId, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let block = block(flow_id, block_id)?;
+    call(move || picture::resume(&block, &picture_id)).await
 }
