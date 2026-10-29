@@ -41,7 +41,7 @@ use strom_types::vision_mixer::{
 use strom_types::{FlowId, PropertyValue};
 use tracing::{info, warn};
 
-use super::builder::{pad_layout, pipeline_cpu, preview_out, InputSpec};
+use super::builder::{pad_layout, pipeline_cpu, preview_out, tiles_out, InputSpec};
 use super::overlay::VisionMixerOverlayState;
 
 /// Buffer time of a dynamic input's `intersrc` when the request names none
@@ -412,6 +412,10 @@ fn build_chain(
             .map_err(err)?;
         preview_out::append_input_underlay(spec, i, &mut elems, &mut links).map_err(err)?;
     }
+    if spec.tiles.is_some() {
+        tiles_out::append_input_branch(spec, i, spec.tiles_out_tee_src(), &mut elems, &mut links)
+            .map_err(err)?;
+    }
     Ok((elems, links))
 }
 
@@ -493,6 +497,9 @@ fn teardown(pipeline: &gst::Pipeline, spec: &InputSpec, index: usize, names: &[S
         if let Some(base) = pm.pvw_out_underlay_base() {
             pads.push((spec.id("pvw_comp"), base + index));
         }
+    }
+    if spec.tiles.is_some() {
+        pads.push((spec.id("tiles_comp"), index));
     }
     for (comp_id, idx) in pads {
         let Some(comp) = pipeline.by_name(&comp_id) else {

@@ -405,6 +405,14 @@ pub(super) fn build_pad_properties(
         }
     }
 
+    // --- Tile compositor pad properties: fixed cells ---
+    if let Some(grid) = p.tiles {
+        let tiles_pads = pad_props.entry(p.id("tiles_comp")).or_default();
+        for i in 0..p.num_inputs {
+            tiles_pads.insert(PadMap::sink(i), grid.pad_properties(i));
+        }
+    }
+
     pad_props
 }
 
@@ -474,6 +482,13 @@ pub(crate) fn dynamic_input_pad_properties(
             spec.id("pvw_comp"),
             PadMap::sink(pm.pvw_out_input(i)),
             rect(hidden, 0.0, vision_mixer::MV_BIG_DISPLAY_ZORDER),
+        ));
+    }
+    if let Some(grid) = spec.tiles {
+        pads.push((
+            spec.id("tiles_comp"),
+            PadMap::sink(i),
+            grid.pad_properties(i),
         ));
     }
     let mut underlay = |comp: &str, idx: usize, zorder: u32| {

@@ -443,6 +443,11 @@ pub(super) fn build_cpu_pipeline(
     } else {
         None
     };
+    // Tile output: one more tee branch per input, after the preview's.
+    if let Some(grid) = p.tiles {
+        let tee_src = p.input_spec().tiles_out_tee_src();
+        super::tiles_out::append(p, grid, tee_src, &mut elems, &mut links)?;
+    }
     let pvw_rect = mv_layout.pvw_rect;
     let (pgm_w, pgm_h) = (p.pgm_w, p.pgm_h);
 

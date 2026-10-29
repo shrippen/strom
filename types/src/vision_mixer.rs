@@ -166,6 +166,40 @@ pub const ENABLE_PREVIEW_OUT_PROPERTY: &str = "enable_preview_out";
 /// shows (an input or a PiP), without the multiview's labels and tallies.
 pub const PREVIEW_OUTPUT_PAD: &str = "pvw_out";
 
+/// Block property that builds the tile output.
+pub const ENABLE_TILES_OUT_PROPERTY: &str = "enable_tiles_out";
+
+/// Output pad of the tiles: every input scaled into its own cell of one
+/// grid, in input order, without labels or tallies. A control surface
+/// shows all inputs live from this one stream instead of one per input.
+pub const TILES_OUTPUT_PAD: &str = "tiles_out";
+
+/// Block property: size of one cell of the tile output, `WIDTHxHEIGHT`.
+pub const TILES_CELL_PROPERTY: &str = "tiles_cell";
+
+/// Default cell size of the tile output.
+pub const DEFAULT_TILES_CELL: &str = "640x360";
+
+/// Block property: columns of the tile output; 0 picks them (see
+/// [`tiles_grid`]).
+pub const TILES_COLUMNS_PROPERTY: &str = "tiles_columns";
+
+/// Block property: frame rate of the tile output; empty follows the
+/// multiview's.
+pub const TILES_FRAMERATE_PROPERTY: &str = "tiles_framerate";
+
+/// Columns and rows of the tile output for `cells` inputs. `columns` 0
+/// picks a square grid (the smallest that fits).
+pub fn tiles_grid(cells: usize, columns: usize) -> (usize, usize) {
+    let cells = cells.max(1);
+    let columns = if columns == 0 {
+        (1..=cells).find(|c| c * c >= cells).unwrap_or(cells)
+    } else {
+        columns.min(cells)
+    };
+    (columns, cells.div_ceil(columns))
+}
+
 // --- Z-order constants for compositor pads ---
 
 /// Z-order for thumbnail pads on the multiview compositor.
@@ -842,6 +876,17 @@ pub fn compute_pip_overlay_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiles_grid_is_square_unless_columns_are_given() {
+        assert_eq!(tiles_grid(1, 0), (1, 1));
+        assert_eq!(tiles_grid(16, 0), (4, 4));
+        assert_eq!(tiles_grid(17, 0), (5, 4));
+        assert_eq!(tiles_grid(32, 0), (6, 6));
+        assert_eq!(tiles_grid(32, 8), (8, 4));
+        assert_eq!(tiles_grid(3, 8), (3, 1));
+        assert_eq!(tiles_grid(0, 0), (1, 1));
+    }
 
     #[test]
     fn test_pip_overlay_rects_one_full_aspect() {
