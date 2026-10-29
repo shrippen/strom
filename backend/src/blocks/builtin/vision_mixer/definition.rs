@@ -412,6 +412,30 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+            label: "Tile Pixel Format".to_string(),
+            description: "Pixel format of the tile output. Auto lets GStreamer negotiate."
+                .to_string(),
+            property_type: PropertyType::Enum {
+                values: {
+                    let mut v = vec![EnumValue {
+                        value: String::new(),
+                        label: Some("Auto".to_string()),
+                    }];
+                    v.extend(common_video_pixel_format_enum_values(false));
+                    v
+                },
+            },
+            default_value: Some(PropertyValue::String(String::new())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Stinger input
         ExposedProperty {
             name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),

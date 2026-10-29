@@ -88,6 +88,8 @@ fn mixer_flow(backend: &str) -> Flow {
         ("enable_preview_out", PV::Bool(true)),
         ("enable_tiles_out", PV::Bool(true)),
         ("tiles_cell", PV::String(format!("{}x{}", CELL.0, CELL.1))),
+        // Not what the compositor picks on its own.
+        ("tiles_format", PV::String("BGRA".into())),
         ("initial_pgm_input", PV::UInt(0)),
         ("initial_pvw_input", PV::UInt(1)),
     ]
@@ -423,6 +425,11 @@ async fn comes_and_goes(rig: Rig) {
             s.get::<i32>("height").unwrap()
         ),
         (3 * CELL.0, 2 * CELL.1)
+    );
+    assert_eq!(
+        s.get::<&str>("format").unwrap(),
+        "BGRA",
+        "tiles_format ignored"
     );
     let flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
     let stored = &flow.blocks[0].properties["dynamic_inputs"];

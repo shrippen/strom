@@ -3,7 +3,7 @@
 //!
 //! ```text
 //!   tee_i.src_{t} → queue_to_tiles_out_i → tiles_comp.sink_i
-//!   tiles_comp → [download] → capsfilter_tiles → queue_tiles_out
+//!   tiles_comp → [convert] → [download] → capsfilter_tiles → queue_tiles_out
 //! ```
 //!
 //! A control surface that shows every input live reads this one stream
@@ -26,13 +26,15 @@ use super::{InputSpec, PipelineParams};
 use crate::blocks::BlockBuildError;
 
 /// Size and grid of the tile output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TilesGrid {
     pub(crate) cell_w: u32,
     pub(crate) cell_h: u32,
     pub(crate) columns: usize,
     pub(crate) rows: usize,
     pub(crate) framerate: (i32, i32),
+    /// Pixel format; `None` lets the compositor pick.
+    pub(crate) format: Option<String>,
 }
 
 impl TilesGrid {
@@ -42,6 +44,7 @@ impl TilesGrid {
         (cell_w, cell_h): (u32, u32),
         columns: usize,
         framerate: (i32, i32),
+        format: Option<String>,
     ) -> Self {
         let (columns, rows) = tiles_grid(cells, columns);
         Self {
@@ -50,6 +53,7 @@ impl TilesGrid {
             columns,
             rows,
             framerate,
+            format,
         }
     }
 
@@ -93,7 +97,7 @@ impl TilesGrid {
 /// from `tee_{i}.src_{tee_src}`. Returns the compositor.
 pub(super) fn append(
     p: &PipelineParams,
-    grid: TilesGrid,
+    grid: &TilesGrid,
     tee_src: usize,
     elems: &mut Vec<(String, gst::Element)>,
     links: &mut Vec<(ElementPadRef, ElementPadRef)>,
@@ -119,7 +123,8 @@ pub(super) fn append(
                 "framerate",
                 gst::Fraction::new(grid.framerate.0, grid.framerate.1),
             )
-            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1));
+            .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
+            .field_if_some("format", grid.format.as_deref());
         match features {
             Some(f) => builder.features([f]).build(),
             None => builder.build(),
@@ -134,6 +139,16 @@ pub(super) fn append(
             let q_post_id = p.id("queue_post_tiles");
             elems.push((q_post_id.clone(), elements::make_queue(&q_post_id)?));
             chain.push(q_post_id);
+            // glvideomixer blends RGBA only: another format is converted
+            // on the GPU, before the download.
+            if grid.format.is_some() {
+                let cc_id = p.id("glcolorconvert_tiles");
+                elems.push((
+                    cc_id.clone(),
+                    elements::make_element("glcolorconvert", &cc_id)?,
+                ));
+                chain.push(cc_id);
+            }
             (Some("memory:GLMemory"), "gldownload")
         }
         CompositorBackend::Cuda => (Some(super::CUDA_MEMORY_FEATURE), "cudadownload"),
@@ -160,8 +175,15 @@ pub(super) fn append(
         ));
     }
     info!(
-        "Vision mixer {}: tile output {}x{} ({}x{} cells of {}x{})",
-        p.instance_id, w, h, grid.columns, grid.rows, grid.cell_w, grid.cell_h
+        "Vision mixer {}: tile output {}x{} ({}x{} cells of {}x{}), format {}",
+        p.instance_id,
+        w,
+        h,
+        grid.columns,
+        grid.rows,
+        grid.cell_w,
+        grid.cell_h,
+        grid.format.as_deref().unwrap_or("auto")
     );
     Ok(comp)
 }
@@ -203,7 +225,7 @@ mod tests {
 
     #[test]
     fn inputs_fill_the_grid_row_by_row() {
-        let grid = TilesGrid::new(17, (640, 360), 0, (30, 1));
+        let grid = TilesGrid::new(17, (640, 360), 0, (30, 1), None);
         assert_eq!((grid.columns, grid.rows), (5, 4));
         assert_eq!(grid.size(), (3200, 1440));
         assert_eq!(grid.cell(0), (0, 0, 640, 360));

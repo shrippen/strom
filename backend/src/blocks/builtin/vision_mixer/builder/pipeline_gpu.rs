@@ -649,7 +649,7 @@ pub(super) fn build_gpu_pipeline(
         None
     };
     // Tile output: one more tee branch per input, after the preview's.
-    if let Some(grid) = p.tiles {
+    if let Some(grid) = &p.tiles {
         let tee_src = p.input_spec().tiles_out_tee_src();
         super::tiles_out::append(p, grid, tee_src, &mut elems, &mut links)?;
     }

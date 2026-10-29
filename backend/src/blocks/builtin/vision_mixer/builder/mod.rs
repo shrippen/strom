@@ -212,6 +212,7 @@ impl BlockBuilder for VisionMixerBuilder {
                         vision_mixer::TILES_FRAMERATE_PROPERTY,
                         &format!("{}/{}", mv_framerate.0, mv_framerate.1),
                     ),
+                    properties::parse_format(props, vision_mixer::TILES_FORMAT_PROPERTY),
                 )
             });
 
@@ -388,7 +389,7 @@ impl PipelineParams<'_> {
             pm: self.pad_map(),
             underlay: (self.num_pips > 0).then(|| self.underlay_source()),
             preview_out: self.enable_preview_out,
-            tiles: self.tiles,
+            tiles: self.tiles.clone(),
             pgm_w: self.pgm_w,
             pgm_h: self.pgm_h,
             mv_w: self.mv_w,

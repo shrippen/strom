@@ -188,6 +188,11 @@ pub const TILES_COLUMNS_PROPERTY: &str = "tiles_columns";
 /// multiview's.
 pub const TILES_FRAMERATE_PROPERTY: &str = "tiles_framerate";
 
+/// Block property: pixel format of the tile output; empty lets the
+/// mixer pick (as `output_format`). A viewer that draws RGBA asks for it,
+/// so it shows the frames without converting them.
+pub const TILES_FORMAT_PROPERTY: &str = "tiles_format";
+
 /// Columns and rows of the tile output for `cells` inputs. `columns` 0
 /// picks a square grid (the smallest that fits).
 pub fn tiles_grid(cells: usize, columns: usize) -> (usize, usize) {
