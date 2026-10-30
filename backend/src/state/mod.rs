@@ -3171,6 +3171,19 @@ impl AppState {
         Ok(stats)
     }
 
+    /// Byte counters of a running flow's output elements (RTMP sink, Live
+    /// Recorder file sink).
+    pub async fn get_output_bytes(
+        &self,
+        flow_id: &FlowId,
+    ) -> Result<strom_types::api::OutputBytes, PipelineError> {
+        let pipelines = self.inner.pipelines.read().await;
+        let manager = pipelines.get(flow_id).ok_or_else(|| {
+            PipelineError::InvalidFlow(format!("Pipeline not running for flow: {}", flow_id))
+        })?;
+        Ok(manager.get_output_bytes())
+    }
+
     /// Query the latency of a running pipeline.
     /// Returns (min_latency_ns, max_latency_ns, live) if query succeeds.
     pub async fn get_flow_latency(&self, flow_id: &FlowId) -> Option<(u64, u64, bool)> {

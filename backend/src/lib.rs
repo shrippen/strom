@@ -181,6 +181,10 @@ pub async fn create_app_with_config(
         )
         .route("/flows/{id}/srt-stats", get(api::flows::get_srt_stats))
         .route(
+            "/flows/{id}/output-bytes",
+            get(api::flows::get_output_bytes),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/sdp",
             get(api::flows::get_block_sdp),
         )

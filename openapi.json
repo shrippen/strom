@@ -5144,6 +5144,49 @@
         }
       }
     },
+    "/api/flows/{id}/output-bytes": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Get the byte counters of a running flow's outputs.",
+        "description": "Returns the bytes each output element has sent or written since the flow\nstarted: `rtmp2sink` (bytes on the socket) and the Live Recorder (bytes in\nits files), keyed by element name. A client polls it and takes the rate\nfrom two readings.",
+        "operationId": "get_output_bytes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Output byte counters retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputBytesResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Flow not running",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{id}/pad-caps": {
       "get": {
         "tags": [
@@ -10825,6 +10868,68 @@
             "description": "Credential keys (flow ids) that have a per-flow PAT registered. Used to\nisolate OSC tenants on a shared Strom instance."
           }
         }
+      },
+      "OutputByteCount": {
+        "type": "object",
+        "description": "Bytes one output element has sent or written since the flow started.",
+        "required": [
+          "medium",
+          "bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total since the element started. A reconnecting network sink may\nstart again from zero; a client taking a rate from two readings\ntreats a smaller value as a new start.",
+            "minimum": 0
+          },
+          "medium": {
+            "$ref": "#/components/schemas/OutputMedium"
+          }
+        }
+      },
+      "OutputBytes": {
+        "type": "object",
+        "description": "Byte counters of a flow's output elements, keyed by element name\n(e.g. `block_id:rtmp_sink`).",
+        "required": [
+          "outputs"
+        ],
+        "properties": {
+          "outputs": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OutputByteCount"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "OutputBytesResponse": {
+        "type": "object",
+        "description": "Response containing a flow's output byte counters.",
+        "required": [
+          "flow_id",
+          "stats"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/OutputBytes"
+          }
+        }
+      },
+      "OutputMedium": {
+        "type": "string",
+        "description": "Where an output's bytes go.",
+        "enum": [
+          "network",
+          "file"
+        ]
       },
       "OverlayAlphaRequest": {
         "type": "object",

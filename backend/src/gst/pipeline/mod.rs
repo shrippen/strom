@@ -5,6 +5,7 @@ mod construction;
 pub(crate) mod effects;
 mod lifecycle;
 mod linking;
+pub mod output_bytes;
 pub(crate) mod properties;
 mod srt;
 mod state;
