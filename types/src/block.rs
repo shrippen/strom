@@ -650,10 +650,11 @@ pub fn parse_audio_channel_config(value: &str) -> Option<AudioChannelConfig> {
     })
 }
 
-/// Pixel formats accepted by `decklinkvideosrc` and `decklinkvideosink`'s
-/// `video-format` property. These are GstDecklinkVideoFormat enum nicks, not
+/// Pixel formats accepted by `decklinkvideosrc`'s `video-format` property
+/// (DeckLink Input). These are GstDecklinkVideoFormat enum nicks, not
 /// GStreamer caps `format=` strings — see `COMMON_VIDEO_PIXEL_FORMATS` for the
-/// caps-format equivalents.
+/// caps-format equivalents. The DeckLink Output plays through
+/// `decklink2sink`, which knows fewer: `DECKLINK_OUTPUT_VIDEO_FORMATS`.
 pub const DECKLINK_VIDEO_FORMATS: &[(&str, &str)] = &[
     ("auto", "Auto"),
     ("8bit-yuv", "8-bit YUV (UYVY)"),
@@ -665,9 +666,29 @@ pub const DECKLINK_VIDEO_FORMATS: &[(&str, &str)] = &[
     ("12bit-rgble", "12-bit RGB LE"),
 ];
 
-/// Get DeckLink video formats as `EnumValue` list for block properties.
+/// Pixel formats of `decklink2sink`'s `video-format` property
+/// (GstDeckLink2VideoFormat nicks, DeckLink Output): no 12-bit RGB.
+pub const DECKLINK_OUTPUT_VIDEO_FORMATS: &[(&str, &str)] = &[
+    ("auto", "Auto"),
+    ("8bit-yuv", "8-bit YUV (UYVY)"),
+    ("10bit-yuv", "10-bit YUV (v210)"),
+    ("8bit-argb", "8-bit ARGB"),
+    ("8bit-bgra", "8-bit BGRA"),
+    ("10bit-rgb", "10-bit RGB (r210)"),
+];
+
+/// Get DeckLink input video formats as `EnumValue` list for block properties.
 pub fn decklink_video_format_enum_values() -> Vec<EnumValue> {
-    DECKLINK_VIDEO_FORMATS
+    enum_values(DECKLINK_VIDEO_FORMATS)
+}
+
+/// Get DeckLink output video formats as `EnumValue` list for block properties.
+pub fn decklink_output_video_format_enum_values() -> Vec<EnumValue> {
+    enum_values(DECKLINK_OUTPUT_VIDEO_FORMATS)
+}
+
+fn enum_values(values: &[(&str, &str)]) -> Vec<EnumValue> {
+    values
         .iter()
         .map(|(value, label)| EnumValue {
             value: (*value).to_string(),

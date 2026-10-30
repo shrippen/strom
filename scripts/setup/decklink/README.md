@@ -144,7 +144,7 @@ The mapping in the GUI translates to GStreamer's zero-indexed `device-number`:
 `DeckLink Quad (1)` is `device-number=0`, `DeckLink Quad (2)` is
 `device-number=1`, and so on. `device-number` values that point at
 sub-devices with `Connectors: none` will fail at pipeline start
-(`decklinkvideosink`) or report SDK errors (`decklinkvideosrc`).
+(`decklink2sink`) or report SDK errors (`decklinkvideosrc`).
 
 ## Running Strom with DeckLink in Docker
 
@@ -246,11 +246,24 @@ Add a "DeckLink Output" block and configure:
 - **Stream Mode**: `Audio + Video`, `Video only`, or `Audio only`
 - **Device Number**: Which DeckLink device to use
 - **Video Mode**: Output video format (e.g., `1080p25`, `1080p50`, `2160p50`)
-- **Video Format**: Pixel format the card expects (`8bit-yuv`, `10bit-yuv`, ...)
+- **Video Format**: Pixel format the card expects (`8bit-yuv`, `10bit-yuv`, ...;
+  no 12-bit RGB on output)
+- **Audio Channels**: 2, 8 or 16 embedded channels
 
-In `Audio only` mode `decklinkvideosink` is still created internally and fed
-black frames at 1080p25/UYVY — required for `decklinkaudiosink` to operate. The
-`Video Mode` and `Video Format` properties are ignored in this case.
+The block plays through `decklink2sink` from GStreamer's `decklink2` plugin,
+which GStreamer ships from 1.30 on (the old `decklinkvideosink` shows every
+frame late once an output starts a second time in the same process, GStreamer
+work item 5391, and is going away). For older GStreamer, build `decklink2` from
+GStreamer `main` and put it on `GST_PLUGIN_PATH`; without it the block fails
+with "decklink2sink not found". **The Docker image (GStreamer 1.26) has no
+`decklink2`, so DeckLink outputs do not start there** until the image moves to
+GStreamer 1.30 or bundles the plugin. Inputs still use `decklinkvideosrc`.
+
+`decklink2sink` takes sound only attached to the frames: with sound, a
+`decklink2combiner` puts picture and sound together, the sound coming through an
+`audiomixer` with live silence, so a sound that ends or pauses does not hold
+the picture. In `Audio only` mode black frames at 1080p25/UYVY carry the sound;
+the `Video Mode` and `Video Format` properties are ignored then.
 
 ### Testing Inside Container
 
@@ -268,7 +281,7 @@ gst-launch-1.0 decklinkvideosrc device-number=0 mode=1080p50 ! \
 # Test output to first DeckLink output
 gst-launch-1.0 videotestsrc ! \
   video/x-raw,width=1920,height=1080,framerate=50/1 ! \
-  decklinkvideosink device-number=0 mode=1080p50
+  decklink2sink device-number=0 mode=1080p50
 ```
 
 ### Detecting Which Inputs Have Signal
