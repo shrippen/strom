@@ -276,6 +276,16 @@ const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
 /// More lead time than this only delays the picture.
 const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
 
+/// GStreamer's own preroll for decklink2sink: frames queued on the
+/// card before playback starts, and so the picture's delay.
+const DEFAULT_BUFFERED_FRAMES: u64 = 7;
+/// Fewer frames leave the card nothing to bridge a late one with.
+const MIN_BUFFERED_FRAMES: u64 = 2;
+/// The sink's own limit before it drops frames.
+const MAX_BUFFERED_FRAMES: u64 = 14;
+/// The sink's default for when it starts repeating frames.
+const DEFAULT_REPEAT_BELOW: u64 = 3;
+
 /// Internal video mode used to carry the sound when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
 /// cards; the actual SDI output is irrelevant in this mode (just black frames).
@@ -538,6 +548,21 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             sink.set_property_from_str(property, value);
         }
         sink.set_property("processing-deadline", processing_deadline.nseconds());
+
+        // The card's queue sets the picture's delay; the sink repeats a
+        // frame once fewer than two are left (at most its default 3).
+        let buffered = properties
+            .get("buffered_frames")
+            .and_then(|v| match v {
+                PropertyValue::UInt(u) => Some(*u),
+                PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_BUFFERED_FRAMES)
+            .clamp(MIN_BUFFERED_FRAMES, MAX_BUFFERED_FRAMES);
+        let repeat_below = (buffered - 2).clamp(1, DEFAULT_REPEAT_BELOW);
+        sink.set_property("n-preroll-frames", buffered as i32);
+        sink.set_property("min-buffered-frames", repeat_below as i32);
 
         let mut elements: Vec<(String, gst::Element)> = vec![(sink_id.clone(), sink)];
         let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
@@ -1154,6 +1179,24 @@ fn decklink_output_definition() -> BlockDefinition {
                 live: false,
                 persist: None,
             },
+            ExposedProperty {
+                name: "buffered_frames".to_string(),
+                label: "Buffered Frames".to_string(),
+                description: "Frames queued on the card before playback starts (2-14). \
+                              Each frame adds one frame of delay; fewer frames leave \
+                              less room for a late one, which the card then repeats. \
+                              GStreamer's default is 7."
+                    .to_string(),
+                property_type: PropertyType::UInt,
+                default_value: Some(PropertyValue::UInt(DEFAULT_BUFFERED_FRAMES)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "buffered_frames".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
         ],
         // Static fallback — matches the default `audio_video` mode. Actual pads
         // are computed dynamically in `DeckLinkOutputBuilder::get_external_pads`.
@@ -1372,6 +1415,34 @@ mod tests {
             deadline_of(&huge, "out:decklink2sink"),
             gst::ClockTime::SECOND
         );
+    }
+
+    // The card holds as many frames as asked (GStreamer's 7 cost about
+    // 130 ms at 25p); the sink repeats a frame only when fewer than
+    // two are left, never below one. Out of range is clamped.
+    #[test]
+    fn buffered_frames_set_the_card_queue() {
+        let queue = |frames: Option<u64>| {
+            let properties: Vec<_> = frames
+                .map(|n| ("buffered_frames", PropertyValue::UInt(n)))
+                .into_iter()
+                .collect();
+            output(&properties).map(|result| {
+                let sink = element(&result, "out:decklink2sink");
+                (
+                    sink.property::<i32>("n-preroll-frames"),
+                    sink.property::<i32>("min-buffered-frames"),
+                    sink.property::<i32>("max-buffered-frames"),
+                )
+            })
+        };
+        let Some(default) = queue(None) else {
+            return;
+        };
+        assert_eq!(default, (7, 3, 14));
+        assert_eq!(queue(Some(3)), Some((3, 1, 14)));
+        assert_eq!(queue(Some(0)), Some((2, 1, 14)));
+        assert_eq!(queue(Some(99)), Some((14, 3, 14)));
     }
 
     // Without the decklink2 plugin the block fails and says what is
