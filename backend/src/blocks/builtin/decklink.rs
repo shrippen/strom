@@ -281,9 +281,11 @@ const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
 const DEFAULT_BUFFERED_FRAMES: u64 = 7;
 /// Fewer frames leave the card nothing to bridge a late one with.
 const MIN_BUFFERED_FRAMES: u64 = 2;
-/// The sink's own limit before it drops frames.
-const MAX_BUFFERED_FRAMES: u64 = 14;
-/// The sink's default for when it starts repeating frames.
+/// Two below the sink's `max-buffered-frames` (14), past which it
+/// drops frames: room for two that come close together.
+const MAX_BUFFERED_FRAMES: u64 = 12;
+/// The sink's default `min-buffered-frames`: at that many frames left
+/// it starts repeating.
 const DEFAULT_REPEAT_BELOW: u64 = 3;
 
 /// Internal video mode used to carry the sound when only audio is exposed.
@@ -550,7 +552,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
         sink.set_property("processing-deadline", processing_deadline.nseconds());
 
         // The card's queue sets the picture's delay; the sink repeats a
-        // frame once fewer than two are left (at most its default 3).
+        // frame once only `min-buffered-frames` are left, two below the
+        // queue (between 1 and its default 3).
         let buffered = properties
             .get("buffered_frames")
             .and_then(|v| match v {
@@ -1182,10 +1185,11 @@ fn decklink_output_definition() -> BlockDefinition {
             ExposedProperty {
                 name: "buffered_frames".to_string(),
                 label: "Buffered Frames".to_string(),
-                description: "Frames queued on the card before playback starts (2-14). \
+                description: "Frames queued on the card before playback starts (2-12). \
                               Each frame adds one frame of delay; fewer frames leave \
                               less room for a late one, which the card then repeats. \
-                              GStreamer's default is 7."
+                              With 2 even small jitter repeats frames. GStreamer's \
+                              default is 7."
                     .to_string(),
                 property_type: PropertyType::UInt,
                 default_value: Some(PropertyValue::UInt(DEFAULT_BUFFERED_FRAMES)),
@@ -1417,9 +1421,9 @@ mod tests {
         );
     }
 
-    // The card holds as many frames as asked (GStreamer's 7 cost about
-    // 130 ms at 25p); the sink repeats a frame only when fewer than
-    // two are left, never below one. Out of range is clamped.
+    // The card holds as many frames as asked (GStreamer's 7 are 280 ms
+    // at 25p); the sink repeats a frame at two below that, between one
+    // and three left. Out of range is clamped.
     #[test]
     fn buffered_frames_set_the_card_queue() {
         let queue = |frames: Option<u64>| {
@@ -1442,7 +1446,7 @@ mod tests {
         assert_eq!(default, (7, 3, 14));
         assert_eq!(queue(Some(3)), Some((3, 1, 14)));
         assert_eq!(queue(Some(0)), Some((2, 1, 14)));
-        assert_eq!(queue(Some(99)), Some((14, 3, 14)));
+        assert_eq!(queue(Some(99)), Some((12, 3, 14)));
     }
 
     // Without the decklink2 plugin the block fails and says what is
