@@ -25,6 +25,8 @@ use gstreamer::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use strom_types::{
     block::{StreamMode, *},
     element::ElementPadRef,
@@ -289,33 +291,104 @@ const OUTPUT_SOUND: &str = "sound";
 /// buffers and its latency follow the smallest input buffer.
 const SILENCE_SAMPLES: i32 = 480;
 
-/// Gives `silence` (through its capsfilter `caps`) the caps of the
-/// sound on `mixer`'s `sink_0`, now and on every change, and starts it
-/// with the first.
-fn follow_the_sound(mixer: &gst::Element, silence: &gst::Element, caps: &gst::Element) {
-    let Some(pad) = mixer.static_pad("sink_0") else {
+/// How long after the first frame the silence waits for the sound's
+/// caps before it starts on its own.
+const SILENCE_WAIT_MS: u64 = 500;
+
+/// Format of the sound at the combiner: the card takes S16LE or S32LE,
+/// and the mixer would bring anything else (F32LE) down to S16LE.
+const OUTPUT_SOUND_FORMAT: &str = "S32LE";
+
+/// Starts `silence` (through its capsfilter `caps`) in the caps of the
+/// first sound on `mixer`'s `sink_0`: format, rate and channels. The
+/// mixer fixes its output by those; later format changes it converts,
+/// later channel or rate changes fail (the card would refuse them too).
+/// Has the sound no caps `SILENCE_WAIT_MS` after the combiner's first
+/// frame (pad not linked, or a source that never sends), the silence
+/// starts on its own in what the sound's source offers, else in two
+/// channels: a live output must not freeze without a word.
+fn follow_the_sound(
+    mixer: &gst::Element,
+    combiner: &gst::Element,
+    silence: &gst::Element,
+    caps: &gst::Element,
+) {
+    let (Some(sound), Some(picture)) = (mixer.static_pad("sink_0"), combiner.static_pad("video"))
+    else {
         return;
     };
-    let silence = silence.downgrade();
-    let caps = caps.downgrade();
-    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
-        let Some(gst::PadProbeData::Event(event)) = &info.data else {
-            return gst::PadProbeReturn::Ok;
-        };
-        let gst::EventView::Caps(c) = event.view() else {
-            return gst::PadProbeReturn::Ok;
-        };
-        if let (Some(silence), Some(filter)) = (silence.upgrade(), caps.upgrade()) {
-            filter.set_property("caps", c.caps_owned());
-            if silence.is_locked_state() {
+    let started = Arc::new(AtomicBool::new(false));
+    let start = {
+        let silence = silence.downgrade();
+        let caps = caps.downgrade();
+        move |with: gst::Caps| {
+            let (Some(silence), Some(filter)) = (silence.upgrade(), caps.upgrade()) else {
+                return;
+            };
+            filter.set_property("caps", with);
+            if !started.swap(true, Ordering::SeqCst) {
                 silence.set_locked_state(false);
                 silence.call_async(|s| {
                     let _ = s.sync_state_with_parent();
                 });
             }
         }
+    };
+    let on_caps = start.clone();
+    sound.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data {
+            if let gst::EventView::Caps(c) = event.view() {
+                on_caps(c.caps_owned());
+            }
+        }
         gst::PadProbeReturn::Ok
     });
+    let combiner = combiner.downgrade();
+    let sound = sound.downgrade();
+    picture.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        let Some(clock) = combiner.upgrade().and_then(|c| c.clock()) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let at = clock.time() + gst::ClockTime::from_mseconds(SILENCE_WAIT_MS);
+        let sound = sound.clone();
+        let start = start.clone();
+        let _ = clock.new_single_shot_id(at).wait_async(move |_, _, _| {
+            let Some(sound) = sound.upgrade() else {
+                return;
+            };
+            if sound.current_caps().is_none() {
+                start(offered_caps(&sound));
+            }
+        });
+        gst::PadProbeReturn::Remove
+    });
+}
+
+/// Caps for silence on `pad` that has none: S32LE at 48 kHz in what
+/// its peer offers, two channels where it lets us choose.
+fn offered_caps(pad: &gst::Pad) -> gst::Caps {
+    let raw = |channels: Option<i32>| {
+        let mut caps = gst::Caps::builder("audio/x-raw")
+            .field("format", OUTPUT_SOUND_FORMAT)
+            .field("rate", 48000i32)
+            .field("layout", "interleaved");
+        if let Some(channels) = channels {
+            caps = caps.field("channels", channels);
+        }
+        caps.build()
+    };
+    let offered = pad
+        .peer()
+        .map(|peer| peer.query_caps(None))
+        .unwrap_or_else(gst::Caps::new_any);
+    for wanted in [raw(Some(2)), raw(None)] {
+        let mut caps = offered.intersect(&wanted);
+        if !caps.is_empty() {
+            caps.fixate();
+            return caps;
+        }
+    }
+    raw(Some(2))
 }
 
 /// `factory`'s element named `name`; for a missing one an error that says
@@ -476,7 +549,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 ElementPadRef::pad(&combiner_id, "src"),
                 ElementPadRef::pad(&sink_id, "sink"),
             ));
-            elements.push((combiner_id.clone(), combiner));
+            elements.push((combiner_id.clone(), combiner.clone()));
 
             // The combiner waits for sound for every frame: sound that
             // ends or pauses would hold the picture. A mixer with live
@@ -493,9 +566,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                     BlockBuildError::ElementCreation(format!("audiomixer: no {pad}"))
                 })?;
             }
-            // Silence in exactly the sound's caps (format, rate,
-            // channels): the mixer then passes the sound through
-            // unchanged. Its source waits for the sound's first caps.
+            // Silence in the first sound's caps (format, rate,
+            // channels), see `follow_the_sound`.
             let silence_id = format!("{}:silence", instance_id);
             let silence = gst::ElementFactory::make("audiotestsrc")
                 .name(&silence_id)
@@ -515,7 +587,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 .map_err(|e| {
                     BlockBuildError::ElementCreation(format!("capsfilter (silence): {e}"))
                 })?;
-            follow_the_sound(&sound, &silence, &silence_caps);
+            follow_the_sound(&sound, &combiner, &silence, &silence_caps);
             internal_links.push((
                 ElementPadRef::pad(&silence_id, "src"),
                 ElementPadRef::pad(&silence_caps_id, "sink"),
@@ -524,11 +596,29 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 ElementPadRef::pad(&silence_caps_id, "src"),
                 ElementPadRef::pad(&sound_id, "sink_1"),
             ));
+            let sound_format_id = format!("{}:sound_format", instance_id);
+            let sound_format = gst::ElementFactory::make("capsfilter")
+                .name(&sound_format_id)
+                .property(
+                    "caps",
+                    gst::Caps::builder("audio/x-raw")
+                        .field("format", OUTPUT_SOUND_FORMAT)
+                        .build(),
+                )
+                .build()
+                .map_err(|e| {
+                    BlockBuildError::ElementCreation(format!("capsfilter (sound format): {e}"))
+                })?;
             internal_links.push((
                 ElementPadRef::pad(&sound_id, "src"),
+                ElementPadRef::pad(&sound_format_id, "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(&sound_format_id, "src"),
                 ElementPadRef::pad(&combiner_id, "audio"),
             ));
             elements.push((sound_id, sound));
+            elements.push((sound_format_id, sound_format));
             elements.push((silence_id, silence));
             elements.push((silence_caps_id, silence_caps));
 
@@ -1381,22 +1471,98 @@ mod tests {
         assert!(message.contains("GStreamer 1.30"), "{message}");
     }
 
+    /// Raw sound for the tests: `format`, 48 kHz, `channels`
+    /// unpositioned beyond two.
+    fn raw_sound(format: &str, channels: u32) -> String {
+        let mask = if channels > 2 {
+            ",channel-mask=(bitmask)0"
+        } else {
+            ""
+        };
+        format!(
+            "audio/x-raw,format={format},rate=48000,channels={channels},layout=interleaved{mask}"
+        )
+    }
+
     // Sound that ends (or pauses) must not stop the picture: the
-    // combiner waits for sound for every frame. The block up to the
-    // card, with a fakesink in its place: sound for half a second,
-    // picture for three seconds at 25 fps. The card gets the sound in
-    // its own format, rate and channels.
+    // combiner waits for sound for every frame. Sound for half a
+    // second, picture for three seconds at 25 fps. The card gets the
+    // sound in its own format, rate and channels.
     #[test]
     fn the_picture_runs_on_when_the_sound_stops() {
         for channels in [2, 8] {
-            picture_after_the_sound(channels);
+            let sound = format!(
+                "audiotestsrc is-live=true num-buffers=50 samplesperbuffer=480 \
+                 ! capsfilter caps={}",
+                raw_sound("S32LE", channels)
+            );
+            let Some((shown, caps)) = play(Some(&sound)) else {
+                return;
+            };
+            assert!(
+                shown >= 60,
+                "{channels} channels: {shown} of 75 frames after the sound stopped"
+            );
+            assert!(caps.contains("format=(string)S32LE"), "{caps}");
+            assert!(
+                caps.contains(&format!("channels=(int){channels}")),
+                "{caps}"
+            );
+            assert!(caps.contains("rate=(int)48000"), "{caps}");
         }
     }
 
-    fn picture_after_the_sound(channels: u32) {
-        let Some(block) = output(&[mode("audio_video")]) else {
+    // The card knows only S16LE and S32LE: float sound must not end up
+    // as 16 bits.
+    #[test]
+    fn float_sound_reaches_the_card_in_32_bits() {
+        let sound = format!(
+            "audiotestsrc is-live=true samplesperbuffer=480 ! capsfilter caps={}",
+            raw_sound("F32LE", 2)
+        );
+        let Some((shown, caps)) = play(Some(&sound)) else {
             return;
         };
+        assert!(shown >= 60, "{shown} of 75 frames");
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+    }
+
+    // A live output must never freeze silently: with no sound at all
+    // (pad not linked, or linked to a source that never sends) the
+    // silence starts on its own, in the channels the sound's source
+    // offers, else two.
+    #[test]
+    fn the_picture_runs_without_any_sound() {
+        let Some((shown, caps)) = play(None) else {
+            return;
+        };
+        assert!(shown >= 50, "unlinked sound: {shown} of 75 frames");
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+        assert!(caps.contains("channels=(int)2"), "{caps}");
+
+        // A live source that never sends (with a latency, as live
+        // sources have) behind fixed caps in eight channels.
+        let quiet = format!(
+            "appsrc is-live=true format=time min-latency=10000000 ! capsfilter caps={}",
+            raw_sound("S32LE", 8)
+        );
+        let Some((shown, caps)) = play(Some(&quiet)) else {
+            return;
+        };
+        assert!(
+            shown >= 50,
+            "sound without data: {shown} of 75 frames, {caps}"
+        );
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+        assert!(caps.contains("channels=(int)8"), "{caps}");
+    }
+
+    /// Plays the block up to the card, with a fakesink in its place: 75
+    /// frames at 25 fps and `sound` (a bin description) on its sound
+    /// pad, if any. The frames that reached the sink and the sound's
+    /// caps at the combiner; `None` without the decklink2 plugin.
+    fn play(sound: Option<&str>) -> Option<(u64, String)> {
+        let block = output(&[mode("audio_video")])?;
         let pads = DeckLinkOutputBuilder
             .get_external_pads(&props(&[mode("audio_video")]))
             .unwrap();
@@ -1442,24 +1608,16 @@ mod tests {
             true,
         )
         .unwrap();
-        let sound = gst::parse::bin_from_description(
-            &format!(
-                "audiotestsrc is-live=true num-buffers=50 samplesperbuffer=480 \
-                 ! capsfilter caps=audio/x-raw,format=S32LE,rate=48000,channels={channels},\
-                 layout=interleaved{}",
-                if channels > 2 {
-                    ",channel-mask=(bitmask)0"
-                } else {
-                    ""
-                }
-            ),
-            true,
-        )
-        .unwrap();
-        pipeline.add(&picture).unwrap();
-        pipeline.add(&sound).unwrap();
-        for (bin, name) in [(&picture, "video_in"), (&sound, "audio_in")] {
-            let target = pads.inputs.iter().find(|p| p.name == name).unwrap();
+        let mut inputs = vec![(picture, "video_in")];
+        if let Some(sound) = sound {
+            inputs.push((
+                gst::parse::bin_from_description(sound, true).unwrap(),
+                "audio_in",
+            ));
+        }
+        for (bin, name) in &inputs {
+            pipeline.add(bin).unwrap();
+            let target = pads.inputs.iter().find(|p| p.name == *name).unwrap();
             let into = pad(
                 &format!("out:{}", target.internal_element_id),
                 &target.internal_pad_name,
@@ -1477,25 +1635,16 @@ mod tests {
             });
         pipeline.set_state(gst::State::Playing).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(3500));
-        // The card gets the sound as it came: the silence takes its
-        // format, rate and channels.
-        let combined = by_id(&format!("out:{OUTPUT_COMBINER}"))
+        let caps = by_id(&format!("out:{OUTPUT_COMBINER}"))
             .static_pad("audio")
             .unwrap()
             .current_caps()
             .map(|c| c.to_string());
         pipeline.set_state(gst::State::Null).unwrap();
         let shown = count.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            shown >= 60,
-            "{channels} channels: {shown} of 75 frames after the sound stopped"
-        );
-        let combined = combined.expect("no sound caps at the combiner");
-        assert!(combined.contains("format=(string)S32LE"), "{combined}");
-        assert!(
-            combined.contains(&format!("channels=(int){channels}")),
-            "{combined}"
-        );
-        assert!(combined.contains("rate=(int)48000"), "{combined}");
+        Some((
+            shown,
+            caps.unwrap_or_else(|| format!("no sound caps at the combiner ({shown} frames)")),
+        ))
     }
 }
