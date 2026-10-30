@@ -6,15 +6,18 @@
 //! - **DeckLink Input** — always creates `decklinkvideosrc` because the plugin
 //!   requires it for `decklinkaudiosrc` to operate on the same device. In
 //!   `audio` mode the video src is drained internally to a `fakesink`.
-//! - **DeckLink Output** — always creates `decklinkvideosink` for the mirrored
-//!   constraint on the playback side. In `audio` mode the videosink is fed
-//!   internally by a `videotestsrc` (black, 1920x1080@25 UYVY) so it can reach
-//!   PLAYING.
+//! - **DeckLink Output** — `decklink2sink` from GStreamer's decklink2 plugin
+//!   (GStreamer 1.30). It takes sound only as part of the picture, so with
+//!   sound a `decklink2combiner` puts both together. In `audio` mode black
+//!   frames (`videotestsrc`, 1920x1080@25 UYVY) carry the sound.
 //!
 //! No format conversion elements are inserted on either side — peer blocks must
 //! accept (input) or deliver (output) the card's native pixel/audio formats.
 //!
-//! Uses GStreamer's DeckLink plugin (gst-plugins-bad) for hardware integration.
+//! The input uses GStreamer's decklink plugin, the output its decklink2
+//! plugin (both gst-plugins-bad). The old `decklinkvideosink` shows every
+//! frame late once an output starts a second time in the same process
+//! (GStreamer work item 5391); decklink2 replaces it.
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
 use gstreamer as gst;
@@ -22,13 +25,12 @@ use gstreamer::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use strom_types::{
     block::{StreamMode, *},
     element::ElementPadRef,
     EnumValue, MediaType, PropertyValue,
 };
-use tracing::{debug, info};
+use tracing::info;
 
 /// DeckLink Input block builder.
 ///
@@ -260,11 +262,11 @@ impl BlockBuilder for DeckLinkInputBuilder {
 
 /// DeckLink Output block builder.
 ///
-/// Combined video + audio playback. The `stream_mode` property controls which pads
-/// are exposed (`audio_video`, `video`, `audio`). `decklinkvideosink` is always
-/// created internally — required by the DeckLink GStreamer plugin even when only
-/// audio is sent externally. In audio-only mode an internal `videotestsrc` (black,
-/// 1920x1080@25 UYVY) drives the videosink so the pipeline can reach PLAYING.
+/// Combined video + audio playback through `decklink2sink`. The `stream_mode`
+/// property controls which pads are exposed (`audio_video`, `video`, `audio`).
+/// The sink takes sound only attached to the frames, so with sound both go
+/// through a `decklink2combiner`; in audio-only mode an internal
+/// `videotestsrc` (black, 1920x1080@25 UYVY) gives the sound its frames.
 pub struct DeckLinkOutputBuilder;
 
 /// GStreamer's own default for a sink's processing deadline.
@@ -272,11 +274,30 @@ const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
 /// More lead time than this only delays the picture.
 const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
 
-/// Internal video mode used to drive `decklinkvideosink` when only audio is exposed.
+/// Internal video mode used to carry the sound when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
 /// cards; the actual SDI output is irrelevant in this mode (just black frames).
 const AUDIO_ONLY_INTERNAL_MODE: &str = "1080p25";
 const AUDIO_ONLY_INTERNAL_FORMAT: &str = "8bit-yuv";
+
+/// Element ids inside the output block.
+const OUTPUT_SINK: &str = "decklink2sink";
+const OUTPUT_COMBINER: &str = "decklink2combiner";
+
+/// `factory`'s element named `name`; for a missing one an error that says
+/// where the plugin comes from.
+fn card_element(factory: &str, name: &str) -> Result<gst::Element, BlockBuildError> {
+    if gst::ElementFactory::find(factory).is_none() {
+        return Err(BlockBuildError::ElementCreation(format!(
+            "{factory} not found: the DeckLink output needs GStreamer's decklink2 plugin \
+             (GStreamer 1.30 or later, or built from GStreamer main and put on GST_PLUGIN_PATH)"
+        )));
+    }
+    gst::ElementFactory::make(factory)
+        .name(name)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("{factory}: {e}")))
+}
 
 impl BlockBuilder for DeckLinkOutputBuilder {
     fn get_external_pads(
@@ -293,6 +314,11 @@ impl BlockBuilder for DeckLinkOutputBuilder {
 
         let mut inputs = Vec::new();
         if mode.has_video() {
+            let (element, pad) = if mode.has_audio() {
+                (OUTPUT_COMBINER, "video")
+            } else {
+                (OUTPUT_SINK, "sink")
+            };
             inputs.push(ExternalPad {
                 label: if mode.has_audio() {
                     Some("V".to_string())
@@ -301,8 +327,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 },
                 name: "video_in".to_string(),
                 media_type: MediaType::Video,
-                internal_element_id: "decklinkvideosink".to_string(),
-                internal_pad_name: "sink".to_string(),
+                internal_element_id: element.to_string(),
+                internal_pad_name: pad.to_string(),
             });
         }
         if mode.has_audio() {
@@ -314,8 +340,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 },
                 name: "audio_in".to_string(),
                 media_type: MediaType::Audio,
-                internal_element_id: "decklinkaudiosink".to_string(),
-                internal_pad_name: "sink".to_string(),
+                internal_element_id: OUTPUT_COMBINER.to_string(),
+                internal_pad_name: "audio".to_string(),
             });
         }
 
@@ -350,7 +376,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             })
             .unwrap_or(0);
 
-        // In audio-only mode the videosink runs in a fixed internal mode regardless
+        // In audio-only mode the sink runs in a fixed internal mode regardless
         // of the user's `mode`/`video_format` settings — those only apply when the
         // video pad is actually wired up.
         let (video_mode, video_format) = if stream_mode.has_video() {
@@ -385,74 +411,66 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 .min(MAX_PROCESSING_DEADLINE_MS),
         );
 
-        let videosink_id = format!("{}:decklinkvideosink", instance_id);
-        let videosink = gst::ElementFactory::make("decklinkvideosink")
-            .name(&videosink_id)
-            .property("device-number", device_number)
-            .property_from_str("mode", video_mode)
-            .property_from_str("video-format", video_format)
-            .property("processing-deadline", processing_deadline)
-            .build()
-            .map_err(|e| BlockBuildError::ElementCreation(format!("decklinkvideosink: {}", e)))?;
-        seed_card_clock_on_first_frame(&videosink);
+        let sink_id = format!("{}:{}", instance_id, OUTPUT_SINK);
+        let sink = card_element(OUTPUT_SINK, &sink_id)?;
+        sink.set_property("device-number", device_number);
+        sink.set_property_from_str("mode", video_mode);
+        sink.set_property_from_str("video-format", video_format);
+        sink.set_property("processing-deadline", processing_deadline.nseconds());
 
-        let mut elements: Vec<(String, gst::Element)> = vec![(videosink_id.clone(), videosink)];
+        let mut elements: Vec<(String, gst::Element)> = vec![(sink_id.clone(), sink)];
         let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
 
-        // Audio-only: feed videosink with black frames so it can reach PLAYING.
-        // (decklinkaudiosink requires decklinkvideosink to be running on the same device.)
-        if !stream_mode.has_video() {
-            let testsrc_id = format!("{}:video_filler", instance_id);
-            let capsfilter_id = format!("{}:video_filler_caps", instance_id);
-
-            let testsrc = gst::ElementFactory::make("videotestsrc")
-                .name(&testsrc_id)
-                .property_from_str("pattern", "black")
-                .property("is-live", true)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("videotestsrc (filler): {}", e))
-                })?;
-
-            // Caps must match the videosink's hardcoded internal mode.
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", "UYVY")
-                .field("width", 1920i32)
-                .field("height", 1080i32)
-                .field("framerate", gst::Fraction::new(25, 1))
-                .field("interlace-mode", "progressive")
-                .build();
-            let capsfilter = gst::ElementFactory::make("capsfilter")
-                .name(&capsfilter_id)
-                .property("caps", &caps)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("capsfilter (filler): {}", e))
-                })?;
-
-            internal_links.push((
-                ElementPadRef::pad(&testsrc_id, "src"),
-                ElementPadRef::pad(&capsfilter_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&capsfilter_id, "src"),
-                ElementPadRef::pad(&videosink_id, "sink"),
-            ));
-            elements.push((testsrc_id, testsrc));
-            elements.push((capsfilter_id, capsfilter));
-        }
-
         if stream_mode.has_audio() {
-            let audiosink_id = format!("{}:decklinkaudiosink", instance_id);
-            let audiosink = gst::ElementFactory::make("decklinkaudiosink")
-                .name(&audiosink_id)
-                .property("device-number", device_number)
-                .property("processing-deadline", processing_deadline)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("decklinkaudiosink: {}", e))
-                })?;
-            elements.push((audiosink_id, audiosink));
+            let combiner_id = format!("{}:{}", instance_id, OUTPUT_COMBINER);
+            let combiner = card_element(OUTPUT_COMBINER, &combiner_id)?;
+            internal_links.push((
+                ElementPadRef::pad(&combiner_id, "src"),
+                ElementPadRef::pad(&sink_id, "sink"),
+            ));
+            elements.push((combiner_id.clone(), combiner));
+
+            // Audio-only: black frames carry the sound.
+            if !stream_mode.has_video() {
+                let testsrc_id = format!("{}:video_filler", instance_id);
+                let capsfilter_id = format!("{}:video_filler_caps", instance_id);
+
+                let testsrc = gst::ElementFactory::make("videotestsrc")
+                    .name(&testsrc_id)
+                    .property_from_str("pattern", "black")
+                    .property("is-live", true)
+                    .build()
+                    .map_err(|e| {
+                        BlockBuildError::ElementCreation(format!("videotestsrc (filler): {}", e))
+                    })?;
+
+                // Caps must match the sink's internal mode.
+                let caps = gst::Caps::builder("video/x-raw")
+                    .field("format", "UYVY")
+                    .field("width", 1920i32)
+                    .field("height", 1080i32)
+                    .field("framerate", gst::Fraction::new(25, 1))
+                    .field("interlace-mode", "progressive")
+                    .build();
+                let capsfilter = gst::ElementFactory::make("capsfilter")
+                    .name(&capsfilter_id)
+                    .property("caps", &caps)
+                    .build()
+                    .map_err(|e| {
+                        BlockBuildError::ElementCreation(format!("capsfilter (filler): {}", e))
+                    })?;
+
+                internal_links.push((
+                    ElementPadRef::pad(&testsrc_id, "src"),
+                    ElementPadRef::pad(&capsfilter_id, "sink"),
+                ));
+                internal_links.push((
+                    ElementPadRef::pad(&capsfilter_id, "src"),
+                    ElementPadRef::pad(&combiner_id, "video"),
+                ));
+                elements.push((testsrc_id, testsrc));
+                elements.push((capsfilter_id, capsfilter));
+            }
         }
 
         info!(
@@ -847,13 +865,13 @@ fn decklink_output_definition() -> BlockDefinition {
     BlockDefinition {
         id: "builtin.decklink_output".to_string(),
         name: "DeckLink Output".to_string(),
-        description: "Outputs video and/or audio to a Blackmagic DeckLink SDI/HDMI card. Accepts the card's native pixel and audio formats only — no internal conversion. In audio-only mode the videosink is internally driven with black frames so it can reach PLAYING.".to_string(),
+        description: "Outputs video and/or audio to a Blackmagic DeckLink SDI/HDMI card (decklink2sink, GStreamer 1.30). Accepts the card's native pixel and audio formats only — no internal conversion. In audio-only mode black frames carry the sound.".to_string(),
         category: "Outputs".to_string(),
         exposed_properties: vec![
             ExposedProperty {
                 name: "stream_mode".to_string(),
                 label: "Stream Mode".to_string(),
-                description: "Which media tracks to expose: video only, audio only, or both. (decklinkvideosink is always created internally — required by the DeckLink plugin even in audio-only mode.)".to_string(),
+                description: "Which media tracks to expose: video only, audio only, or both. (The card takes sound only with frames: in audio-only mode black frames carry it.)".to_string(),
                 property_type: PropertyType::Enum {
                     values: vec![
                         EnumValue {
@@ -954,15 +972,15 @@ fn decklink_output_definition() -> BlockDefinition {
                     label: Some("V".to_string()),
                     name: "video_in".to_string(),
                     media_type: MediaType::Video,
-                    internal_element_id: "decklinkvideosink".to_string(),
-                    internal_pad_name: "sink".to_string(),
+                    internal_element_id: OUTPUT_COMBINER.to_string(),
+                    internal_pad_name: "video".to_string(),
                 },
                 ExternalPad {
                     label: Some("A".to_string()),
                     name: "audio_in".to_string(),
                     media_type: MediaType::Audio,
-                    internal_element_id: "decklinkaudiosink".to_string(),
-                    internal_pad_name: "sink".to_string(),
+                    internal_element_id: OUTPUT_COMBINER.to_string(),
+                    internal_pad_name: "audio".to_string(),
                 },
             ],
             outputs: vec![],
@@ -977,252 +995,213 @@ fn decklink_output_definition() -> BlockDefinition {
     }
 }
 
-/// Lines the card's clock up with the pipeline clock before the first
-/// frame is scheduled.
-///
-/// `decklinkvideosink` slaves the card's clock to the pipeline clock when
-/// the first frame arrives, but the calibration takes a few seconds to
-/// settle. Until then it maps running time to card time one to one, which
-/// is only right while the running time is close to zero. With a running
-/// time far from zero (direct media timing: base time 0, the running time
-/// is the clock's time, hours after boot) the first seconds of frames are
-/// scheduled hours ahead, fill the card's queue, and the card then refuses
-/// every frame with E_FAIL. Seeding the calibration with "card time now is
-/// pipeline time now" makes those frames land on time; the slaving refines
-/// it from there.
-fn seed_card_clock_on_first_frame(videosink: &gst::Element) {
-    if let Some(pad) = videosink.static_pad("sink") {
-        seed_until_card_clock_runs(&pad, |sink| sink.provide_clock());
-    }
-}
-
-/// Seeds the card clock (`card_clock_of` the sink) on each buffer through
-/// `pad` until that clock is seen running, then removes the probe.
-///
-/// The card's clock stands until the card starts playing, and the card
-/// starts only once picture and sound have both arrived: a seed taken
-/// while it stands would be off by however long it stood. Re-seeding on
-/// each buffer keeps the seed fresh until the clock moves between two
-/// buffers; then the seed is right and stays. This is a BUFFER probe, but
-/// it lives for the first few buffers of a start only, keeps its state in
-/// an atomic and captures no GStreamer object.
-fn seed_until_card_clock_runs<F>(pad: &gst::Pad, card_clock_of: F)
-where
-    F: Fn(&gst::Element) -> Option<gst::Clock> + Send + Sync + 'static,
-{
-    let last_card_time = AtomicU64::new(u64::MAX);
-    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, _info| {
-        let Some(sink) = pad.parent_element() else {
-            return gst::PadProbeReturn::Remove;
-        };
-        let Some(pipeline_clock) = sink.clock() else {
-            return gst::PadProbeReturn::Ok;
-        };
-        let Some(card_clock) = card_clock_of(&sink) else {
-            return gst::PadProbeReturn::Ok;
-        };
-        if card_clock == pipeline_clock {
-            return gst::PadProbeReturn::Remove;
-        }
-        let card_time = card_clock.internal_time();
-        seed_calibration(&card_clock, card_time, &pipeline_clock);
-        let before = last_card_time.swap(card_time.nseconds(), Ordering::Relaxed);
-        if before != u64::MAX && before != card_time.nseconds() {
-            debug!("DeckLink Output: card clock seeded at {}", card_time);
-            gst::PadProbeReturn::Remove
-        } else {
-            gst::PadProbeReturn::Ok
-        }
-    });
-}
-
-/// Calibrates `card_clock` so that `card_time` (its internal time now)
-/// maps to the time of `pipeline_clock` now, at rate 1.
-fn seed_calibration(
-    card_clock: &gst::Clock,
-    card_time: gst::ClockTime,
-    pipeline_clock: &gst::Clock,
-) {
-    card_clock.set_calibration(card_time, pipeline_clock.time(), 1, 1);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn output(properties: &[(&str, PropertyValue)]) -> BlockBuildResult {
-        gst::init().unwrap();
-        let properties = properties
+    fn props(properties: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
+        properties
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
-            .collect();
-        DeckLinkOutputBuilder
-            .build(
-                "out",
-                &properties,
-                &BlockBuildContext::new(Vec::new(), "all".to_string()),
-            )
-            .expect("DeckLink output block")
+            .collect()
     }
 
-    fn deadline_of(result: &BlockBuildResult, id: &str) -> gst::ClockTime {
-        let (_, element) = result
+    fn mode(stream_mode: &str) -> (&'static str, PropertyValue) {
+        (
+            "stream_mode",
+            PropertyValue::String(stream_mode.to_string()),
+        )
+    }
+
+    /// The output block, or `None` (the test passes) where GStreamer has
+    /// no decklink2 plugin: it is new in 1.30.
+    fn output(properties: &[(&str, PropertyValue)]) -> Option<BlockBuildResult> {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("decklink2sink").is_none() {
+            eprintln!("skipped: no decklink2 plugin");
+            return None;
+        }
+        Some(
+            DeckLinkOutputBuilder
+                .build(
+                    "out",
+                    &props(properties),
+                    &BlockBuildContext::new(Vec::new(), "all".to_string()),
+                )
+                .expect("DeckLink output block"),
+        )
+    }
+
+    fn element<'a>(result: &'a BlockBuildResult, id: &str) -> &'a gst::Element {
+        result
             .elements
             .iter()
             .find(|(element_id, _)| element_id == id)
-            .unwrap_or_else(|| panic!("no element {id}"));
-        gst::ClockTime::from_nseconds(element.property::<u64>("processing-deadline"))
+            .map(|(_, element)| element)
+            .unwrap_or_else(|| panic!("no element {id}"))
     }
 
-    // Both sinks of the card take the lead time, so picture and sound
-    // keep together. Without the property they keep 20 ms, which is also
-    // GStreamer's own default: that half documents it and guards nothing.
-    #[test]
-    fn output_sinks_take_the_lead_time() {
-        let ahead = output(&[("processing_deadline_ms", PropertyValue::UInt(100))]);
-        let ms100 = gst::ClockTime::from_mseconds(100);
-        assert_eq!(deadline_of(&ahead, "out:decklinkvideosink"), ms100);
-        assert_eq!(deadline_of(&ahead, "out:decklinkaudiosink"), ms100);
+    fn deadline_of(result: &BlockBuildResult, id: &str) -> gst::ClockTime {
+        gst::ClockTime::from_nseconds(element(result, id).property::<u64>("processing-deadline"))
+    }
 
-        let plain = output(&[]);
-        let ms20 = gst::ClockTime::from_mseconds(20);
-        assert_eq!(deadline_of(&plain, "out:decklinkvideosink"), ms20);
-        assert_eq!(deadline_of(&plain, "out:decklinkaudiosink"), ms20);
+    fn targets(pads: &ExternalPads) -> Vec<(String, String, String)> {
+        pads.inputs
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.internal_element_id.clone(),
+                    p.internal_pad_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn has_link(result: &BlockBuildResult, from: (&str, &str), to: (&str, &str)) -> bool {
+        result.internal_links.iter().any(|(a, b)| {
+            a.element_id == from.0
+                && a.pad_name.as_deref() == Some(from.1)
+                && b.element_id == to.0
+                && b.pad_name.as_deref() == Some(to.1)
+        })
+    }
+
+    // decklink2sink takes sound only as part of the picture: with sound,
+    // both go into the combiner; picture alone goes straight to the sink.
+    #[test]
+    fn sound_meets_the_picture_in_the_combiner() {
+        let both = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("audio_video")]))
+            .unwrap();
+        assert_eq!(
+            targets(&both),
+            vec![
+                (
+                    "video_in".into(),
+                    "decklink2combiner".into(),
+                    "video".into()
+                ),
+                (
+                    "audio_in".into(),
+                    "decklink2combiner".into(),
+                    "audio".into()
+                ),
+            ]
+        );
+        let sound = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("audio")]))
+            .unwrap();
+        assert_eq!(
+            targets(&sound),
+            vec![(
+                "audio_in".into(),
+                "decklink2combiner".into(),
+                "audio".into()
+            )]
+        );
+        let picture = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("video")]))
+            .unwrap();
+        assert_eq!(
+            targets(&picture),
+            vec![("video_in".into(), "decklink2sink".into(), "sink".into())]
+        );
+    }
+
+    // The block's elements as the pads above say: the combiner feeds the
+    // sink, and with sound only black frames drive the picture.
+    #[test]
+    fn the_combiner_feeds_the_sink() {
+        let Some(both) = output(&[mode("audio_video")]) else {
+            return;
+        };
+        assert!(has_link(
+            &both,
+            ("out:decklink2combiner", "src"),
+            ("out:decklink2sink", "sink")
+        ));
+        let Some(sound) = output(&[mode("audio")]) else {
+            return;
+        };
+        assert!(has_link(
+            &sound,
+            ("out:video_filler_caps", "src"),
+            ("out:decklink2combiner", "video")
+        ));
+        assert!(has_link(
+            &sound,
+            ("out:decklink2combiner", "src"),
+            ("out:decklink2sink", "sink")
+        ));
+        let Some(picture) = output(&[mode("video")]) else {
+            return;
+        };
+        assert!(picture.internal_links.is_empty());
+        assert_eq!(picture.elements.len(), 1);
+    }
+
+    // The sink takes the device, the mode and the lead time. Without the
+    // property it keeps 20 ms, GStreamer's own default: that half
+    // documents it and guards nothing.
+    #[test]
+    fn the_sink_takes_device_mode_and_lead_time() {
+        let Some(ahead) = output(&[
+            ("device_number", PropertyValue::UInt(3)),
+            ("mode", PropertyValue::String("720p50".into())),
+            ("processing_deadline_ms", PropertyValue::UInt(100)),
+        ]) else {
+            return;
+        };
+        let sink = element(&ahead, "out:decklink2sink");
+        assert_eq!(sink.property::<i32>("device-number"), 3);
+        assert_eq!(enum_nick(sink, "mode"), "720p50");
+        assert_eq!(
+            deadline_of(&ahead, "out:decklink2sink"),
+            gst::ClockTime::from_mseconds(100)
+        );
+
+        let Some(plain) = output(&[]) else {
+            return;
+        };
+        assert_eq!(
+            deadline_of(&plain, "out:decklink2sink"),
+            gst::ClockTime::from_mseconds(20)
+        );
+    }
+
+    fn enum_nick(element: &gst::Element, name: &str) -> String {
+        let value = element.property_value(name);
+        let (_, enum_value) = gst::glib::EnumValue::from_value(&value).unwrap();
+        enum_value.nick().to_string()
     }
 
     // A lead time of hours (or u64::MAX ms, which would overflow) is cut
     // to a second.
     #[test]
     fn lead_time_has_a_ceiling() {
-        let huge = output(&[("processing_deadline_ms", PropertyValue::UInt(u64::MAX))]);
-        let second = gst::ClockTime::SECOND;
-        assert_eq!(deadline_of(&huge, "out:decklinkvideosink"), second);
-        assert_eq!(deadline_of(&huge, "out:decklinkaudiosink"), second);
-    }
-
-    // A clock that stands until the test moves it, as a card's clock
-    // does until the card plays.
-    mod standing {
-        use gstreamer as gst;
-        use gstreamer::glib;
-        use gstreamer::subclass::prelude::*;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        #[derive(Default)]
-        pub struct Imp {
-            pub time: AtomicU64,
-        }
-
-        #[glib::object_subclass]
-        impl ObjectSubclass for Imp {
-            const NAME: &'static str = "StromTestStandingClock";
-            type Type = StandingClock;
-            type ParentType = gst::Clock;
-        }
-
-        impl ObjectImpl for Imp {}
-        impl GstObjectImpl for Imp {}
-        impl ClockImpl for Imp {
-            fn internal_time(&self) -> gst::ClockTime {
-                gst::ClockTime::from_nseconds(self.time.load(Ordering::Relaxed))
-            }
-        }
-
-        glib::wrapper! {
-            pub struct StandingClock(ObjectSubclass<Imp>) @extends gst::Clock, gst::Object;
-        }
-
-        impl StandingClock {
-            pub fn at(time: gst::ClockTime) -> Self {
-                let clock: Self = glib::Object::new();
-                clock.set(time);
-                clock
-            }
-
-            pub fn set(&self, time: gst::ClockTime) {
-                self.imp().time.store(time.nseconds(), Ordering::Relaxed);
-            }
-        }
-    }
-
-    // The probe in a running pipeline whose clock is hours ahead of the
-    // card's. The card clock stands for two buffers (the card is not
-    // playing yet), then moves: the probe seeds on every buffer until it
-    // sees the move, and the seed that stays carries the card's time after
-    // the move, mapped to the pipeline's time then.
-    #[test]
-    fn running_pipeline_seeds_the_card_clock_until_it_runs() {
-        gst::init().unwrap();
-        let hours = gst::ClockTime::from_seconds(9 * 3600);
-        let standing_at = gst::ClockTime::from_seconds(5);
-        let running_at = gst::ClockTime::from_seconds(7);
-        let card = standing::StandingClock::at(standing_at);
-        let pipeline_clock = system_clock();
-        pipeline_clock.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
-
-        let pipeline = gst::parse::launch(
-            "videotestsrc is-live=true num-buffers=6 ! video/x-raw,framerate=50/1 \
-             ! fakesink name=sink sync=false",
-        )
-        .unwrap()
-        .downcast::<gst::Pipeline>()
-        .unwrap();
-        pipeline.use_clock(Some(&pipeline_clock));
-        let sink = pipeline.by_name("sink").unwrap();
-        let before = pipeline_clock.time();
-        let calls = std::sync::Arc::new(AtomicU64::new(0));
-        let card_for_probe = card.clone();
-        let calls_in_probe = calls.clone();
-        seed_until_card_clock_runs(&sink.static_pad("sink").unwrap(), move |_| {
-            if calls_in_probe.fetch_add(1, Ordering::Relaxed) + 1 == 3 {
-                card_for_probe.set(running_at);
-            }
-            Some(card_for_probe.clone().upcast())
-        });
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let bus = pipeline.bus().unwrap();
-        bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &[gst::MessageType::Eos])
-            .expect("EOS");
-        pipeline.set_state(gst::State::Null).unwrap();
-
-        let after = pipeline_clock.time();
-
-        let (internal, external, _, _) = card.calibration();
-        assert_eq!(internal, running_at, "the seed that stayed");
-        assert!(
-            external >= before && external <= after,
-            "card time {internal} maps to pipeline time {external}, not within {before}..{after}"
+        let Some(huge) = output(&[("processing_deadline_ms", PropertyValue::UInt(u64::MAX))])
+        else {
+            return;
+        };
+        assert_eq!(
+            deadline_of(&huge, "out:decklink2sink"),
+            gst::ClockTime::SECOND
         );
-        // Two buffers with the clock standing, the third sees it moved.
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
-    fn system_clock() -> gst::Clock {
-        gst::glib::Object::new::<gst::SystemClock>().upcast()
-    }
-
-    // A pipeline clock hours ahead of the card's: the seeded calibration
-    // maps a running time of "now + 1 s" to the card's now + 1 s, not to
-    // hours ahead.
+    // Without the decklink2 plugin the block fails and says what is
+    // missing and where it comes from.
     #[test]
-    fn seeded_card_clock_maps_pipeline_time_to_card_time() {
+    fn a_missing_plugin_says_what_to_install() {
         gst::init().unwrap();
-        let hours = gst::ClockTime::from_seconds(9 * 3600);
-        let card = system_clock();
-        let pipeline = system_clock();
-        pipeline.set_calibration(gst::ClockTime::ZERO, hours, 1, 1);
-
-        seed_calibration(&card, card.internal_time(), &pipeline);
-
-        let frame = pipeline.time() + gst::ClockTime::from_seconds(1);
-        let (internal, external, rate_num, rate_denom) = card.calibration();
-        let on_card =
-            gst::Clock::unadjust_with_calibration(frame, internal, external, rate_num, rate_denom);
-        let ahead = on_card.nseconds() as i64 - card.internal_time().nseconds() as i64;
-        let second = gst::ClockTime::SECOND.nseconds() as i64;
-        assert!(
-            (ahead - second).abs() < 50_000_000,
-            "frame lands {ahead} ns ahead of the card's time"
-        );
+        let Err(BlockBuildError::ElementCreation(message)) =
+            card_element("decklink2nosuchsink", "out:x")
+        else {
+            panic!("an element from nowhere");
+        };
+        assert!(message.contains("decklink2nosuchsink"), "{message}");
+        assert!(message.contains("GStreamer 1.30"), "{message}");
+        assert!(message.contains("GST_PLUGIN_PATH"), "{message}");
     }
 }
