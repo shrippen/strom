@@ -29,6 +29,8 @@ const NUM_INPUTS: usize = 2;
 const MAX_INPUTS: usize = 6;
 const NUM_PIPS: usize = 1;
 const NUM_DSK: usize = 1;
+/// Cell of the tile output: 6 slots make a grid of 3 × 2.
+const CELL: (i32, i32) = (160, 90);
 /// Longest gap between two program frames at the sink (a frame is 33 ms).
 const MAX_ARRIVAL_GAP: Duration = Duration::from_millis(400);
 
@@ -43,7 +45,7 @@ fn elem(id: &str, ty: &str, props: Vec<(&str, PV)>) -> strom_types::Element {
 }
 
 /// A mixer with two static inputs (live test sources), four free slots,
-/// one PiP (border underlays), one DSK and the preview output.
+/// one PiP (border underlays), one DSK, the preview and the tile output.
 fn mixer_flow(backend: &str) -> Flow {
     let mut flow = Flow::new("vm_dynamic_inputs");
     for i in 0..NUM_INPUTS {
@@ -84,6 +86,10 @@ fn mixer_flow(backend: &str) -> Flow {
         ("num_pips", PV::String(NUM_PIPS.to_string())),
         ("num_dsk_inputs", PV::String(NUM_DSK.to_string())),
         ("enable_preview_out", PV::Bool(true)),
+        ("enable_tiles_out", PV::Bool(true)),
+        ("tiles_cell", PV::String(format!("{}x{}", CELL.0, CELL.1))),
+        // Not what the compositor picks on its own.
+        ("tiles_format", PV::String("BGRA".into())),
         ("initial_pgm_input", PV::UInt(0)),
         ("initial_pvw_input", PV::UInt(1)),
     ]
@@ -103,6 +109,7 @@ fn mixer_flow(backend: &str) -> Flow {
         ("pgmsink", "pgm_out"),
         ("mvsink", "multiview_out"),
         ("pvwsink", "pvw_out"),
+        ("tilessink", "tiles_out"),
     ] {
         flow.elements
             .push(elem(id, "fakesink", vec![("sync", PV::Bool(true))]));
@@ -261,10 +268,10 @@ impl Rig {
         pipeline.iterate_recurse().into_iter().count()
     }
 
-    /// Sink pads of the mixer's three compositors.
+    /// Sink pads of the mixer's compositors.
     async fn compositor_pads(&self) -> usize {
         let mut n = 0;
-        for c in ["mixer", "mv_comp", "pvw_comp"] {
+        for c in ["mixer", "mv_comp", "pvw_comp", "tiles_comp"] {
             n += self.element(&Self::id(c)).await.unwrap().sink_pads().len();
         }
         n
@@ -395,6 +402,35 @@ async fn comes_and_goes(rig: Rig) {
         .unwrap();
     assert!(thumb.property::<i32>("width") > 1, "no thumbnail tile");
     assert!(thumb.property::<f64>("alpha") > 0.99, "thumbnail hidden");
+    // And its cell in the tile output, whose frame holds all six slots.
+    let tiles = rig.element(&Rig::id("tiles_comp")).await.unwrap();
+    let cell = tiles.static_pad(&PadMap::sink(index)).unwrap();
+    assert_eq!(
+        ["xpos", "ypos", "width", "height"].map(|p| cell.property::<i32>(p)),
+        [2 * CELL.0, 0, CELL.0, CELL.1],
+        "input {index} is not in its tile cell"
+    );
+    let caps = rig
+        .element("tilessink")
+        .await
+        .unwrap()
+        .static_pad("sink")
+        .unwrap()
+        .current_caps()
+        .expect("the tile output negotiated");
+    let s = caps.structure(0).unwrap();
+    assert_eq!(
+        (
+            s.get::<i32>("width").unwrap(),
+            s.get::<i32>("height").unwrap()
+        ),
+        (3 * CELL.0, 2 * CELL.1)
+    );
+    assert_eq!(
+        s.get::<&str>("format").unwrap(),
+        "BGRA",
+        "tiles_format ignored"
+    );
     let flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
     let stored = &flow.blocks[0].properties["dynamic_inputs"];
     assert!(

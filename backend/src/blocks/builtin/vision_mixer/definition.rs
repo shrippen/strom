@@ -353,6 +353,89 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Tile output
+        ExposedProperty {
+            name: strom_types::vision_mixer::ENABLE_TILES_OUT_PROPERTY.to_string(),
+            label: "Tile Output".to_string(),
+            description: "Add a tile output: every input scaled into its own cell of one grid, in input order, for a control surface that shows all inputs live from one stream. Costs one more compositor at the grid's size.".to_string(),
+            property_type: PropertyType::Bool,
+            default_value: Some(PropertyValue::Bool(false)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::ENABLE_TILES_OUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_CELL_PROPERTY.to_string(),
+            label: "Tile Size".to_string(),
+            description: "Size of one cell of the tile output (WIDTHxHEIGHT). Inputs keep their aspect inside it.".to_string(),
+            property_type: PropertyType::String,
+            default_value: Some(PropertyValue::String(
+                strom_types::vision_mixer::DEFAULT_TILES_CELL.to_string(),
+            )),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_CELL_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_COLUMNS_PROPERTY.to_string(),
+            label: "Tile Columns".to_string(),
+            description: "Columns of the tile output; 0 makes the grid square.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_COLUMNS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FRAMERATE_PROPERTY.to_string(),
+            label: "Tile Framerate".to_string(),
+            description: "Frame rate of the tile output; empty follows the multiview.".to_string(),
+            property_type: PropertyType::String,
+            default_value: Some(PropertyValue::String(String::new())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FRAMERATE_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+            label: "Tile Pixel Format".to_string(),
+            description: "Pixel format of the tile output. Auto lets GStreamer negotiate."
+                .to_string(),
+            property_type: PropertyType::Enum {
+                values: {
+                    let mut v = vec![EnumValue {
+                        value: String::new(),
+                        label: Some("Auto".to_string()),
+                    }];
+                    v.extend(common_video_pixel_format_enum_values(false));
+                    v
+                },
+            },
+            default_value: Some(PropertyValue::String(String::new())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Stinger input
         ExposedProperty {
             name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),

@@ -1603,6 +1603,7 @@ fn test_dynamic_input_pad_properties_start_hidden() {
         pm: PadMap::new(6, 1, 1),
         underlay: Some((false, String::new())),
         preview_out: true,
+        tiles: None,
         pgm_w: 1920,
         pgm_h: 1080,
         mv_w: 1280,

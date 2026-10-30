@@ -29,9 +29,10 @@ pub(crate) mod pad_layout;
 pub(crate) mod pipeline_cpu;
 mod pipeline_gpu;
 pub(crate) mod preview_out;
+pub(crate) mod tiles_out;
 
 /// Caps feature of CUDA device memory (NVIDIA `nvcodec` elements).
-const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
+pub(crate) const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
 
 /// Vision Mixer block builder.
 pub struct VisionMixerBuilder;
@@ -114,6 +115,15 @@ impl BlockBuilder for VisionMixerBuilder {
                 "src",
             ));
         }
+        if properties::parse_bool(props, vision_mixer::ENABLE_TILES_OUT_PROPERTY, false) {
+            outputs.push(ExternalPad::with_label(
+                vision_mixer::TILES_OUTPUT_PAD,
+                "Tiles",
+                MediaType::Video,
+                "queue_tiles_out",
+                "src",
+            ));
+        }
 
         Some(ExternalPads { inputs, outputs })
     }
@@ -186,6 +196,25 @@ impl BlockBuilder for VisionMixerBuilder {
             properties::parse_bool(props, strom_types::stinger::ENABLE_STINGER_PROPERTY, false);
         let enable_preview_out =
             properties::parse_bool(props, vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY, false);
+
+        let tiles = properties::parse_bool(props, vision_mixer::ENABLE_TILES_OUT_PROPERTY, false)
+            .then(|| {
+                tiles_out::TilesGrid::new(
+                    capacity,
+                    properties::parse_resolution(
+                        props,
+                        vision_mixer::TILES_CELL_PROPERTY,
+                        vision_mixer::DEFAULT_TILES_CELL,
+                    ),
+                    properties::parse_u64(props, vision_mixer::TILES_COLUMNS_PROPERTY, 0) as usize,
+                    properties::parse_framerate(
+                        props,
+                        vision_mixer::TILES_FRAMERATE_PROPERTY,
+                        &format!("{}/{}", mv_framerate.0, mv_framerate.1),
+                    ),
+                    properties::parse_format(props, vision_mixer::TILES_FORMAT_PROPERTY),
+                )
+            });
 
         let pref = props
             .get("compositor_preference")
@@ -263,6 +292,7 @@ impl BlockBuilder for VisionMixerBuilder {
             swap_pvw_pgm,
             enable_stinger,
             enable_preview_out,
+            tiles,
         };
 
         match backend {
@@ -315,6 +345,8 @@ pub(super) struct PipelineParams<'a> {
     pub(super) enable_stinger: bool,
     /// Build the preview output (`preview_out`).
     pub(super) enable_preview_out: bool,
+    /// Build the tile output (`tiles_out`) on this grid.
+    pub(super) tiles: Option<tiles_out::TilesGrid>,
 }
 
 impl PipelineParams<'_> {
@@ -357,6 +389,7 @@ impl PipelineParams<'_> {
             pm: self.pad_map(),
             underlay: (self.num_pips > 0).then(|| self.underlay_source()),
             preview_out: self.enable_preview_out,
+            tiles: self.tiles.clone(),
             pgm_w: self.pgm_w,
             pgm_h: self.pgm_h,
             mv_w: self.mv_w,
@@ -380,6 +413,8 @@ pub(crate) struct InputSpec {
     pub(crate) underlay: Option<(bool, String)>,
     /// The mixer has the preview output (one more tee branch per input).
     pub(crate) preview_out: bool,
+    /// The mixer has the tile output on this grid (one more tee branch).
+    pub(crate) tiles: Option<tiles_out::TilesGrid>,
     pub(crate) pgm_w: u32,
     pub(crate) pgm_h: u32,
     pub(crate) mv_w: u32,
@@ -398,6 +433,11 @@ impl InputSpec {
     /// PVW and PiP branches).
     pub(crate) fn pvw_out_tee_src(&self) -> usize {
         3 + self.num_pips
+    }
+
+    /// Tee source pad of the tile output branch (after the preview's).
+    pub(crate) fn tiles_out_tee_src(&self) -> usize {
+        self.pvw_out_tee_src() + usize::from(self.preview_out)
     }
 
     /// Multiview layout with tiles for `inputs` (ascending).

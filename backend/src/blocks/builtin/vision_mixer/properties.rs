@@ -328,7 +328,12 @@ pub fn parse_bool(properties: &HashMap<String, PropertyValue>, key: &str, defaul
 
 /// Parse the output pixel format. Returns None for "Auto" (empty string).
 pub fn parse_output_format(properties: &HashMap<String, PropertyValue>) -> Option<String> {
-    properties.get("output_format").and_then(|v| match v {
+    parse_format(properties, "output_format")
+}
+
+/// Parse a pixel format property. Returns None for "Auto" (empty string).
+pub fn parse_format(properties: &HashMap<String, PropertyValue>, key: &str) -> Option<String> {
+    properties.get(key).and_then(|v| match v {
         PropertyValue::String(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
     })
