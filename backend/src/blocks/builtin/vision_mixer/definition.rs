@@ -55,8 +55,10 @@ fn vision_mixer_definition() -> BlockDefinition {
             name: "num_inputs".to_string(),
             label: "Number of Inputs".to_string(),
             description: format!(
-                "Number of video inputs ({}-{})",
-                MIN_NUM_INPUTS, MAX_NUM_INPUTS
+                "Number of video inputs built with the flow ({}-{}; {} with free input slots)",
+                MIN_NUM_INPUTS,
+                MAX_NUM_INPUTS,
+                strom_types::vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS
             ),
             property_type: PropertyType::UInt,
             default_value: Some(PropertyValue::UInt(DEFAULT_NUM_INPUTS as u64)),
@@ -393,6 +395,34 @@ fn vision_mixer_definition() -> BlockDefinition {
             mapping: PropertyMapping {
                 element_id: "_block".to_string(),
                 property_name: strom_types::vision_mixer::TILES_COLUMNS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FIRST_INPUT_PROPERTY.to_string(),
+            label: "First Tile Input".to_string(),
+            description: "The input in the first cell of the tile output; inputs before it get no cell.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FIRST_INPUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_CELLS_PROPERTY.to_string(),
+            label: "Tile Cells".to_string(),
+            description: "Cells of the tile output; 0 gives every input slot one. Inputs beyond the last cell get none; more cells than slots from the first input on are cut to those.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_CELLS_PROPERTY.to_string(),
                 transform: None,
             },
             live: false,

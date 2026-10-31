@@ -200,7 +200,7 @@ impl BlockBuilder for VisionMixerBuilder {
         let tiles = properties::parse_bool(props, vision_mixer::ENABLE_TILES_OUT_PROPERTY, false)
             .then(|| {
                 tiles_out::TilesGrid::new(
-                    capacity,
+                    properties::parse_tile_cells(props, capacity),
                     properties::parse_resolution(
                         props,
                         vision_mixer::TILES_CELL_PROPERTY,
