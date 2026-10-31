@@ -2,8 +2,8 @@
 //! QoS events upstream.
 //!
 //! `add_element` drops the upstream QoS events of every qos-enabled sink, but
-//! block elements bypass it. The RTMP output's `rtmp2sink` (qos=true,
-//! sync=false) then reported, through `flvmux`, the running time of the audio
+//! block elements bypass it. The RTMP output's `rtmp2sink` (qos=true; run
+//! with sync=false by lmix) then reported, through `flvmux`, the running time of the audio
 //! whenever the video arrived late against the clock, and the encoder's
 //! `videoconvert` dropped every video frame as too late: the stream carried no
 //! video for as long as the video stayed behind.
