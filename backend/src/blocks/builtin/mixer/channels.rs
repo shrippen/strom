@@ -161,7 +161,7 @@ pub(super) fn channel_strip(
     // buses' rate
     let caps_id = format!("{}:caps_{}", spec.instance_id, ch);
     let caps = gst::Caps::builder("audio/x-raw")
-        .field("format", super::BUS_FORMAT)
+        .field("format", "F32LE")
         .field("rate", spec.sample_rate as i32)
         .field("channels", 2i32)
         .field("layout", "interleaved")
