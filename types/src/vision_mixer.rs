@@ -96,6 +96,10 @@ pub const MAX_NUM_INPUTS: usize = 32;
 /// Minimum number of video inputs.
 pub const MIN_NUM_INPUTS: usize = 2;
 
+/// Minimum number of video inputs of a mixer with free slots
+/// (`max_inputs` above `num_inputs`): the others come at runtime.
+pub const MIN_NUM_INPUTS_WITH_FREE_SLOTS: usize = 1;
+
 /// Default PGM (distribution) output resolution.
 pub const DEFAULT_PGM_RESOLUTION: &str = "1920x1080";
 
@@ -183,6 +187,16 @@ pub const DEFAULT_TILES_CELL: &str = "640x360";
 /// Block property: columns of the tile output; 0 picks them (see
 /// [`tiles_grid`]).
 pub const TILES_COLUMNS_PROPERTY: &str = "tiles_columns";
+
+/// Block property: the input in the tile output's first cell. Inputs
+/// before it get no cell (a background, say).
+pub const TILES_FIRST_INPUT_PROPERTY: &str = "tiles_first_input";
+
+/// Block property: cells of the tile output; 0 gives every input slot
+/// from `tiles_first_input` up to the capacity one. Inputs beyond the last
+/// cell get none: a mixer with many slots keeps a tile picture of a size
+/// the viewer can take.
+pub const TILES_CELLS_PROPERTY: &str = "tiles_cells";
 
 /// Block property: frame rate of the tile output; empty follows the
 /// multiview's.

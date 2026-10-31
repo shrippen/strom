@@ -412,9 +412,16 @@ fn build_chain(
             .map_err(err)?;
         preview_out::append_input_underlay(spec, i, &mut elems, &mut links).map_err(err)?;
     }
-    if spec.tiles.is_some() {
-        tiles_out::append_input_branch(spec, i, spec.tiles_out_tee_src(), &mut elems, &mut links)
-            .map_err(err)?;
+    if let Some(grid) = &spec.tiles {
+        tiles_out::append_input_branch(
+            spec,
+            grid,
+            i,
+            spec.tiles_out_tee_src(),
+            &mut elems,
+            &mut links,
+        )
+        .map_err(err)?;
     }
     Ok((elems, links))
 }
@@ -498,8 +505,8 @@ fn teardown(pipeline: &gst::Pipeline, spec: &InputSpec, index: usize, names: &[S
             pads.push((spec.id("pvw_comp"), base + index));
         }
     }
-    if spec.tiles.is_some() {
-        pads.push((spec.id("tiles_comp"), index));
+    if let Some(c) = spec.tiles.as_ref().and_then(|g| g.cell_of(index)) {
+        pads.push((spec.id("tiles_comp"), c));
     }
     for (comp_id, idx) in pads {
         let Some(comp) = pipeline.by_name(&comp_id) else {

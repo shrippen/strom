@@ -1460,6 +1460,21 @@ fn test_parse_num_inputs_negative_and_padded() {
     assert_eq!(properties::parse_num_inputs(&props), Ok(8));
 }
 
+/// Two inputs at least, one when free slots let the others come at
+/// runtime.
+#[test]
+fn test_parse_num_inputs_one_with_free_slots() {
+    let mut props = HashMap::new();
+    props.insert("num_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(8));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(1));
+    props.insert("num_inputs".to_string(), PropertyValue::UInt(0));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(1));
+}
+
 #[test]
 fn test_parse_max_inputs() {
     use strom_types::vision_mixer::MAX_INPUT_CAPACITY;

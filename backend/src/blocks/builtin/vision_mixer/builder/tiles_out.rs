@@ -9,9 +9,10 @@
 //! A control surface that shows every input live reads this one stream
 //! and cuts it up, instead of one stream per input: the inputs are scaled
 //! on the mixer's GPU (or CPU), where they already are, and leave as one
-//! frame. Input `i` sits in cell `i` (row-major, see `tiles_grid`), aspect
-//! fitted; a cell without an input stays black. The cells never move, so
-//! nothing has to follow operations.
+//! frame. Input `first + c` sits in cell `c` (row-major, see `tiles_grid`),
+//! aspect fitted; a cell without an input stays black, an input outside
+//! the cells has no branch. The cells never move, so nothing has to follow
+//! operations. The tile compositor's pad of cell `c` is `sink_c`.
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -28,6 +29,10 @@ use crate::blocks::BlockBuildError;
 /// Size and grid of the tile output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TilesGrid {
+    /// The input in cell 0.
+    pub(crate) first: usize,
+    /// Number of cells.
+    pub(crate) cells: usize,
     pub(crate) cell_w: u32,
     pub(crate) cell_h: u32,
     pub(crate) columns: usize,
@@ -38,16 +43,19 @@ pub(crate) struct TilesGrid {
 }
 
 impl TilesGrid {
-    /// The grid for `cells` inputs.
+    /// The grid for `cells` inputs from input `first` on.
     pub(crate) fn new(
-        cells: usize,
+        (first, cells): (usize, usize),
         (cell_w, cell_h): (u32, u32),
         columns: usize,
         framerate: (i32, i32),
         format: Option<String>,
     ) -> Self {
+        let cells = cells.max(1);
         let (columns, rows) = tiles_grid(cells, columns);
         Self {
+            first,
+            cells,
             cell_w,
             cell_h,
             columns,
@@ -65,9 +73,19 @@ impl TilesGrid {
         )
     }
 
-    /// Rectangle of input `i`'s cell.
-    pub(crate) fn cell(&self, i: usize) -> (i32, i32, i32, i32) {
-        let (col, row) = (i % self.columns, i / self.columns);
+    /// The cell of input `i`, if it has one.
+    pub(crate) fn cell_of(&self, i: usize) -> Option<usize> {
+        i.checked_sub(self.first).filter(|c| *c < self.cells)
+    }
+
+    /// The inputs that have a cell, below `inputs`.
+    pub(crate) fn inputs(&self, inputs: usize) -> std::ops::Range<usize> {
+        self.first.min(inputs)..(self.first + self.cells).min(inputs)
+    }
+
+    /// Rectangle of cell `c`.
+    pub(crate) fn cell(&self, c: usize) -> (i32, i32, i32, i32) {
+        let (col, row) = (c % self.columns, c / self.columns);
         (
             (col as u32 * self.cell_w) as i32,
             (row as u32 * self.cell_h) as i32,
@@ -76,9 +94,9 @@ impl TilesGrid {
         )
     }
 
-    /// Pad properties of input `i`'s pad: its cell, the picture fitted.
-    pub(crate) fn pad_properties(&self, i: usize) -> HashMap<String, PropertyValue> {
-        let (x, y, w, h) = self.cell(i);
+    /// Pad properties of cell `c`'s pad: the cell, the picture fitted.
+    pub(crate) fn pad_properties(&self, c: usize) -> HashMap<String, PropertyValue> {
+        let (x, y, w, h) = self.cell(c);
         HashMap::from([
             ("xpos".to_string(), PropertyValue::Int(x as i64)),
             ("ypos".to_string(), PropertyValue::Int(y as i64)),
@@ -108,10 +126,10 @@ pub(super) fn append(
     comp.set_property("name", &comp_id);
     elems.push((comp_id.clone(), comp.clone()));
 
-    // In input order: the GL mixer names its pads in link order.
+    // In cell order: the GL mixer names its pads in link order.
     let spec = p.input_spec();
-    for i in 0..p.num_inputs {
-        append_input_branch(&spec, i, tee_src, elems, links)?;
+    for i in grid.inputs(p.num_inputs) {
+        append_input_branch(&spec, grid, i, tee_src, elems, links)?;
     }
 
     let (w, h) = grid.size();
@@ -189,15 +207,20 @@ pub(super) fn append(
 }
 
 /// Input `i`'s branch to the tile compositor:
-/// `tee_i.src_{tee_src} → queue_to_tiles_out_i → tiles_comp.sink_i`.
-/// Shared by static and dynamic inputs.
+/// `tee_i.src_{tee_src} → queue_to_tiles_out_i → tiles_comp.sink_c` for
+/// its cell `c`; nothing for an input without a cell. Shared by static and
+/// dynamic inputs.
 pub(crate) fn append_input_branch(
     spec: &InputSpec,
+    grid: &TilesGrid,
     i: usize,
     tee_src: usize,
     elems: &mut Vec<(String, gst::Element)>,
     links: &mut Vec<(ElementPadRef, ElementPadRef)>,
 ) -> Result<(), BlockBuildError> {
+    let Some(cell) = grid.cell_of(i) else {
+        return Ok(());
+    };
     let q_id = spec.id(&format!("queue_to_tiles_out_{}", i));
     elems.push((q_id.clone(), elements::make_queue(&q_id)?));
     links.push((
@@ -206,7 +229,7 @@ pub(crate) fn append_input_branch(
     ));
     links.push((
         ElementPadRef::pad(&q_id, "src"),
-        ElementPadRef::pad(spec.id("tiles_comp"), PadMap::sink(i)),
+        ElementPadRef::pad(spec.id("tiles_comp"), PadMap::sink(cell)),
     ));
     Ok(())
 }
@@ -225,12 +248,27 @@ mod tests {
 
     #[test]
     fn inputs_fill_the_grid_row_by_row() {
-        let grid = TilesGrid::new(17, (640, 360), 0, (30, 1), None);
+        let grid = TilesGrid::new((0, 17), (640, 360), 0, (30, 1), None);
         assert_eq!((grid.columns, grid.rows), (5, 4));
         assert_eq!(grid.size(), (3200, 1440));
         assert_eq!(grid.cell(0), (0, 0, 640, 360));
         assert_eq!(grid.cell(4), (2560, 0, 640, 360));
         assert_eq!(grid.cell(5), (0, 360, 640, 360));
         assert_eq!(grid.cell(16), (640, 1080, 640, 360));
+    }
+
+    #[test]
+    fn inputs_outside_the_cells_get_none() {
+        // Input 0 (a background) and the inputs after the fourth cell
+        // stay out; the grid is the cells', not the capacity's.
+        let grid = TilesGrid::new((1, 4), (640, 360), 0, (30, 1), None);
+        assert_eq!((grid.columns, grid.rows), (2, 2));
+        assert_eq!(grid.cell_of(0), None);
+        assert_eq!(grid.cell_of(1), Some(0));
+        assert_eq!(grid.cell_of(4), Some(3));
+        assert_eq!(grid.cell_of(5), None);
+        assert_eq!(grid.inputs(3), 1..3);
+        assert_eq!(grid.inputs(100), 1..5);
+        assert_eq!(grid.inputs(0), 0..0);
     }
 }
