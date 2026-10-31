@@ -1473,6 +1473,37 @@ fn test_parse_num_inputs_one_with_free_slots() {
     assert_eq!(properties::parse_num_inputs(&props), Ok(1));
     props.insert("num_inputs".to_string(), PropertyValue::UInt(0));
     assert_eq!(properties::parse_num_inputs(&props), Ok(1));
+    // One built input and a capacity of one leave no free place: the
+    // minimum stays two (review of #57).
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+}
+
+/// The tile cells: 0 means one per slot from the first input on; more
+/// than the slots there are would only add black cells (and a picture a
+/// typo makes huge), so they are cut to that.
+#[test]
+fn test_tile_cells_stay_within_the_slots() {
+    use strom_types::vision_mixer::{TILES_CELLS_PROPERTY, TILES_FIRST_INPUT_PROPERTY};
+    let mut props = HashMap::new();
+    assert_eq!(properties::parse_tile_cells(&props, 16), (0, 16));
+    props.insert(
+        TILES_FIRST_INPUT_PROPERTY.to_string(),
+        PropertyValue::UInt(1),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 16), (1, 15));
+    props.insert(TILES_CELLS_PROPERTY.to_string(), PropertyValue::UInt(10));
+    assert_eq!(properties::parse_tile_cells(&props, 16), (1, 10));
+    props.insert(
+        TILES_CELLS_PROPERTY.to_string(),
+        PropertyValue::UInt(10_000),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 128), (1, 127));
+    props.insert(
+        TILES_FIRST_INPUT_PROPERTY.to_string(),
+        PropertyValue::UInt(200),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 128), (200, 0));
 }
 
 #[test]
