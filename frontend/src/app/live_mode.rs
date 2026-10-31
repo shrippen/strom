@@ -239,9 +239,15 @@ impl StromApp {
 
                 if let Some(flow) = self.flows.iter_mut().find(|f| f.id == flow_id) {
                     if let Some(block) = flow.blocks.iter_mut().find(|b| b.id == block_id) {
-                        // The editor does not show buses added at runtime;
-                        // they stay, a reset only clears their settings.
+                        // The editor does not show buses or channels added
+                        // at runtime; they stay, a reset only clears their
+                        // settings.
                         strom_types::mixer::keep_dynamic_aux_buses(
+                            &block.properties,
+                            &mut props,
+                            !reset,
+                        );
+                        strom_types::mixer::keep_dynamic_channels(
                             &block.properties,
                             &mut props,
                             !reset,

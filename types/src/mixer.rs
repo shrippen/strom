@@ -399,9 +399,109 @@ pub fn is_channel_property(name: &str, ch: usize) -> bool {
     name.starts_with(&format!("ch{}_", ch))
 }
 
+/// Carry a mixer's dynamic channels from its stored properties `old` into
+/// the properties `new` an editor saves: the capacity and the channel
+/// list, and with `settings` the channels' own properties (`chN_…`). An
+/// editor that shows only the channels built with the flow would
+/// otherwise drop them. A channel whose number the flow now builds itself
+/// is the editor's.
+pub fn keep_dynamic_channels(
+    old: &std::collections::HashMap<String, crate::PropertyValue>,
+    new: &mut std::collections::HashMap<String, crate::PropertyValue>,
+    settings: bool,
+) {
+    for name in [MAX_CHANNELS_PROPERTY, DYNAMIC_CHANNELS_PROPERTY] {
+        if let Some(value) = old.get(name) {
+            new.entry(name.to_string()).or_insert_with(|| value.clone());
+        }
+    }
+    if !settings {
+        return;
+    }
+    let Some(crate::PropertyValue::String(json)) = old.get(DYNAMIC_CHANNELS_PROPERTY) else {
+        return;
+    };
+    let Ok(channels) = parse_dynamic_channels(json) else {
+        return;
+    };
+    let num_static = num_static_channels(new)
+        .or_else(|| num_static_channels(old))
+        .unwrap_or(0);
+    for (name, value) in old {
+        if channels
+            .iter()
+            .any(|c| c.channel > num_static && is_channel_property(name, c.channel))
+        {
+            new.entry(name.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
+/// The `num_channels` property, as the backend reads it.
+fn num_static_channels(
+    properties: &std::collections::HashMap<String, crate::PropertyValue>,
+) -> Option<usize> {
+    match properties.get("num_channels")? {
+        crate::PropertyValue::Int(n) => Some(usize::try_from(*n).unwrap_or(0)),
+        crate::PropertyValue::UInt(n) => Some(usize::try_from(*n).unwrap_or(usize::MAX)),
+        crate::PropertyValue::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_editor_save_keeps_the_dynamic_channels() {
+        use crate::PropertyValue;
+        use std::collections::HashMap;
+        let channel = DynamicChannel {
+            channel: 3,
+            source: "cam".to_string(),
+            max_time_ms: None,
+        };
+        let json = serde_json::to_string(&[channel]).unwrap();
+        let old: HashMap<String, PropertyValue> = [
+            ("num_channels", PropertyValue::UInt(2)),
+            (MAX_CHANNELS_PROPERTY, PropertyValue::UInt(8)),
+            (DYNAMIC_CHANNELS_PROPERTY, PropertyValue::String(json)),
+            ("ch3_fader", PropertyValue::Float(0.5)),
+            ("ch3_aux1_level", PropertyValue::Float(0.5)),
+            ("ch2_fader", PropertyValue::Float(0.5)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        // The editor saves what it shows: channels 1 and 2.
+        let shown = || -> HashMap<String, PropertyValue> {
+            [("num_channels".to_string(), PropertyValue::UInt(2))].into()
+        };
+        let mut saved = shown();
+        keep_dynamic_channels(&old, &mut saved, true);
+        let mut kept: Vec<&str> = saved.keys().map(String::as_str).collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [
+                "ch3_aux1_level",
+                "ch3_fader",
+                DYNAMIC_CHANNELS_PROPERTY,
+                MAX_CHANNELS_PROPERTY,
+                "num_channels"
+            ]
+        );
+        // A reset keeps the channels, not their settings.
+        let mut reset = shown();
+        keep_dynamic_channels(&old, &mut reset, false);
+        assert_eq!(reset.len(), 3);
+        // Channel 3 built with the flow now: its settings are the editor's.
+        let mut grown: HashMap<String, PropertyValue> =
+            [("num_channels".to_string(), PropertyValue::UInt(3))].into();
+        keep_dynamic_channels(&old, &mut grown, true);
+        assert!(!grown.contains_key("ch3_fader"));
+    }
 
     fn bus(aux: usize, channel: &str) -> DynamicAuxBus {
         DynamicAuxBus {
