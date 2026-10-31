@@ -124,6 +124,41 @@ There are two tap points per channel that determine where signals branch off:
 > fader. A *post-fader* feed **tracks** the fader and mute — what you
 > hear in the room is proportional to what you send to that bus.
 
+### Delay
+
+In front of the strip each channel has a delay (`chN_delay`, in ms,
+live): its sound reaches every bus that much later, to bring it in line
+with a picture that arrives late. The source has to hold the sound that
+long (a dynamic channel's `max_time_ms`, see below). Changing the delay
+while the channel plays leaves a short gap or skips a piece of sound.
+
+### Channels added while the flow runs
+
+With **Channel Capacity** (`max_channels`) above **Channels**
+(`num_channels`), the channel numbers in between are free. The API adds a
+channel there while the flow runs and removes it again, without
+rebuilding the mixer: Main, the buses and the other channels play on.
+
+- `GET /api/flows/{flow}/blocks/{block}/channels` lists the channels.
+- `POST …/channels` with `{"source": "…", "channel": 5, "max_time_ms": 500}`
+  adds one (`channel` optional: the lowest free number; `max_time_ms`
+  optional: the room its input keeps for the delay, default 500).
+- `DELETE …/channels/{channel}` removes one. A channel built with the flow
+  cannot be removed.
+
+Such a channel has no input pad: it plays the inter channel `source`,
+which an **Inter Output** block (or any `intersink` with that producer
+name) in another flow publishes. Both flows must share their timing (the
+same clock and base time, e.g. direct media timing on both, and
+`start_time_selection` "first" on the mixer). A source nobody publishes
+yet is silence until it starts.
+
+The channel is built like a static one, with its sends into every bus and
+group, and takes the same properties (`chN_fader`, `chN_mute`,
+`chN_auxM_level`, …). The channels are stored in the block property
+`dynamic_channels` and built again on restart. A removed channel takes its
+stored properties with it, and its PFL or AFL ends.
+
 ---
 
 ## 3. Routing — channel to buses
@@ -398,7 +433,8 @@ discontinuity click of a hard step.
 These are **construction-time properties** — they define how the mixer is
 built and require restarting the flow to change:
 
-- channel and group counts, the number of aux buses built with the flow
+- channel and group counts, the channel capacity (channels up to it come
+  and go at runtime, see 2), the number of aux buses built with the flow
   and the aux bus capacity (buses up to it come and go at runtime, see 4.3)
 - sample rate
 - DSP backend (Rust or LV2)

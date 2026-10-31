@@ -120,6 +120,27 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Channel numbers for channels added while the flow runs —
+        // construction-time only.
+        ExposedProperty {
+            name: strom_types::mixer::MAX_CHANNELS_PROPERTY.to_string(),
+            label: "Channel Capacity".to_string(),
+            description: format!(
+                "Highest channel number, for channels added while the flow runs (the \
+                 API's channels endpoint adds them; their sound comes from an inter \
+                 channel). 0 = no free channels, else at least Channels, at most {}.",
+                MAX_CHANNELS
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::mixer::MAX_CHANNELS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Number of groups — construction-time only.
         ExposedProperty {
             name: "num_groups".to_string(),
@@ -574,6 +595,27 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             persist: None,
         });
 
+        // Delay (lip sync): a Time Offset identity in front of the strip.
+        exposed_properties.push(ExposedProperty {
+            name: format!("ch{}_delay", ch),
+            label: format!("Ch {} Delay", ch),
+            description: format!(
+                "Channel {} delay in ms: its sound reaches every bus that much later \
+                 (lip sync). The source must buffer that long.",
+                ch
+            ),
+            property_type: PropertyType::Float,
+            default_value: Some(PropertyValue::Float(0.0)),
+            mapping: PropertyMapping {
+                element_id: super::channels::delay_id(ch - 1),
+                property_name: "offset_ms".to_string(),
+                // A sound cannot come before its source.
+                transform: Some("non_negative".to_string()),
+            },
+            live: true,
+            persist: None,
+        });
+
         exposed_properties.push(ExposedProperty {
             name: format!("ch{}_pan", ch),
             label: format!("Ch {} Pan", ch),
@@ -1023,7 +1065,7 @@ pub(super) fn mixer_definition() -> BlockDefinition {
                     name: format!("input_{}", i + 1),
                     label: Some(format!("A{}", i)),
                     media_type: MediaType::Audio,
-                    internal_element_id: format!("convert_{}", i),
+                    internal_element_id: super::channels::delay_id(i),
                     internal_pad_name: "sink".to_string(),
                 })
                 .collect(),

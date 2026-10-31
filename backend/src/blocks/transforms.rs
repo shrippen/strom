@@ -18,12 +18,23 @@ pub fn lookup(name: Option<&str>) -> Transform {
         None => IDENTITY,
         Some("bool_to_volume") => BOOL_TO_VOLUME,
         Some("db_to_linear") => DB_TO_LINEAR,
+        Some("non_negative") => NON_NEGATIVE,
         Some(_) => IDENTITY,
     }
 }
 
 const IDENTITY: Transform = Transform {
     forward: |v| Some(v),
+    inverse: |v| Some(v),
+};
+
+/// Float or Int, below 0 as 0 (a delay); the element's value back as it is.
+const NON_NEGATIVE: Transform = Transform {
+    forward: |v| match v {
+        PropertyValue::Float(f) => Some(PropertyValue::Float(f.max(0.0))),
+        PropertyValue::Int(i) => Some(PropertyValue::Int(i.max(0))),
+        other => Some(other),
+    },
     inverse: |v| Some(v),
 };
 

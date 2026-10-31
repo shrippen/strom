@@ -1211,6 +1211,237 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/channels": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "List the channels of an audio mixer: its capacity, the number of static\nchannels and the dynamic ones with their sources.",
+        "operationId": "list_mixer_channels",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mixer's channels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The stored channel list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add a channel to a running audio mixer. The channel takes the requested\nfree number (or the lowest free one), its sound from the inter channel\n`source`, a send into every aux bus (level 0 until set with\n`chN_auxM_level`) and its stored `chN_…` settings. It is stored with the\nflow and built again on restart.",
+        "operationId": "add_mixer_channel",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMixerChannelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Channel added; the mixer's channels afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or the mixer has no free channels (max_channels)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested number is taken, or every number is",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GStreamer could not build the channel",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/channels/{channel}": {
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a dynamic channel from an audio mixer. Its stored settings\n(`chN_…`) go with it.",
+        "operationId": "remove_mixer_channel",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "channel",
+            "in": "path",
+            "description": "Channel number (as in chN_fader)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Channel removed; the mixer's channels afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Channel 0 (channels are numbered from 1)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer, or no dynamic channel with this number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A static channel (num_channels, also one stored as dynamic before num_channels grew), or the stored channel list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/devtools/link": {
       "post": {
         "tags": [
@@ -7741,6 +7972,36 @@
           }
         }
       },
+      "AddMixerChannelRequest": {
+        "type": "object",
+        "description": "Request to add a channel to a running mixer.",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "channel": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Channel number to fill; `None` takes the lowest free one.",
+            "minimum": 0
+          },
+          "max_time_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Buffer time of the subscriber in ms.",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Inter channel the sound comes from."
+          }
+        }
+      },
       "AddPictureRequest": {
         "type": "object",
         "description": "Show a picture (video or still image) on a stage.",
@@ -8976,6 +9237,34 @@
           "channel": {
             "type": "string",
             "description": "Inter channel the bus's output is published on (the producer name an\nInter Input block or `intersrc` subscribes to)."
+          }
+        }
+      },
+      "DynamicChannel": {
+        "type": "object",
+        "description": "A channel added while the flow runs.",
+        "required": [
+          "channel",
+          "source"
+        ],
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "description": "Channel number, as in the properties `chN_fader`\n(`num_channels < channel <= max_channels`).",
+            "minimum": 0
+          },
+          "max_time_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Buffer time of the subscriber in ms; `None` keeps the element\ndefault. It also bounds the channel's delay (`chN_delay`).",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Inter channel the sound comes from (the producer name of an Inter\nOutput block or an `intersink`)."
           }
         }
       },
@@ -10652,6 +10941,34 @@
               "$ref": "#/components/schemas/DynamicAuxBus"
             },
             "description": "Stored buses the mixer does not build: they no longer fit the\nnumbers (`num_aux_buses`, `max_aux_buses`). They come back when the\nnumbers fit again; removing one takes it out of the store."
+          }
+        }
+      },
+      "MixerChannels": {
+        "type": "object",
+        "description": "The channels of a mixer.",
+        "required": [
+          "capacity",
+          "num_static",
+          "dynamic"
+        ],
+        "properties": {
+          "capacity": {
+            "type": "integer",
+            "description": "Highest channel number (`max_channels`).",
+            "minimum": 0
+          },
+          "dynamic": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicChannel"
+            },
+            "description": "The dynamic channels, ascending by number."
+          },
+          "num_static": {
+            "type": "integer",
+            "description": "Channels built with the flow (`num_channels`): they cannot be\nremoved.",
+            "minimum": 0
           }
         }
       },

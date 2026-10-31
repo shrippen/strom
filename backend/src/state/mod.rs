@@ -43,6 +43,7 @@ struct RegisteredEndpoints {
 }
 
 mod mixer_aux_buses;
+mod mixer_channels;
 pub(crate) mod stinger;
 mod vision_mixer_inputs;
 #[doc(hidden)]

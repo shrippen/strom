@@ -39,7 +39,9 @@ use super::buses::*;
 pub(crate) use super::properties::stored_dynamic_aux_buses;
 use super::properties::{
     parse_dynamic_aux_buses, parse_max_aux_buses, parse_num_aux_buses, parse_num_channels,
+    stored_dynamic_channels,
 };
+use super::MAX_CHANNELS;
 use crate::blocks::builtin::start_time::StartTime;
 
 /// Why adding or removing a bus, or changing a send's tap, failed.
@@ -92,7 +94,9 @@ pub fn added_bus_properties(
     let Some(pre) = request.pre_fader else {
         return Vec::new();
     };
+    let dynamic = stored_dynamic_channels(properties).unwrap_or_default();
     (0..parse_num_channels(properties))
+        .chain(dynamic.iter().map(|c| c.channel - 1))
         .map(|ch| (send_pre_property(ch, aux - 1), PropertyValue::Bool(pre)))
         .collect()
 }
@@ -180,17 +184,18 @@ pub fn bus_channel(pipeline: &gst::Pipeline, instance_id: &str, aux: usize) -> O
     Some(sink.property::<String>("producer-name"))
 }
 
-/// The channels the running mixer `instance_id` has: the stored
-/// `num_channels` may have changed since it was built (it takes effect on
-/// the next start), the sends follow the pipeline.
-fn running_channels(pipeline: &gst::Pipeline, instance_id: &str) -> usize {
-    (0..)
-        .take_while(|ch| {
+/// The channels (0-based) the running mixer `instance_id` has, static and
+/// dynamic: the stored `num_channels` may have changed since it was built
+/// (it takes effect on the next start), and dynamic channels come and go.
+/// The sends follow the pipeline.
+pub(super) fn running_channels(pipeline: &gst::Pipeline, instance_id: &str) -> Vec<usize> {
+    (0..MAX_CHANNELS)
+        .filter(|ch| {
             pipeline
                 .by_name(&format!("{}:{}", instance_id, send_tap_tee(*ch, true)))
                 .is_some()
         })
-        .count()
+        .collect()
 }
 
 /// Build dynamic aux bus `bus` into the running mixer `instance_id`, whose
@@ -221,7 +226,7 @@ pub fn add_aux_bus(
     let mut taps = Vec::new();
     aux_master(&spec, aux, properties, &mut elements, &mut links).map_err(failed)?;
     aux_inter_output(&spec, aux, &bus.channel, &mut elements, &mut links).map_err(failed)?;
-    for ch in 0..running_channels(pipeline, instance_id) {
+    for ch in running_channels(pipeline, instance_id) {
         aux_send(&spec, ch, aux, properties, &mut elements, &mut links).map_err(failed)?;
         // `aux_send` puts the link from the channel's tap tee last.
         taps.push(links.pop().expect("aux_send links its tap"));
@@ -274,7 +279,7 @@ pub fn remove_aux_bus(
     aux: usize,
 ) -> Vec<String> {
     let spec = BusSpec::new(instance_id, properties);
-    let names = bus_element_names(&spec, aux - 1, running_channels(pipeline, instance_id));
+    let names = bus_element_names(&spec, aux - 1, &running_channels(pipeline, instance_id));
     teardown(pipeline, &spec, aux - 1, &names);
     // The latency is left as it is: lowering it while the mixer runs would
     // make every sink skip the difference, an audible jump on Main.
@@ -346,9 +351,9 @@ pub fn send_pre_property_target(name: &str) -> Option<(usize, usize)> {
 
 /// Every element of aux bus `aux` (0-based), sends first, so stopping them
 /// in this order stops each source before what it feeds.
-fn bus_element_names(spec: &BusSpec, aux: usize, num_channels: usize) -> Vec<String> {
+fn bus_element_names(spec: &BusSpec, aux: usize, channels: &[usize]) -> Vec<String> {
     let mut names = Vec::new();
-    for ch in 0..num_channels {
+    for &ch in channels {
         names.push(spec.id(&send_id(ch, aux)));
         names.push(spec.id(&format!("aux_queue_{}_{}", ch, aux)));
     }
@@ -410,7 +415,11 @@ fn teardown(pipeline: &gst::Pipeline, spec: &BusSpec, aux: usize, names: &[Strin
 
 /// Link like the pipeline manager does: named pads pad to pad, an element
 /// without a pad name by a compatible (or requested) pad.
-fn link(pipeline: &gst::Pipeline, from: &ElementPadRef, to: &ElementPadRef) -> Result<(), String> {
+pub(super) fn link(
+    pipeline: &gst::Pipeline,
+    from: &ElementPadRef,
+    to: &ElementPadRef,
+) -> Result<(), String> {
     let element = |id: &str| {
         pipeline
             .by_name(id)

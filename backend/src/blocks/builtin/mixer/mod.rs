@@ -67,8 +67,10 @@
 
 mod builder;
 mod buses;
+mod channels;
 mod definition;
 pub mod dynamic;
+pub mod dynamic_channels;
 mod elements;
 pub(crate) use elements::make_audiomixer;
 mod metering;
@@ -87,6 +89,7 @@ const EQ_BAND_TYPE_BELL: i32 = 7;
 // Public API
 pub use builder::MixerBuilder;
 pub use definition::get_blocks;
+pub(crate) use properties::stored_dynamic_channels;
 pub use properties::translate_property_for_element;
 
 /// Block definition ID for the audio mixer. Used by state-layer hooks that

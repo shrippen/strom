@@ -6,7 +6,9 @@ use strom_types::{parse_common_audio_sample_rate, PropertyValue, DEFAULT_AUDIO_S
 use tracing::warn;
 
 use strom_types::mixer::{
-    buildable_dynamic_aux_buses, DynamicAuxBus, DYNAMIC_AUX_BUSES_PROPERTY, MAX_AUX_BUSES_PROPERTY,
+    buildable_dynamic_aux_buses, validate_dynamic_channels, DynamicAuxBus, DynamicChannel,
+    DYNAMIC_AUX_BUSES_PROPERTY, DYNAMIC_CHANNELS_PROPERTY, MAX_AUX_BUSES_PROPERTY,
+    MAX_CHANNELS_PROPERTY,
 };
 
 use super::{DEFAULT_CHANNELS, MAX_AUX_BUSES, MAX_CHANNELS, MAX_GROUPS, MIN_KNEE_LINEAR};
@@ -82,6 +84,53 @@ pub(super) fn parse_dynamic_aux_buses(
         num_aux_buses,
         capacity,
     ))
+}
+
+/// Parse the channel capacity (`max_channels`): at least `num_channels`.
+pub(super) fn parse_max_channels(
+    properties: &HashMap<String, PropertyValue>,
+    num_channels: usize,
+) -> usize {
+    properties
+        .get(MAX_CHANNELS_PROPERTY)
+        .and_then(parse_count)
+        .unwrap_or(0)
+        .clamp(num_channels, MAX_CHANNELS)
+}
+
+/// The stored dynamic channels (`dynamic_channels`), as written: no check
+/// against the mixer's numbers. Errors when the property does not parse.
+pub(crate) fn stored_dynamic_channels(
+    properties: &HashMap<String, PropertyValue>,
+) -> Result<Vec<DynamicChannel>, String> {
+    match properties.get(DYNAMIC_CHANNELS_PROPERTY) {
+        None => Ok(Vec::new()),
+        Some(PropertyValue::String(json)) => strom_types::mixer::parse_dynamic_channels(json),
+        Some(other) => Err(format!(
+            "{} must be a JSON string, not {:?}",
+            DYNAMIC_CHANNELS_PROPERTY, other
+        )),
+    }
+}
+
+/// The stored dynamic channels the mixer builds, in order, and why each
+/// other one is left out: outside the free numbers, a number taken by an
+/// earlier entry, no source. Errors when the property does not parse.
+pub(super) fn parse_dynamic_channels(
+    properties: &HashMap<String, PropertyValue>,
+    num_channels: usize,
+    capacity: usize,
+) -> Result<(Vec<DynamicChannel>, Vec<String>), String> {
+    let mut built: Vec<DynamicChannel> = Vec::new();
+    let mut skipped = Vec::new();
+    for channel in stored_dynamic_channels(properties)? {
+        built.push(channel);
+        if let Err(reason) = validate_dynamic_channels(&built, num_channels, capacity) {
+            built.pop();
+            skipped.push(reason);
+        }
+    }
+    Ok((built, skipped))
 }
 
 /// Parse the monitor's source from properties: the 0-based aux bus it
