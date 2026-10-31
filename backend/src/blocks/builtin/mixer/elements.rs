@@ -112,15 +112,18 @@ pub(super) fn answer_latency_for_unfed_input(element: &gst::Element) {
     });
 }
 
-/// Create the capsfilter that follows a bus mixer and pins it to `rate`.
-/// Only the rate is fixed: format and channels stay with whatever the bus
-/// negotiates.
+/// Create the capsfilter that follows a bus mixer and pins it to `rate`
+/// and the channels' sample format. A bus that starts without a fed input
+/// would otherwise settle on any format its consumer offers (S32LE,
+/// say), and a channel added later (F32LE, see `channels`) could not join
+/// it. The channel count stays with whatever the bus negotiates.
 pub(super) fn make_rate_pin(name: &str, rate: u32) -> Result<gst::Element, BlockBuildError> {
     gst::ElementFactory::make("capsfilter")
         .name(name)
         .property(
             "caps",
             gst::Caps::builder("audio/x-raw")
+                .field("format", super::BUS_FORMAT)
                 .field("rate", rate as i32)
                 .build(),
         )

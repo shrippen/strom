@@ -282,6 +282,123 @@ pub fn drop_dynamic_aux_buses(
     });
 }
 
+// ── Dynamic channels ────────────────────────────────────────────────
+//
+// A mixer builds its channels `1..=num_channels` with the flow; they take
+// their sound through the block pads `input_N`. With `max_channels` above
+// `num_channels`, the numbers up to `max_channels` are free: an API call
+// adds a channel there while the flow runs (and removes it again), without
+// rebuilding the mixer. A dynamic channel takes its sound from an inter
+// channel instead of a block pad, so adding one needs no flow link. It has
+// the strip, sends and routing of a static channel, under the same
+// property names (`chN_fader`, `chN_auxM_level`, …). Dynamic channels are
+// stored in the block property `dynamic_channels`, so a restart builds them
+// again under the same numbers.
+
+/// Block property: highest channel number (channel capacity). Missing or
+/// below `num_channels` means `num_channels` (a mixer without free
+/// channels).
+pub const MAX_CHANNELS_PROPERTY: &str = "max_channels";
+
+/// Block property: the dynamic channels, as a JSON list of
+/// [`DynamicChannel`].
+pub const DYNAMIC_CHANNELS_PROPERTY: &str = "dynamic_channels";
+
+/// Highest `max_time_ms` of a dynamic channel's inter subscriber (the
+/// Inter Input block offers up to 2000 ms).
+pub const MAX_CHANNEL_MAX_TIME_MS: u64 = 10_000;
+
+/// A channel added while the flow runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct DynamicChannel {
+    /// Channel number, as in the properties `chN_fader`
+    /// (`num_channels < channel <= max_channels`).
+    pub channel: usize,
+    /// Inter channel the sound comes from (the producer name of an Inter
+    /// Output block or an `intersink`).
+    pub source: String,
+    /// Buffer time of the subscriber in ms; `None` keeps the element
+    /// default. It also bounds the channel's delay (`chN_delay`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_time_ms: Option<u64>,
+}
+
+/// Request to add a channel to a running mixer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct AddMixerChannelRequest {
+    /// Channel number to fill; `None` takes the lowest free one.
+    #[serde(default)]
+    pub channel: Option<usize>,
+    /// Inter channel the sound comes from.
+    pub source: String,
+    /// Buffer time of the subscriber in ms.
+    #[serde(default)]
+    pub max_time_ms: Option<u64>,
+}
+
+/// The channels of a mixer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct MixerChannels {
+    /// Highest channel number (`max_channels`).
+    pub capacity: usize,
+    /// Channels built with the flow (`num_channels`): they cannot be
+    /// removed.
+    pub num_static: usize,
+    /// The dynamic channels, ascending by number.
+    pub dynamic: Vec<DynamicChannel>,
+}
+
+/// Parse the `dynamic_channels` property. An empty string is no channels.
+pub fn parse_dynamic_channels(json: &str) -> Result<Vec<DynamicChannel>, String> {
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(json).map_err(|e| format!("dynamic_channels is not valid: {}", e))
+}
+
+/// Check dynamic channels against the mixer's numbers: each in
+/// `num_static + 1..=capacity`, no number twice, a source, a bounded
+/// buffer time. Two channels may listen to one source.
+pub fn validate_dynamic_channels(
+    channels: &[DynamicChannel],
+    num_static: usize,
+    capacity: usize,
+) -> Result<(), String> {
+    let mut numbers = std::collections::BTreeSet::new();
+    for ch in channels {
+        if ch.channel <= num_static || ch.channel > capacity {
+            return Err(format!(
+                "channel {} is outside the free channels {}..={}",
+                ch.channel,
+                num_static + 1,
+                capacity
+            ));
+        }
+        if !numbers.insert(ch.channel) {
+            return Err(format!("channel {} is listed twice", ch.channel));
+        }
+        if ch.source.trim().is_empty() {
+            return Err(format!("channel {} has no source", ch.channel));
+        }
+        if let Some(ms) = ch.max_time_ms.filter(|ms| *ms > MAX_CHANNEL_MAX_TIME_MS) {
+            return Err(format!(
+                "channel {}: max_time_ms {} is above {}",
+                ch.channel, ms, MAX_CHANNEL_MAX_TIME_MS
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether block property `name` belongs to channel `ch` (1-based): its
+/// strip, routing and sends (`chN_…`). They go with a removed channel.
+pub fn is_channel_property(name: &str, ch: usize) -> bool {
+    name.starts_with(&format!("ch{}_", ch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,5 +531,44 @@ mod tests {
             // Bus 2 is static now: its settings stay.
             assert_eq!(left, ["aux2_fader", "num_aux_buses"]);
         }
+    }
+
+    fn ch(channel: usize, source: &str) -> DynamicChannel {
+        DynamicChannel {
+            channel,
+            source: source.to_string(),
+            max_time_ms: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_channels_round_trip() {
+        let channels = vec![ch(3, "cam"), ch(9, "cam")];
+        let json = serde_json::to_string(&channels).unwrap();
+        assert_eq!(parse_dynamic_channels(&json).unwrap(), channels);
+        assert_eq!(parse_dynamic_channels("").unwrap(), Vec::new());
+        assert!(parse_dynamic_channels("[{\"channel\":2}]").is_err());
+    }
+
+    #[test]
+    fn dynamic_channels_stay_in_the_free_numbers() {
+        assert!(validate_dynamic_channels(&[ch(2, "a"), ch(4, "a")], 1, 4).is_ok());
+        assert!(validate_dynamic_channels(&[ch(1, "a")], 1, 4).is_err());
+        assert!(validate_dynamic_channels(&[ch(5, "a")], 1, 4).is_err());
+        assert!(validate_dynamic_channels(&[ch(2, "a"), ch(2, "b")], 1, 4).is_err());
+        assert!(validate_dynamic_channels(&[ch(2, " ")], 1, 4).is_err());
+        let long = DynamicChannel {
+            max_time_ms: Some(MAX_CHANNEL_MAX_TIME_MS + 1),
+            ..ch(2, "a")
+        };
+        assert!(validate_dynamic_channels(&[long], 1, 4).is_err());
+    }
+
+    #[test]
+    fn channel_properties_are_the_channels_own() {
+        assert!(is_channel_property("ch3_fader", 3));
+        assert!(is_channel_property("ch3_aux2_level", 3));
+        assert!(!is_channel_property("ch31_fader", 3));
+        assert!(!is_channel_property("aux3_fader", 3));
     }
 }

@@ -67,8 +67,10 @@
 
 mod builder;
 mod buses;
+mod channels;
 mod definition;
 pub mod dynamic;
+pub mod dynamic_channels;
 mod elements;
 pub(crate) use elements::make_audiomixer;
 mod metering;
@@ -79,6 +81,8 @@ mod tests;
 use strom_types::mixer::{
     DEFAULT_CHANNELS, MAX_AUX_BUSES, MAX_CHANNELS, MAX_GROUPS, MIN_KNEE_LINEAR,
 };
+/// Sample format of every channel strip and bus.
+const BUS_FORMAT: &str = "F32LE";
 /// Level meter interval in nanoseconds (100ms)
 const METER_INTERVAL_NS: u64 = 100_000_000;
 /// EQ band type for Peaking/Bell filter (lsp-rs-equalizer enum value)
@@ -87,6 +91,7 @@ const EQ_BAND_TYPE_BELL: i32 = 7;
 // Public API
 pub use builder::MixerBuilder;
 pub use definition::get_blocks;
+pub(crate) use properties::stored_dynamic_channels;
 pub use properties::translate_property_for_element;
 
 /// Block definition ID for the audio mixer. Used by state-layer hooks that

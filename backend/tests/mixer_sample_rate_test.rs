@@ -103,8 +103,17 @@ fn run(sample_rate: Option<u64>, hold: Duration) -> Result<i32, String> {
         .add_many([&src, &caps, &valve, sink.upcast_ref()])
         .unwrap();
     gst::Element::link_many([&src, &caps, &valve]).unwrap();
+    // Into channel 1 as a flow links it: the block's external pad.
+    let input = &MixerBuilder
+        .get_external_pads(&props)
+        .expect("mixer has pads")
+        .inputs[0];
     valve
-        .link_pads(Some("src"), &by_id["mix:convert_0"], Some("sink"))
+        .link_pads(
+            Some("src"),
+            &by_id[&format!("mix:{}", input.internal_element_id)],
+            Some(input.internal_pad_name.as_str()),
+        )
         .unwrap();
     by_id["mix:main_out_tee"]
         .link_pads(

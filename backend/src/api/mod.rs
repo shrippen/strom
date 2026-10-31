@@ -11,6 +11,7 @@ pub mod mcp;
 pub mod media;
 pub mod mediaplayer;
 pub mod mixer_aux_buses;
+pub mod mixer_channels;
 pub mod network;
 pub mod osc;
 pub mod ports;
