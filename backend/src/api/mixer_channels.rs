@@ -111,8 +111,9 @@ pub async fn add_mixer_channel(
     ),
     responses(
         (status = 200, description = "Channel removed; the mixer's channels afterwards", body = MixerChannels),
+        (status = 400, description = "Channel 0 (channels are numbered from 1)", body = ErrorResponse),
         (status = 404, description = "No audio mixer, or no dynamic channel with this number", body = ErrorResponse),
-        (status = 409, description = "A static channel (num_channels), or the stored channel list does not parse", body = ErrorResponse),
+        (status = 409, description = "A static channel (num_channels, also one stored as dynamic before num_channels grew), or the stored channel list does not parse", body = ErrorResponse),
     )
 )]
 pub async fn remove_mixer_channel(
