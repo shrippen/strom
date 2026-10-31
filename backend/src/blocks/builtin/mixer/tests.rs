@@ -2270,3 +2270,31 @@ fn test_channel_delay_shifts_the_channel() {
     ));
     assert_eq!(offset(1), 25_000_000);
 }
+
+/// A channel delay is never negative: a sound cannot come before its
+/// source. Below 0 counts as 0, at build time and live.
+#[test]
+fn test_channel_delay_is_never_negative() {
+    let m = assemble(&small_mixer_props(&[(
+        "ch2_delay",
+        PropertyValue::Float(-40.0),
+    )]));
+    let src = m.element(&channels::delay_id(1)).static_pad("src").unwrap();
+    assert_eq!(src.offset(), 0);
+
+    let definition = mixer_definition();
+    let delay = definition
+        .exposed_properties
+        .iter()
+        .find(|p| p.name == "ch2_delay")
+        .unwrap();
+    let transform = crate::blocks::transforms::lookup(delay.mapping.transform.as_deref());
+    assert!(matches!(
+        (transform.forward)(PropertyValue::Float(-25.0)),
+        Some(PropertyValue::Float(f)) if f == 0.0
+    ));
+    assert!(matches!(
+        (transform.forward)(PropertyValue::Float(25.0)),
+        Some(PropertyValue::Float(f)) if f == 25.0
+    ));
+}

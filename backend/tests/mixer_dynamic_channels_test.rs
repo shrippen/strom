@@ -334,3 +334,35 @@ async fn a_channel_comes_back_after_a_restart() {
     assert!(matches!(rig.stored("ch3_fader").await, Some(PV::Float(_))));
     rig.stop().await;
 }
+
+/// A removal names a channel it may remove: channel 0 does not exist
+/// (no panic), and a stored dynamic channel that `num_channels` made
+/// static meanwhile stays, settings and all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_names_a_channel_it_may_remove() {
+    let rig = Rig::start("mixer_channel_test_removal_names").await;
+    assert!(matches!(
+        rig.state.remove_mixer_channel(&rig.flow_id, BLOCK, 0).await,
+        Err(ChannelError::Invalid(_))
+    ));
+
+    rig.add(Some(2)).await.expect("add channel 2");
+    rig.set("ch2_fader", PV::Float(0.5)).await;
+    rig.state.stop_flow(&rig.flow_id).await.unwrap();
+    // The flow edited with two channels (as the editor saves it).
+    let mut flow = rig.state.get_flow(&rig.flow_id).await.unwrap();
+    let block = flow.blocks.iter_mut().find(|b| b.id == BLOCK).unwrap();
+    block
+        .properties
+        .insert("num_channels".to_string(), PV::UInt(2));
+    rig.state.upsert_flow(flow).await.unwrap();
+    assert!(matches!(
+        rig.state.remove_mixer_channel(&rig.flow_id, BLOCK, 2).await,
+        Err(ChannelError::Conflict(_))
+    ));
+    assert!(
+        matches!(rig.stored("ch2_fader").await, Some(PV::Float(f)) if f == 0.5),
+        "the static channel kept its settings"
+    );
+    rig.stop().await;
+}

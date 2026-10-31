@@ -609,7 +609,8 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             mapping: PropertyMapping {
                 element_id: super::channels::delay_id(ch - 1),
                 property_name: "offset_ms".to_string(),
-                transform: None,
+                // A sound cannot come before its source.
+                transform: Some("non_negative".to_string()),
             },
             live: true,
             persist: None,

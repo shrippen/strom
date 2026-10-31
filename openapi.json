@@ -1409,6 +1409,16 @@
               }
             }
           },
+          "400": {
+            "description": "Channel 0 (channels are numbered from 1)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "404": {
             "description": "No audio mixer, or no dynamic channel with this number",
             "content": {
@@ -1420,7 +1430,7 @@
             }
           },
           "409": {
-            "description": "A static channel (num_channels), or the stored channel list does not parse",
+            "description": "A static channel (num_channels, also one stored as dynamic before num_channels grew), or the stored channel list does not parse",
             "content": {
               "application/json": {
                 "schema": {

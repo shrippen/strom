@@ -79,23 +79,32 @@ impl AppState {
         block_id: &str,
         ch: usize,
     ) -> Result<MixerChannels, ChannelError> {
+        if ch == 0 {
+            return Err(ChannelError::Invalid(
+                "channels are numbered from 1".to_string(),
+            ));
+        }
         let serial = self.inner.mixer_aux_buses.lock().await;
         let properties = self.mixer_channel_properties(flow_id, block_id).await?;
         let channels = dynamic_channels::channels(&properties);
+        // Also a stored dynamic channel that `num_channels` took in since:
+        // it is the flow's now, and its settings stay.
+        if (1..=channels.num_static).contains(&ch) {
+            return Err(ChannelError::Conflict(format!(
+                "channel {} is built with the flow (num_channels) and cannot be removed",
+                ch
+            )));
+        }
         let listed = stored_list(&properties)?.iter().any(|c| c.channel == ch);
         let mut pipelines = self.inner.pipelines.write().await;
         let built = pipelines
             .get(flow_id)
             .is_some_and(|m| dynamic_channels::is_built_dynamic(m.pipeline(), block_id, ch));
         if !listed && !built {
-            return Err(if (1..=channels.num_static).contains(&ch) {
-                ChannelError::Conflict(format!(
-                    "channel {} is built with the flow (num_channels) and cannot be removed",
-                    ch
-                ))
-            } else {
-                ChannelError::NotFound(format!("channel {} is not a dynamic channel", ch))
-            });
+            return Err(ChannelError::NotFound(format!(
+                "channel {} is not a dynamic channel",
+                ch
+            )));
         }
         if built {
             if let Some(manager) = pipelines.get_mut(flow_id) {

@@ -97,7 +97,8 @@ pub(super) fn channel_strip(
     // Delay (lip sync): later running times, so the buses play the sound
     // that much later. In front of everything, so the meter and the sends
     // are as late as Main.
-    let delay_ms = get_float_prop(properties, &format!("ch{}_delay", ch + 1), 0.0);
+    // Never negative: a sound cannot come before its source.
+    let delay_ms = get_float_prop(properties, &format!("ch{}_delay", ch + 1), 0.0).max(0.0);
     let (delay_id, delay) =
         time_offset::make_offset_identity(&spec.id(&format!("delay_{}", ch)), delay_ms)?;
     answer_latency_for_unfed_input(&delay);
