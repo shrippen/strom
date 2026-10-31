@@ -110,13 +110,43 @@ pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<u
             PropertyValue::Int(n) => Some((*n).max(0) as u64),
             _ => None,
         })
-        .is_some_and(|max| max > requested);
+        // Against what would be built: 0 inputs are one, and a capacity
+        // of one then leaves no free place.
+        .is_some_and(|max| {
+            max > requested.max(vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS as u64)
+        });
     let min = if free_slots {
         vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS
     } else {
         MIN_NUM_INPUTS
     };
     Ok((requested as usize).max(min))
+}
+
+/// The tile picture's first input and cell count for a mixer with
+/// `capacity` slots: `tiles_cells` 0 (the default) is one cell per slot
+/// from `tiles_first_input` on, and more than that would only add black
+/// cells (a typo like 10000 a picture no compositor allocates), so it is
+/// cut to the slots there are.
+pub fn parse_tile_cells(
+    properties: &HashMap<String, PropertyValue>,
+    capacity: usize,
+) -> (usize, usize) {
+    let first = parse_u64(properties, vision_mixer::TILES_FIRST_INPUT_PROPERTY, 0) as usize;
+    let slots = capacity.saturating_sub(first);
+    let cells =
+        match parse_u64(properties, vision_mixer::TILES_CELLS_PROPERTY, 0) as usize {
+            0 => slots,
+            n if n > slots => {
+                tracing::warn!(
+                "Vision mixer: tiles_cells {} is more than the {} slots from input {}; using {}",
+                n, slots, first, slots
+            );
+                slots
+            }
+            n => n,
+        };
+    (first, cells)
 }
 
 /// [`parse_num_inputs`] for callers that cannot fail (pad listings, pages of

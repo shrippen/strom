@@ -417,7 +417,7 @@ fn vision_mixer_definition() -> BlockDefinition {
         ExposedProperty {
             name: strom_types::vision_mixer::TILES_CELLS_PROPERTY.to_string(),
             label: "Tile Cells".to_string(),
-            description: "Cells of the tile output; 0 gives every input slot one. Inputs beyond the last cell get none.".to_string(),
+            description: "Cells of the tile output; 0 gives every input slot one. Inputs beyond the last cell get none; more cells than slots from the first input on are cut to those.".to_string(),
             property_type: PropertyType::UInt,
             default_value: Some(PropertyValue::UInt(0)),
             mapping: PropertyMapping {
