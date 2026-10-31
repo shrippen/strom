@@ -174,6 +174,11 @@ impl Rig {
 
     /// The rig with the mixer on `backend` (`cpu` or `cuda`).
     async fn start_on(backend: &str) -> Rig {
+        Self::start_with(backend, |_| {}).await
+    }
+
+    /// The rig with the mixer flow changed by `edit` first.
+    async fn start_with(backend: &str, edit: impl FnOnce(&mut Flow)) -> Rig {
         gst::init().unwrap();
         // `main` registers the inter elements at startup, once: registering
         // them again replaces their factories under the elements already made.
@@ -198,7 +203,8 @@ impl Rig {
             false,
             false,
         );
-        let flow = mixer_flow(backend);
+        let mut flow = mixer_flow(backend);
+        edit(&mut flow);
         let flow_id = flow.id;
         state.upsert_flow(flow).await.unwrap();
         let rig = Rig {
@@ -786,4 +792,116 @@ async fn bad_slot_properties_fail_the_start() {
             "{key} accepted a bad value"
         );
     }
+}
+
+/// The mixer with only input 0 built with the flow (static); the tile
+/// output leaves input 0 out and has two cells, for inputs 1 and 2.
+fn one_static_input_two_cells(flow: &mut Flow) {
+    flow.elements.retain(|e| e.id != "src1" && e.id != "caps1");
+    flow.links
+        .retain(|l| !l.from.starts_with("src1") && !l.from.starts_with("caps1"));
+    let props = &mut flow.blocks[0].properties;
+    props.insert("num_inputs".into(), PV::UInt(1));
+    props.insert("initial_pvw_input".into(), PV::UInt(0));
+    props.insert("tiles_first_input".into(), PV::UInt(1));
+    props.insert("tiles_cells".into(), PV::UInt(2));
+}
+
+/// A mixer that starts with one input and grows: the others come at
+/// runtime, the program cuts to them and back; the tile picture is two
+/// cells wide whatever the capacity, for the inputs it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mixer_with_one_input_grows_and_tiles_only_its_cells() {
+    grows(Rig::start_with("cpu", one_static_input_two_cells).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+async fn cuda_a_mixer_with_one_input_grows_and_tiles_only_its_cells() {
+    grows(Rig::start_with("cuda", one_static_input_two_cells).await).await;
+}
+
+async fn grows(rig: Rig) {
+    let tiles = rig.element("tilessink").await.expect("tilessink");
+    let caps = tiles
+        .static_pad("sink")
+        .unwrap()
+        .current_caps()
+        .expect("tiles caps");
+    let s = caps.structure(0).unwrap();
+    assert_eq!(
+        (
+            s.get::<i32>("width").unwrap(),
+            s.get::<i32>("height").unwrap()
+        ),
+        (2 * CELL.0, CELL.1),
+        "the tile picture is the cells', not the capacity's"
+    );
+    let tiles_comp = rig.element(&Rig::id("tiles_comp")).await.unwrap();
+    assert_eq!(tiles_comp.sink_pads().len(), 0, "input 0 has no cell");
+
+    let _producers: Vec<gst::Element> = ["a", "b", "c"]
+        .iter()
+        .map(|n| producer(&rig.channel(&format!("grow-{n}")), "ball"))
+        .collect();
+    let mut added = Vec::new();
+    for n in ["a", "b", "c"] {
+        added.push(
+            rig.add(inter(&rig.channel(&format!("grow-{n}"))))
+                .await
+                .expect("add"),
+        );
+    }
+    assert_eq!(added, [1, 2, 3]);
+    for i in &added {
+        rig.wait_for_video(*i).await;
+    }
+    // Inputs 1 and 2 sit in cells 0 and 1; input 3 has none.
+    let xpos = |pad: &str| {
+        tiles_comp
+            .static_pad(pad)
+            .map(|p| p.property::<i32>("xpos"))
+    };
+    assert_eq!(xpos("sink_0"), Some(0));
+    assert_eq!(xpos("sink_1"), Some(CELL.0));
+    assert_eq!(tiles_comp.sink_pads().len(), 2);
+    assert!(rig
+        .element(&Rig::id("queue_to_tiles_out_3"))
+        .await
+        .is_none());
+
+    // On air and back.
+    rig.state
+        .select_vision_mixer_preview(&rig.flow_id, BLOCK, 2)
+        .await
+        .unwrap();
+    rig.state
+        .trigger_transition(&rig.flow_id, BLOCK, 0, 2, "cut", 0)
+        .await
+        .expect("cut to input 2");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mixer = rig.element(&Rig::id("mixer")).await.unwrap();
+    let pad = mixer
+        .static_pad(&PadMap::sink(Rig::pad_map().dist_input(2)))
+        .unwrap();
+    assert!(
+        pad.property::<f64>("alpha") > 0.99,
+        "input 2 not on program"
+    );
+    rig.state
+        .trigger_transition(&rig.flow_id, BLOCK, 2, 0, "cut", 0)
+        .await
+        .expect("cut back to input 0");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Input 2 went back to preview with the cut: it stays, the others go.
+    let message = conflict(rig.remove(2).await);
+    assert!(message.contains("preview"), "{message}");
+    for i in [3, 1] {
+        rig.remove(i).await.expect("remove");
+    }
+    assert_eq!(tiles_comp.sink_pads().len(), 1, "a cell's pad stayed");
+    assert_eq!(xpos("sink_1"), Some(CELL.0), "input 2 left its cell");
+    rig.assert_program_unbroken("one input, three come and go");
+    rig.stop().await;
 }

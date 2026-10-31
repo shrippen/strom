@@ -83,7 +83,9 @@ pub fn parse_pip_bg(
 ///
 /// A value above [`MAX_NUM_INPUTS`] is an error: clamping it would leave the
 /// links to the inputs beyond the maximum without a target. A value below
-/// [`MIN_NUM_INPUTS`] is raised to it (the extra inputs stay unlinked).
+/// [`MIN_NUM_INPUTS`] is raised to it (the extra inputs stay unlinked),
+/// unless `max_inputs` leaves free slots: then one input is enough, the
+/// others come at runtime.
 pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<usize, String> {
     let requested = properties
         .get("num_inputs")
@@ -100,7 +102,21 @@ pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<u
             requested, MAX_NUM_INPUTS
         ));
     }
-    Ok((requested as usize).max(MIN_NUM_INPUTS))
+    let free_slots = properties
+        .get(vision_mixer::MAX_INPUTS_PROPERTY)
+        .and_then(|v| match v {
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
+            _ => None,
+        })
+        .is_some_and(|max| max > requested);
+    let min = if free_slots {
+        vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS
+    } else {
+        MIN_NUM_INPUTS
+    };
+    Ok((requested as usize).max(min))
 }
 
 /// [`parse_num_inputs`] for callers that cannot fail (pad listings, pages of
