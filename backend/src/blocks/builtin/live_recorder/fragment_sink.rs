@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -114,6 +114,11 @@ impl FragmentFileSink {
         *self.imp().drain_pads.lock().unwrap() = pads;
     }
 
+    /// Bytes written to disk since the sink started, over all its files.
+    pub fn bytes_written(&self) -> u64 {
+        self.imp().bytes_written.load(Ordering::Relaxed)
+    }
+
     /// Report each file the sink opens. Replaces an earlier callback.
     pub fn set_file_opened_callback(&self, callback: FileOpenedFn) {
         *self.imp().on_file_opened.lock().unwrap() = Some(callback);
@@ -174,6 +179,9 @@ mod imp {
         pub(super) split_requested: AtomicBool,
         pub(super) on_file_opened: Mutex<Option<FileOpenedFn>>,
         pub(super) drain_pads: Mutex<Vec<gst::glib::WeakRef<gst::Pad>>>,
+        /// Written since the start, over all files. An atomic, so the API
+        /// thread reads it without taking the streaming thread's lock.
+        pub(super) bytes_written: AtomicU64,
         state: Mutex<State>,
         /// Set when EOS reaches the sink, for a stop that waits for it.
         eos: Mutex<bool>,
@@ -210,6 +218,7 @@ mod imp {
                 split_requested: AtomicBool::default(),
                 on_file_opened: Mutex::default(),
                 drain_pads: Mutex::default(),
+                bytes_written: AtomicU64::default(),
                 state: Mutex::default(),
                 eos: Mutex::default(),
                 eos_cond: Condvar::default(),
@@ -267,6 +276,7 @@ mod imp {
                     *self.state.lock().unwrap() = State::default();
                     *self.eos.lock().unwrap() = false;
                     self.split_requested.store(false, Ordering::SeqCst);
+                    self.bytes_written.store(0, Ordering::Relaxed);
                 }
                 gst::StateChange::PlayingToPaused if self.stopping() => self.drain(),
                 _ => {}
@@ -318,6 +328,7 @@ mod imp {
                     )
                 })?;
                 written = header.len() as u64;
+                self.bytes_written.fetch_add(written, Ordering::Relaxed);
             }
             state.file = Some(file);
             state.next_index += 1;
@@ -350,6 +361,8 @@ mod imp {
                 )
             })?;
             state.bytes_in_file += bytes.len() as u64;
+            self.bytes_written
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             Ok(())
         }
 

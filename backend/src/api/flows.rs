@@ -14,10 +14,10 @@ use strom_types::{
     api::{
         AnimateInputRequest, AvailableOutput, AvailableSourcesResponse, BlockPropertiesResponse,
         DynamicPadsResponse, ElementPropertiesResponse, ErrorResponse, FlowDebugInfo,
-        FlowListResponse, FlowResponse, FlowStatsResponse, LatencyResponse, PadPropertiesResponse,
-        SourceFlowInfo, SrtStatsResponse, TransitionResponse, TriggerTransitionRequest,
-        UpdateBlockPropertiesRequest, UpdateFlowPropertiesRequest, UpdatePadPropertyRequest,
-        UpdatePropertyRequest, WebRtcStatsResponse,
+        FlowListResponse, FlowResponse, FlowStatsResponse, LatencyResponse, OutputBytesResponse,
+        PadPropertiesResponse, SourceFlowInfo, SrtStatsResponse, TransitionResponse,
+        TriggerTransitionRequest, UpdateBlockPropertiesRequest, UpdateFlowPropertiesRequest,
+        UpdatePadPropertyRequest, UpdatePropertyRequest, WebRtcStatsResponse,
     },
     Flow, FlowId,
 };
@@ -1572,6 +1572,40 @@ pub async fn get_srt_stats(
     })?;
 
     Ok(Json(SrtStatsResponse { flow_id: id, stats }))
+}
+
+/// Get the byte counters of a running flow's outputs.
+///
+/// Returns the bytes each output element has sent or written since the flow
+/// started: `rtmp2sink` (bytes on the socket) and the Live Recorder (bytes in
+/// its files), keyed by element name. A client polls it and takes the rate
+/// from two readings.
+#[utoipa::path(
+    get,
+    path = "/api/flows/{id}/output-bytes",
+    tag = "flows",
+    params(
+        ("id" = String, Path, description = "Flow ID (UUID)")
+    ),
+    responses(
+        (status = 200, description = "Output byte counters retrieved", body = OutputBytesResponse),
+        (status = 404, description = "Flow not running", body = ErrorResponse)
+    )
+)]
+pub async fn get_output_bytes(
+    State(state): State<AppState>,
+    Path(id): Path<FlowId>,
+) -> Result<Json<OutputBytesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let stats = state.get_output_bytes(&id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::with_details(
+                "Pipeline not running",
+                e.to_string(),
+            )),
+        )
+    })?;
+    Ok(Json(OutputBytesResponse { flow_id: id, stats }))
 }
 
 /// Get pipeline latency for a running flow.

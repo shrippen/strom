@@ -668,6 +668,46 @@ pub struct SrtStatsResponse {
     pub stats: SrtStats,
 }
 
+/// Where an output's bytes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMedium {
+    /// Sent on the network (`rtmp2sink`): the bytes written to the socket,
+    /// protocol framing included.
+    Network,
+    /// Written to disk (Live Recorder): the bytes written to its files.
+    File,
+}
+
+/// Bytes one output element has sent or written since the flow started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputByteCount {
+    pub medium: OutputMedium,
+    /// Total since the element started. A reconnecting network sink may
+    /// start again from zero; a client taking a rate from two readings
+    /// treats a smaller value as a new start.
+    pub bytes: u64,
+}
+
+/// Byte counters of a flow's output elements, keyed by element name
+/// (e.g. `block_id:rtmp_sink`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputBytes {
+    pub outputs: HashMap<String, OutputByteCount>,
+}
+
+/// Response containing a flow's output byte counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputBytesResponse {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+    pub flow_id: FlowId,
+    pub stats: OutputBytes,
+}
+
 // ============================================================================
 // Statistics API Types
 // ============================================================================
