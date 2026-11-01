@@ -117,6 +117,10 @@ pub fn init_gl() {
             std::env::set_var("GST_GL_WINDOW", "surfaceless");
         }
         gst::init().expect("GStreamer initialises");
+        // What the server does at start: GL mixers work around the driver
+        // they find (NVIDIA's empty udmabuf textures); without it a GL test
+        // on an NVIDIA host composites black.
+        strom::gpu::detect_gpu_capabilities();
     });
 }
 

@@ -1,6 +1,7 @@
 //! Property parsing helpers for vision mixer block.
 
 use std::collections::HashMap;
+use strom_types::vision_mixer;
 use strom_types::vision_mixer::{
     Source, DEFAULT_DSK_INPUTS, DEFAULT_NUM_INPUTS, DEFAULT_NUM_PIPS, DEFAULT_SHOW_VU_METERS,
     MAX_DSK_INPUTS, MAX_NUM_INPUTS, MAX_NUM_PIPS, MIN_NUM_INPUTS,
@@ -78,18 +79,138 @@ pub fn parse_pip_bg(
     Some(raw.min(num_inputs - 1))
 }
 
-/// Parse the number of inputs from block properties, clamped to valid range.
-pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> usize {
-    properties
+/// Parse the number of inputs from block properties.
+///
+/// A value above [`MAX_NUM_INPUTS`] is an error: clamping it would leave the
+/// links to the inputs beyond the maximum without a target. A value below
+/// [`MIN_NUM_INPUTS`] is raised to it (the extra inputs stay unlinked),
+/// unless `max_inputs` leaves free slots: then one input is enough, the
+/// others come at runtime.
+pub fn parse_num_inputs(properties: &HashMap<String, PropertyValue>) -> Result<usize, String> {
+    let requested = properties
         .get("num_inputs")
         .and_then(|v| match v {
-            PropertyValue::String(s) => s.parse::<usize>().ok(),
-            PropertyValue::UInt(n) => Some(*n as usize),
-            PropertyValue::Int(n) => Some(*n as usize),
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
             _ => None,
         })
-        .unwrap_or(DEFAULT_NUM_INPUTS)
-        .clamp(MIN_NUM_INPUTS, MAX_NUM_INPUTS)
+        .unwrap_or(DEFAULT_NUM_INPUTS as u64);
+    if requested > MAX_NUM_INPUTS as u64 {
+        return Err(format!(
+            "num_inputs is {}, the vision mixer takes at most {} inputs",
+            requested, MAX_NUM_INPUTS
+        ));
+    }
+    let free_slots = properties
+        .get(vision_mixer::MAX_INPUTS_PROPERTY)
+        .and_then(|v| match v {
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
+            _ => None,
+        })
+        // Against what would be built: 0 inputs are one, and a capacity
+        // of one then leaves no free place.
+        .is_some_and(|max| {
+            max > requested.max(vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS as u64)
+        });
+    let min = if free_slots {
+        vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS
+    } else {
+        MIN_NUM_INPUTS
+    };
+    Ok((requested as usize).max(min))
+}
+
+/// The tile picture's first input and cell count for a mixer with
+/// `capacity` slots: `tiles_cells` 0 (the default) is one cell per slot
+/// from `tiles_first_input` on, and more than that would only add black
+/// cells (a typo like 10000 a picture no compositor allocates), so it is
+/// cut to the slots there are.
+pub fn parse_tile_cells(
+    properties: &HashMap<String, PropertyValue>,
+    capacity: usize,
+) -> (usize, usize) {
+    let first = parse_u64(properties, vision_mixer::TILES_FIRST_INPUT_PROPERTY, 0) as usize;
+    let slots = capacity.saturating_sub(first);
+    let cells =
+        match parse_u64(properties, vision_mixer::TILES_CELLS_PROPERTY, 0) as usize {
+            0 => slots,
+            n if n > slots => {
+                tracing::warn!(
+                "Vision mixer: tiles_cells {} is more than the {} slots from input {}; using {}",
+                n, slots, first, slots
+            );
+                slots
+            }
+            n => n,
+        };
+    (first, cells)
+}
+
+/// [`parse_num_inputs`] for callers that cannot fail (pad listings, pages of
+/// a flow that is not running): an out-of-range value counts as the maximum.
+/// The build itself rejects it.
+pub fn num_inputs_or_max(properties: &HashMap<String, PropertyValue>) -> usize {
+    parse_num_inputs(properties).unwrap_or(MAX_NUM_INPUTS)
+}
+
+/// Parse the pad capacity (`max_inputs`) for a mixer with `num_inputs`
+/// static inputs. Missing or `0` means `num_inputs` (no free slots). Below
+/// `num_inputs` or above [`vision_mixer::MAX_INPUT_CAPACITY`] is an error.
+pub fn parse_max_inputs(
+    properties: &HashMap<String, PropertyValue>,
+    num_inputs: usize,
+) -> Result<usize, String> {
+    use strom_types::vision_mixer::{MAX_INPUTS_PROPERTY, MAX_INPUT_CAPACITY};
+    let requested = properties
+        .get(MAX_INPUTS_PROPERTY)
+        .and_then(|v| match v {
+            PropertyValue::String(s) => s.trim().parse::<u64>().ok(),
+            PropertyValue::UInt(n) => Some(*n),
+            PropertyValue::Int(n) => Some((*n).max(0) as u64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if requested == 0 {
+        return Ok(num_inputs);
+    }
+    if requested > MAX_INPUT_CAPACITY as u64 {
+        return Err(format!(
+            "max_inputs is {}, the vision mixer takes at most {} input slots",
+            requested, MAX_INPUT_CAPACITY
+        ));
+    }
+    if (requested as usize) < num_inputs {
+        return Err(format!(
+            "max_inputs is {}, below num_inputs {}",
+            requested, num_inputs
+        ));
+    }
+    Ok(requested as usize)
+}
+
+/// Pad capacity for callers that cannot fail: `max_inputs`, or `num_inputs`
+/// when the property is invalid (the build rejects it).
+pub fn capacity_or_num_inputs(properties: &HashMap<String, PropertyValue>) -> usize {
+    let num_inputs = num_inputs_or_max(properties);
+    parse_max_inputs(properties, num_inputs).unwrap_or(num_inputs)
+}
+
+/// Parse and check the `dynamic_inputs` property against the mixer's slots.
+pub fn parse_dynamic_inputs(
+    properties: &HashMap<String, PropertyValue>,
+    num_inputs: usize,
+    capacity: usize,
+) -> Result<Vec<vision_mixer::DynamicInput>, String> {
+    let inputs = match properties.get(vision_mixer::DYNAMIC_INPUTS_PROPERTY) {
+        Some(PropertyValue::String(s)) => vision_mixer::parse_dynamic_inputs(s)?,
+        None => Vec::new(),
+        Some(_) => return Err("dynamic_inputs must be a JSON string".to_string()),
+    };
+    vision_mixer::validate_dynamic_inputs(&inputs, num_inputs, capacity)?;
+    Ok(inputs)
 }
 
 /// Parse the initial PGM source from block properties.
@@ -211,7 +332,7 @@ pub fn apply_live_label(
         return Err(format!(
             "input {} is beyond the configured {} inputs",
             input + 1,
-            state.num_inputs
+            state.capacity
         ));
     }
     Ok(())
@@ -253,7 +374,12 @@ pub fn parse_bool(properties: &HashMap<String, PropertyValue>, key: &str, defaul
 
 /// Parse the output pixel format. Returns None for "Auto" (empty string).
 pub fn parse_output_format(properties: &HashMap<String, PropertyValue>) -> Option<String> {
-    properties.get("output_format").and_then(|v| match v {
+    parse_format(properties, "output_format")
+}
+
+/// Parse a pixel format property. Returns None for "Auto" (empty string).
+pub fn parse_format(properties: &HashMap<String, PropertyValue>, key: &str) -> Option<String> {
+    properties.get(key).and_then(|v| match v {
         PropertyValue::String(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
     })
@@ -301,6 +427,8 @@ pub fn parse_u64(properties: &HashMap<String, PropertyValue>, key: &str, default
         })
         .unwrap_or(default)
 }
+
+pub use crate::blocks::builtin::start_time::parse_start_time;
 
 #[cfg(test)]
 mod tests {

@@ -27,7 +27,10 @@ impl ApiClient {
 
         let response = self
             .with_auth(self.client.post(&url))
-            .json(&SetPlaylistRequest { files })
+            .json(&SetPlaylistRequest {
+                files,
+                loop_playlist: None,
+            })
             .send()
             .await
             .map_err(|e| {

@@ -64,6 +64,8 @@ impl StatsCollector {
         let stats = match block.block_definition_id.as_str() {
             "builtin.aes67_input" => Self::collect_aes67_input_stats(pipeline, &block.id),
             "builtin.whip_input" => Self::collect_whip_input_stats(block, whip_sessions),
+            "builtin.inter_input" => Self::collect_inter_input_stats(pipeline, &block.id),
+            "builtin.videoenc" => Self::collect_video_encoder_stats(pipeline, &block.id),
             "builtin.aes67_output" => {
                 // AES67 output doesn't have jitterbuffer stats, could add other stats later
                 vec![]
@@ -129,6 +131,24 @@ impl StatsCollector {
         }
 
         all_stats
+    }
+
+    /// Collect statistics for an Inter Input block: its receive queue.
+    fn collect_inter_input_stats(pipeline: &gst::Pipeline, instance_id: &str) -> Vec<Statistic> {
+        pipeline
+            .by_name(&format!("{}:intersrc", instance_id))
+            .and_then(|intersrc| crate::stats::inter::inter_input_stats(&intersrc))
+            .map(|stats| stats.to_statistics())
+            .unwrap_or_default()
+    }
+
+    /// Collect statistics for a Video Encoder block: its encode time.
+    fn collect_video_encoder_stats(pipeline: &gst::Pipeline, instance_id: &str) -> Vec<Statistic> {
+        pipeline
+            .by_name(&format!("{}:encoder", instance_id))
+            .and_then(|encoder| crate::stats::encoder::encoder_stats(&encoder))
+            .map(|stats| stats.to_statistics())
+            .unwrap_or_default()
     }
 
     /// Collect statistics for a WHIP Input block, one set per connected seat.

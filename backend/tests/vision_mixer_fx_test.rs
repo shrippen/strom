@@ -226,6 +226,9 @@ async fn wipe_between_letterboxed_sources_animates() {
     if !common::gl_available(GL_ELEMENTS) {
         return;
     }
+    // As at server startup: the GL builder adapts to the detected driver
+    // (see gpu::udmabuf_upload_broken).
+    strom::gpu::detect_gpu_capabilities();
 
     let mut flow = Flow::new("vm_letterbox_wipe");
     flow.blocks.push(strom_types::BlockInstance {
@@ -491,7 +494,7 @@ async fn wipe_between_letterboxed_sources_animates() {
     // trigger_transition reads the authoritative bus state from overlay
     // state, so without this the next take would re-run the same pair.
     manager
-        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(1), Some(0), 2)
+        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(1), Some(0))
         .expect("after take 0->1");
     let (animated, w_end, r_end) = observe_wipe(true);
     eprintln!(
@@ -514,7 +517,7 @@ async fn wipe_between_letterboxed_sources_animates() {
         .trigger_transition(LETTERBOX_BLOCK_ID, 1, 0, "wipe_left", 2000)
         .expect("wipe 1->0");
     manager
-        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(0), Some(1), 2)
+        .update_vision_mixer_after_take(LETTERBOX_BLOCK_ID, Some(0), Some(1))
         .expect("after take 1->0");
     let (animated2, w_end2, r_end2) = observe_wipe(false);
     eprintln!(

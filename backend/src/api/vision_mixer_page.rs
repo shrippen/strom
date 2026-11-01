@@ -108,7 +108,7 @@ async fn render_vision_mixer_page(
     };
 
     let block_id = &vm_block.id;
-    let num_inputs = vm_props::parse_num_inputs(&vm_block.properties);
+    let num_inputs = vm_props::num_inputs_or_max(&vm_block.properties);
     let labels = vm_props::parse_input_labels(&vm_block.properties, num_inputs);
     let num_dsk_inputs = vm_props::parse_num_dsk_inputs(&vm_block.properties);
     let num_pips = vm_props::parse_num_pips(&vm_block.properties);

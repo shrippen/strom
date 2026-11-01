@@ -116,33 +116,51 @@ pub async fn set_playlist(
     );
 
     // Always store playlist as a block property so it persists
-    let mut flow = state.get_flow(&flow_id).await.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse::new("Flow not found")),
-    ))?;
-
-    // Find the block and update its playlist property
-    let block = flow.blocks.iter_mut().find(|b| b.id == block_id).ok_or((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse::new("Block not found")),
-    ))?;
-
-    // Store playlist as JSON string in properties
     let playlist_json = serde_json::to_string(&req.files).unwrap_or_else(|_| "[]".to_string());
-    block
-        .properties
-        .insert("playlist".to_string(), PropertyValue::String(playlist_json));
-
-    // Save the updated flow
-    if let Err(e) = state.upsert_flow(flow).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::with_details(
-                "Failed to save flow",
-                e.to_string(),
-            )),
-        ));
-    }
+    state
+        .update_flow_with(&flow_id, |flow| {
+            // Find the block and update its playlist property
+            let block = flow
+                .blocks
+                .iter_mut()
+                .find(|b| b.id == block_id)
+                .ok_or::<&str>("Block not found")?;
+            // Store playlist as JSON string in properties
+            block
+                .properties
+                .insert("playlist".to_string(), PropertyValue::String(playlist_json));
+            if let Some(looped) = req.loop_playlist {
+                block
+                    .properties
+                    .insert("loop_playlist".to_string(), PropertyValue::Bool(looped));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e: crate::state::FlowUpdateError<&str>| {
+            use crate::state::FlowUpdateError;
+            match e {
+                FlowUpdateError::NotFound => (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new("Flow not found")),
+                ),
+                FlowUpdateError::Rejected(message) => {
+                    (StatusCode::NOT_FOUND, Json(ErrorResponse::new(message)))
+                }
+                FlowUpdateError::Save(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::with_details(
+                        "Failed to save flow",
+                        e.to_string(),
+                    )),
+                ),
+                // The change keeps the id.
+                FlowUpdateError::IdChanged => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("Failed to save flow")),
+                ),
+            }
+        })?;
 
     // If flow is running, also update the runtime player
     let key = MediaPlayerKey {
@@ -151,17 +169,24 @@ pub async fn set_playlist(
     };
 
     if let Some(player) = MEDIA_PLAYER_REGISTRY.get(&key) {
+        if let Some(looped) = req.loop_playlist {
+            player
+                .loop_playlist
+                .store(looped, std::sync::atomic::Ordering::SeqCst);
+        }
         let was_stopped = player.state() == strom_types::mediaplayer::PlayerState::Stopped;
+        let same_files = player.playlist_files() == req.files;
         player.set_playlist(req.files);
 
-        // Only auto-start from the beginning if the player was stopped. A
-        // stinger clip source parks its first clip instead of playing it.
+        // Only auto-start from the beginning if the player was stopped and
+        // got other files: a loop change alone leaves a held end as it is.
+        // A stinger clip source parks its first clip instead of playing it.
         if player.stinger.enabled {
             if player.playlist_len() > 0 && !player.is_parked_on(player.current_index()) {
                 let index = player.current_index();
                 let _ = control(move || player.cue(index).map(|_| ())).await;
             }
-        } else if was_stopped && player.playlist_len() > 0 {
+        } else if was_stopped && !same_files && player.playlist_len() > 0 {
             let _ = control(move || player.goto(0)).await;
         }
     }

@@ -418,7 +418,7 @@ fn idle_fx_slots_pass_buffers_through_and_effects_still_apply() {
         .trigger_transition(h.block_id, 0, 1, "wipe_left", 1500)
         .expect("wipe take");
     h.manager
-        .update_vision_mixer_after_take(h.block_id, Some(1), Some(0), 2)
+        .update_vision_mixer_after_take(h.block_id, Some(1), Some(0))
         .expect("after wipe take");
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut saw_both = false;
@@ -448,7 +448,7 @@ fn idle_fx_slots_pass_buffers_through_and_effects_still_apply() {
         .trigger_transition(h.block_id, 1, 0, "cut", 0)
         .expect("cut back");
     h.manager
-        .update_vision_mixer_after_take(h.block_id, Some(0), Some(1), 2)
+        .update_vision_mixer_after_take(h.block_id, Some(0), Some(1))
         .expect("after cut");
     h.wait_for_pgm(
         "the red input after the cut",
@@ -463,7 +463,7 @@ fn idle_fx_slots_pass_buffers_through_and_effects_still_apply() {
         .trigger_transition(h.block_id, 0, 1, "glitch_cut", 600)
         .expect("glitch take");
     h.manager
-        .update_vision_mixer_after_take(h.block_id, Some(1), Some(0), 2)
+        .update_vision_mixer_after_take(h.block_id, Some(1), Some(0))
         .expect("after glitch take");
     std::thread::sleep(Duration::from_millis(900));
     assert!(

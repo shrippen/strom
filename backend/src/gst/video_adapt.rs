@@ -13,6 +13,7 @@
 //! | Consumer | Producer caps | Adapters |
 //! |---|---|---|
 //! | [`Consumer::GlUpload`] | raw video in CUDA memory only | [`Adapter::CudaDownload`], or [`Refusal::MissingFactory`] when `cudadownload` is not installed |
+//! | [`Consumer::GlUpload`] | raw video in VA memory only | [`Adapter::VaPostProc`], or [`Refusal::MissingFactory`] when `vapostproc` is not installed |
 //! | [`Consumer::GlUpload`] | raw video in system memory only, in no pixel format `glupload` uploads | [`Adapter::VideoConvert`] |
 //! | [`Consumer::GlUpload`] | anything else | none |
 //! | [`Consumer::Accepts`] | raw video in GL memory only, consumer takes system-memory raw video | [`Adapter::GlDownload`] |
@@ -35,6 +36,10 @@ pub const GL_MEMORY_FEATURE: &str = "memory:GLMemory";
 /// The caps feature that marks a buffer as living in CUDA memory.
 pub const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
 
+/// The caps feature that marks a buffer as a VA-API surface (AMD and Intel
+/// decoders of the GStreamer `va` plugin).
+pub const VA_MEMORY_FEATURE: &str = "memory:VAMemory";
+
 /// The element that converts raw video in system memory between pixel formats.
 pub const VIDEO_CONVERT_FACTORY: &str = "videoconvert";
 
@@ -45,6 +50,11 @@ pub const GL_DOWNLOAD_FACTORY: &str = "gldownload";
 /// to system memory, whichever its consumer takes. Ships with the GStreamer
 /// nvcodec plugin, so it exists on NVIDIA builds only.
 pub const CUDA_DOWNLOAD_FACTORY: &str = "cudadownload";
+
+/// The element that takes VA surfaces out to DMABuf or system memory,
+/// whichever its consumer takes. Ships with the GStreamer `va` plugin, so it
+/// exists only where VA-API is installed.
+pub const VA_POSTPROC_FACTORY: &str = "vapostproc";
 
 /// The input being adapted.
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +85,8 @@ pub enum Adapter {
     GlDownload,
     /// `cudadownload`: CUDA memory to GL or system memory.
     CudaDownload,
+    /// `vapostproc`: VA surfaces to DMABuf or system memory.
+    VaPostProc,
     /// `videoconvert`: a system-memory pixel format the consumer cannot take
     /// to one it can.
     VideoConvert,
@@ -120,6 +132,15 @@ pub fn decide(
         Consumer::GlUpload(uploads) => {
             if offers_only_cuda_memory(producer) {
                 return cuda_download(available);
+            }
+            if offers_only_memory(producer, VA_MEMORY_FEATURE) {
+                return if available(VA_POSTPROC_FACTORY) {
+                    Ok(vec![Adapter::VaPostProc])
+                } else {
+                    Err(Refusal::MissingFactory {
+                        factory: VA_POSTPROC_FACTORY,
+                    })
+                };
             }
             // Compared by structure: a meta feature next to system memory
             // does not change which pixel formats can be uploaded.
@@ -237,6 +258,9 @@ pub fn build_elements(
             Adapter::CudaDownload => {
                 elements.push(make(CUDA_DOWNLOAD_FACTORY, name_prefix, "cudadownload")?)
             }
+            Adapter::VaPostProc => {
+                elements.push(make(VA_POSTPROC_FACTORY, name_prefix, "vapostproc")?)
+            }
             Adapter::VideoConvert => {
                 elements.push(make(VIDEO_CONVERT_FACTORY, name_prefix, "videoconvert")?)
             }
@@ -291,15 +315,18 @@ fn offers_only_system_memory_raw_video(caps: &gst::CapsRef) -> bool {
 
 /// True when every structure in `caps` is raw video in CUDA memory.
 fn offers_only_cuda_memory(caps: &gst::CapsRef) -> bool {
+    offers_only_memory(caps, CUDA_MEMORY_FEATURE)
+}
+
+/// True when every structure in `caps` is raw video in `feature` memory.
+fn offers_only_memory(caps: &gst::CapsRef, feature: &str) -> bool {
     if caps.is_any() || caps.is_empty() {
         return false;
     }
     caps.iter_with_features().all(|(structure, features)| {
-        // `video/x-raw(ANY)` contains every feature, CUDA included, but it
-        // offers system memory too.
-        structure.name() == "video/x-raw"
-            && !features.is_any()
-            && features.contains(CUDA_MEMORY_FEATURE)
+        // `video/x-raw(ANY)` contains every feature, CUDA and VA included,
+        // but it offers system memory too.
+        structure.name() == "video/x-raw" && !features.is_any() && features.contains(feature)
     })
 }
 
@@ -450,6 +477,28 @@ mod tests {
             decide(&caps(CUDA), Consumer::GlUpload(&uploads()), none),
             Err(Refusal::MissingFactory {
                 factory: CUDA_DOWNLOAD_FACTORY
+            })
+        );
+    }
+
+    const VA: &str = "video/x-raw(memory:VAMemory), format=NV12, width=1920, height=1080";
+
+    /// A VA surface (an AMD or Intel decoder re-pushed by the Media Player)
+    /// reaches `glupload` through `vapostproc`, which hands it on as DMABuf.
+    #[test]
+    fn gl_upload_va_memory_gets_vapostproc() {
+        assert_eq!(
+            decide(&caps(VA), Consumer::GlUpload(&uploads()), all),
+            Ok(vec![Adapter::VaPostProc])
+        );
+    }
+
+    #[test]
+    fn gl_upload_va_memory_without_vapostproc_is_missing() {
+        assert_eq!(
+            decide(&caps(VA), Consumer::GlUpload(&uploads()), none),
+            Err(Refusal::MissingFactory {
+                factory: VA_POSTPROC_FACTORY
             })
         );
     }

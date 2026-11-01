@@ -178,6 +178,19 @@ impl PipelineManager {
         &self.pipeline
     }
 
+    /// Enter elements built into the running pipeline (a mixer's dynamic
+    /// aux bus) in the element map, so property writes reach them.
+    pub fn adopt_elements(&mut self, elements: impl IntoIterator<Item = (String, gst::Element)>) {
+        self.elements.extend(elements);
+    }
+
+    /// Drop elements that left the running pipeline from the element map.
+    pub fn forget_elements(&mut self, names: &[String]) {
+        for name in names {
+            self.elements.remove(name);
+        }
+    }
+
     /// Get the flow name.
     pub fn flow_name(&self) -> &str {
         &self.flow_name
