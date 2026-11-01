@@ -593,8 +593,8 @@ fn plain_host(authority: &str) -> bool {
 ///   behind `=` (`passphrase= abc`) and the rest of the line behind `:`
 ///   (`auth-token: a b`, a header) up to a blank followed by a known pair
 ///   or a `!` (`auth-token: a b latency=1`); one more word behind `Bearer`,
-///   `Basic`, `Digest`. A value that starts with a quote is the quoted run through
-///   its partner (`{"passphrase":"a b","x":1}`).
+///   `Basic`, `Digest`. A value that starts with a quote is the quoted run
+///   through its partner (`{"passphrase":"a b","x":1}`).
 /// - `user:pass@host` without `//` is masked whole.
 /// - A quote that opens in a masked part (`passphrase="two words"`,
 ///   `passphrase=(string)"a b"`, `\"` in a `{:?}` dump) masks through its
