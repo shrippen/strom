@@ -16,6 +16,12 @@
 //! them) until it is back on time. The event stops at the aggregator: it
 //! does not travel on to the inputs (see [`stop_upstream`]).
 //!
+//! Each skipped frame shows up as a QoS message of the aggregator on the
+//! bus, as for any element that drops late buffers.
+//!
+//! Only a live aggregator is affected: without a latency (not live) the
+//! probe sends nothing, so offline processing keeps every frame.
+//!
 //! The probe checks every [`CHECK_EVERY`]th buffer only; the others cost an
 //! atomic increment, no lock and no allocation.
 
@@ -25,7 +31,7 @@ use gstreamer::prelude::*;
 use gstreamer_base as gst_base;
 use gstreamer_base::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The lag is measured on every this-many output buffers (6 times a second
 /// at 30 fps). Between two checks an overloaded aggregator falls behind by
@@ -84,31 +90,60 @@ pub(crate) fn install(element: &gst::Element) {
 ///
 /// The aggregator sends the event straight to each sink pad's peer, past
 /// the sink pad's own probes, so the probe sits on the peer, on every peer
-/// the pad is linked to. Upstream events are rare: it costs nothing per
-/// buffer. A probe left on a former peer only ever drops this aggregator's
-/// own event.
+/// the pad is linked to, and leaves it again on unlink. Upstream events
+/// are rare: it costs nothing per buffer.
 fn stop_upstream(pad: &gst::Pad, sent: &Arc<AtomicU32>) {
-    if let Some(peer) = pad.peer() {
-        drop_own_qos(&peer, sent);
+    // The peer carrying the probe, and the probe; locked on (un)link only.
+    let probe: Arc<Mutex<Option<(gst::Pad, gst::PadProbeId)>>> = Arc::default();
+    {
+        let (sent, probe) = (sent.clone(), probe.clone());
+        pad.connect_linked(move |_, peer| guard(peer, &sent, &probe));
     }
-    let sent = sent.clone();
-    pad.connect_linked(move |_, peer| drop_own_qos(peer, &sent));
+    {
+        let probe = probe.clone();
+        pad.connect_unlinked(move |_, _| {
+            if let Some((peer, id)) = probe.lock().unwrap().take() {
+                peer.remove_probe(id);
+            }
+        });
+    }
+    // Connected first, so a link in between is not missed; `guard` keeps a
+    // second call for the same peer from adding a second probe.
+    if let Some(peer) = pad.peer() {
+        guard(&peer, sent, &probe);
+    }
 }
 
-fn drop_own_qos(peer: &gst::Pad, sent: &Arc<AtomicU32>) {
+fn guard(
+    peer: &gst::Pad,
+    sent: &Arc<AtomicU32>,
+    probe: &Mutex<Option<(gst::Pad, gst::PadProbeId)>>,
+) {
+    let mut probe = probe.lock().unwrap();
+    if probe.as_ref().is_some_and(|(guarded, _)| guarded == peer) {
+        return;
+    }
+    if let Some((old, id)) = probe.take() {
+        old.remove_probe(id);
+    }
     let sent = sent.clone();
-    peer.add_probe(
-        gst::PadProbeType::EVENT_UPSTREAM,
-        move |_, info| match &info.data {
-            Some(gst::PadProbeData::Event(event))
-                if event.type_() == gst::EventType::Qos
-                    && event.seqnum().into_glib() == sent.load(Ordering::Relaxed) =>
-            {
-                gst::PadProbeReturn::Drop
-            }
-            _ => gst::PadProbeReturn::Ok,
-        },
-    );
+    // `Handled`, not `Drop`: gstreamer-rs has already taken the event out
+    // of the probe info, and before GStreamer 1.26 `Drop` makes the pad
+    // unref the now NULL event (a CRITICAL per dropped event).
+    *probe = peer
+        .add_probe(
+            gst::PadProbeType::EVENT_UPSTREAM,
+            move |_, info| match &info.data {
+                Some(gst::PadProbeData::Event(event))
+                    if event.type_() == gst::EventType::Qos
+                        && event.seqnum().into_glib() == sent.load(Ordering::Relaxed) =>
+                {
+                    gst::PadProbeReturn::Handled
+                }
+                _ => gst::PadProbeReturn::Ok,
+            },
+        )
+        .map(|id| (peer.clone(), id));
 }
 
 /// The QoS event for `buffer` leaving `pad`, if it is more than its own
@@ -121,13 +156,11 @@ fn late_by(pad: &gst::Pad, buffer: &gst::BufferRef) -> Option<gst::Event> {
         .downcast_ref::<gst::ClockTime>()?
         .to_running_time(pts)?;
     let element = pad.parent_element()?;
-    let now = element.current_running_time()?;
     // A live aggregator puts out a frame when the clock reaches its running
-    // time plus its latency; later than that, and it is behind.
-    let latency = element
-        .downcast_ref::<gst_base::Aggregator>()
-        .map(|aggregator| aggregator.latency().unwrap_or(gst::ClockTime::ZERO))
-        .unwrap_or(gst::ClockTime::ZERO);
+    // time plus its latency; later than that, and it is behind. Not live
+    // (no latency): never behind.
+    let latency = element.downcast_ref::<gst_base::Aggregator>()?.latency()?;
+    let now = element.current_running_time()?;
     let due = running_time + latency;
     let tolerance = buffer.duration().unwrap_or(DEFAULT_TOLERANCE);
     if now <= due + tolerance {
