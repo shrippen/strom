@@ -359,10 +359,14 @@ pub struct VideoEncoderStats {
     pub frames: u64,
     /// Sum of their encode times.
     pub encode_time_ns: u64,
+    /// A hardware encoder (`Hardware` in its element klass: NVENC, VA,
+    /// QSV, ...): its encode time is latency, not busy time.
+    pub hardware: bool,
 }
 
 impl VideoEncoderStats {
     pub const FRAMES: &'static str = "encoded_frames";
+    pub const HARDWARE: &'static str = "hardware_encoder";
     pub const ENCODE_TIME: &'static str = "encode_time_ns";
     pub const AVERAGE: &'static str = "avg_encode_time_ns";
     const CATEGORY: &'static str = "Encoder";
@@ -402,6 +406,13 @@ impl VideoEncoderStats {
                 "Average time a frame spent in the encoder",
                 None,
             ),
+            stat(
+                Self::HARDWARE,
+                StatValue::Bool(self.hardware),
+                "Hardware Encoder",
+                "Encodes on dedicated hardware; its encode time is latency",
+                None,
+            ),
         ]
     }
 
@@ -410,6 +421,10 @@ impl VideoEncoderStats {
         Some(Self {
             frames: stat_u64(stats, Self::FRAMES)?,
             encode_time_ns: stat_u64(stats, Self::ENCODE_TIME)?,
+            hardware: match stats.iter().find(|s| s.id == Self::HARDWARE)?.value {
+                StatValue::Bool(v) => v,
+                _ => return None,
+            },
         })
     }
 }
@@ -531,6 +546,7 @@ mod tests {
         let stats = VideoEncoderStats {
             frames: 50,
             encode_time_ns: 400_000_000,
+            hardware: true,
         };
         let generic = stats.to_statistics();
         assert_eq!(VideoEncoderStats::from_statistics(&generic), Some(stats));

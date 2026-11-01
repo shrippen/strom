@@ -156,6 +156,7 @@ fn video_encoder_reports_each_frame_it_encoded() {
     let encoder = VideoEncoderStats::from_statistics(&block.stats).expect("encoder stats");
     assert_eq!(encoder.frames, FRAMES, "every frame timed once");
     assert!(encoder.encode_time_ns > 0, "the frames took time");
+    assert!(!encoder.hardware, "x264enc is a software encoder");
 }
 
 /// A consumer that does not take its frames (paused, so its live source
