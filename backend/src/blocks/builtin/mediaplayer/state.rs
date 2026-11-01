@@ -530,6 +530,10 @@ impl MediaPlayerState {
     /// `Ok(false)` without touching anything when a file switch has happened
     /// since (that EOS ended a file that is no longer playing), when the user
     /// has paused or stopped since, or when the player has been shut down.
+    /// At the end of the playlist (`Err`) it holds the last frame, under the
+    /// same lock: a play or file switch that comes in meanwhile runs after
+    /// and ends the hold, rather than racing it and leaving a repeat running
+    /// next to the playback.
     pub fn advance_after_eos(&self, generation: u64) -> Result<bool, String> {
         // A stinger clip plays once per take; the take re-cues it.
         if self.stinger.enabled {
@@ -545,7 +549,9 @@ impl MediaPlayerState {
         {
             return Ok(false);
         }
-        self.next_locked().map(|()| true)
+        self.next_locked()
+            .map(|()| true)
+            .inspect_err(|_| self.hold_still())
     }
 
     /// Go to the previous file.
@@ -661,7 +667,8 @@ impl MediaPlayerState {
         // file's, a clip so short it ends while starting included, and must
         // advance the playlist.
         self.switch_generation.fetch_add(1, Ordering::SeqCst);
-        // A new file ends the repeat of the old one's last frame.
+        // A new file ends the repeat of the old one's last frame, and
+        // forgets it.
         self.still.release();
 
         if !play {
@@ -792,7 +799,7 @@ impl MediaPlayerState {
 
     /// Repeat the last frame of the first video track until playback goes
     /// on (see `still`). A stinger clip source parks instead.
-    pub fn hold_still(&self) {
+    fn hold_still(&self) {
         if self.stinger.enabled {
             return;
         }

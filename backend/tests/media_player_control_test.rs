@@ -6,7 +6,8 @@
 //! returned either.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use strom::blocks::builtin::mediaplayer::{MediaPlayerKey, MEDIA_PLAYER_REGISTRY};
 use strom::state::AppState;
@@ -45,14 +46,33 @@ fn run_glib_main_loop() {
 /// `x264enc` is in gstreamer1.0-plugins-ugly, `mp4mux` in -good, both
 /// installed in CI.
 fn write_h264_clip(dir: &std::path::Path, name: &str, frames: u32) -> String {
+    write_clip(
+        dir,
+        name,
+        &format!(
+            "videotestsrc num-buffers={} ! video/x-raw,width=160,height=90,framerate=25/1 \
+             ! x264enc tune=zerolatency key-int-max=10 ! h264parse ! mp4mux ! filesink name=out",
+            frames
+        ),
+    )
+}
+
+/// A WAV file with a minute of tone and no video.
+fn write_audio_clip(dir: &std::path::Path, name: &str) -> String {
+    write_clip(
+        dir,
+        name,
+        "audiotestsrc num-buffers=500 ! audio/x-raw,rate=8000,channels=1 \
+         ! wavenc ! filesink name=out",
+    )
+}
+
+/// Run `launch`, whose `filesink name=out` writes `dir/name`, and return the
+/// file's URI.
+fn write_clip(dir: &std::path::Path, name: &str, launch: &str) -> String {
     use gstreamer::prelude::*;
     let path = dir.join(name);
-    let writer = gstreamer::parse::launch(&format!(
-        "videotestsrc num-buffers={} ! video/x-raw,width=160,height=90,framerate=25/1 \
-         ! x264enc tune=zerolatency key-int-max=10 ! h264parse ! mp4mux ! filesink name=out",
-        frames
-    ))
-    .expect("x264enc and mp4mux are installed in CI");
+    let writer = gstreamer::parse::launch(launch).expect("x264enc and mp4mux are installed in CI");
     writer
         .downcast_ref::<gstreamer::Bin>()
         .unwrap()
@@ -219,4 +239,204 @@ async fn a_storm_of_jumps_and_pauses_never_hangs_the_player() {
         "stop_flow did not return within 20 s after the storm (issue #963)"
     );
     stop.unwrap().unwrap().expect("stop_flow failed");
+}
+
+/// Start `flow` and count the buffers that reach its fakesink.
+async fn start_counting_frames(
+    state: &AppState,
+    flow: Flow,
+) -> (strom_types::FlowId, Arc<AtomicU64>) {
+    use gstreamer::prelude::*;
+    let flow_id = flow.id;
+    state.upsert_flow(flow).await.expect("upsert_flow failed");
+    state.start_flow(&flow_id).await.expect("start_flow failed");
+
+    let frames = Arc::new(AtomicU64::new(0));
+    let pipelines = state.pipelines_read().await;
+    let sink = pipelines
+        .get(&flow_id)
+        .expect("running pipeline")
+        .pipeline()
+        .by_name("sink")
+        .expect("the flow's fakesink");
+    let counter = Arc::clone(&frames);
+    sink.static_pad("sink")
+        .unwrap()
+        .add_probe(gstreamer::PadProbeType::BUFFER, move |_, _| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            gstreamer::PadProbeReturn::Ok
+        });
+    (flow_id, frames)
+}
+
+/// Wait until at least ten frames have arrived since `before`.
+async fn wait_for_frames(frames: &AtomicU64, before: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while frames.load(Ordering::Relaxed) < before + 10 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        frames.load(Ordering::Relaxed) >= before + 10,
+        "the player never fed its output"
+    );
+}
+
+/// Frames that arrive in 2 s, from half a second on.
+async fn frames_in_two_seconds(frames: &AtomicU64) -> u64 {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = frames.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    frames.load(Ordering::Relaxed) - before
+}
+
+/// A paused player must keep feeding its output with its last frame. Pausing
+/// stops the internal pipeline; without a repeat the main pipeline's video
+/// appsrc gets no more buffers, and a live aggregator downstream (a vision
+/// mixer input) waits for its deadline on every output frame for as long as
+/// the player stays paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_player_keeps_feeding_its_output() {
+    gstreamer::init().unwrap();
+    run_glib_main_loop();
+
+    let dir = tempfile::tempdir().unwrap();
+    // 20 s at 25 fps: still playing when the test pauses it.
+    let playlist = vec![write_h264_clip(dir.path(), "long.mp4", 500)];
+
+    let (state, _files) = new_app_state();
+    let flow = build_player_flow("media_player_paused_feeds", &playlist);
+    let (flow_id, frames) = start_counting_frames(&state, flow).await;
+    let player = player_of(flow_id);
+    player.play().expect("play");
+    wait_for_frames(&frames, 0).await;
+
+    player.pause().expect("pause");
+    let paused = frames_in_two_seconds(&frames).await;
+    drop(player);
+    state.stop_flow(&flow_id).await.expect("stop_flow failed");
+
+    // 2 s at 25 fps is 50 frames; half of that leaves room for a busy runner.
+    assert!(
+        paused >= 25,
+        "the paused player fed {} frames in 2 s",
+        paused
+    );
+}
+
+/// A player that passes its file through (decode off) sends encoded frames.
+/// Repeating one while paused (mostly a delta frame, restamped without DTS)
+/// would break the decoder or muxer behind it, so it sends nothing, as
+/// before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_passthrough_player_repeats_no_encoded_frame() {
+    gstreamer::init().unwrap();
+    run_glib_main_loop();
+
+    let dir = tempfile::tempdir().unwrap();
+    let playlist = vec![write_h264_clip(dir.path(), "long.mp4", 500)];
+
+    let (state, _files) = new_app_state();
+    let mut flow = build_player_flow("media_player_paused_passthrough", &playlist);
+    flow.blocks[0]
+        .properties
+        .insert("decode".to_string(), PropertyValue::Bool(false));
+    let (flow_id, frames) = start_counting_frames(&state, flow).await;
+    let player = player_of(flow_id);
+    player.play().expect("play");
+    wait_for_frames(&frames, 0).await;
+
+    player.pause().expect("pause");
+    let paused = frames_in_two_seconds(&frames).await;
+    drop(player);
+    state.stop_flow(&flow_id).await.expect("stop_flow failed");
+
+    assert_eq!(paused, 0, "the paused passthrough player repeated frames");
+}
+
+/// A file switch forgets the old file's last frame: paused on a file that
+/// has shown no frame (here one without video), the player holds nothing
+/// rather than the frame of the file before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_player_paused_on_a_new_file_does_not_show_the_old_one() {
+    gstreamer::init().unwrap();
+    run_glib_main_loop();
+
+    let dir = tempfile::tempdir().unwrap();
+    let playlist = vec![
+        write_h264_clip(dir.path(), "long.mp4", 500),
+        write_audio_clip(dir.path(), "tone.wav"),
+    ];
+
+    let (state, _files) = new_app_state();
+    let flow = build_player_flow("media_player_paused_new_file", &playlist);
+    let (flow_id, frames) = start_counting_frames(&state, flow).await;
+    let player = player_of(flow_id);
+    player.play().expect("play");
+    wait_for_frames(&frames, 0).await;
+
+    player.goto(1).expect("goto");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    player.pause().expect("pause");
+    let paused = frames_in_two_seconds(&frames).await;
+    drop(player);
+    state.stop_flow(&flow_id).await.expect("stop_flow failed");
+
+    assert_eq!(paused, 0, "the paused player showed the old file's frame");
+}
+
+/// Going to another file while paused plays it, so the output keeps being
+/// fed, now by the new file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paused_player_switching_files_keeps_feeding_its_output() {
+    gstreamer::init().unwrap();
+    run_glib_main_loop();
+
+    let dir = tempfile::tempdir().unwrap();
+    let playlist = vec![
+        write_h264_clip(dir.path(), "a.mp4", 500),
+        write_h264_clip(dir.path(), "b.mp4", 500),
+    ];
+
+    let (state, _files) = new_app_state();
+    let flow = build_player_flow("media_player_paused_switch", &playlist);
+    let (flow_id, frames) = start_counting_frames(&state, flow).await;
+    let player = player_of(flow_id);
+    player.play().expect("play");
+    wait_for_frames(&frames, 0).await;
+    player.pause().expect("pause");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut fed = Vec::new();
+    for step in ["next", "previous", "goto"] {
+        match step {
+            "next" => player.next(),
+            "previous" => player.previous(),
+            _ => player.goto(1),
+        }
+        .expect(step);
+        fed.push((step, frames_in_two_seconds(&frames).await));
+        player.pause().expect("pause");
+    }
+    drop(player);
+    state.stop_flow(&flow_id).await.expect("stop_flow failed");
+
+    for (step, frames) in fed {
+        assert!(
+            frames >= 25,
+            "{} while paused: the player fed {} frames in 2 s",
+            step,
+            frames
+        );
+    }
+}
+
+fn player_of(
+    flow_id: strom_types::FlowId,
+) -> Arc<strom::blocks::builtin::mediaplayer::MediaPlayerState> {
+    MEDIA_PLAYER_REGISTRY
+        .get(&MediaPlayerKey {
+            flow_id,
+            block_id: BLOCK_ID.to_string(),
+        })
+        .expect("the Media Player registered")
 }
