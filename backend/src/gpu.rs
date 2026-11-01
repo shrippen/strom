@@ -146,8 +146,12 @@ pub fn udmabuf_upload_broken() -> bool {
 }
 
 /// Upload one white RGBA frame with `glupload` and download it again.
-/// `Some(true)` when the white survives, `Some(false)` when the frame comes
-/// back empty, `None` when there is no GL or no frame within the deadline.
+/// `Some(true)` when it comes back white, `Some(false)` when it does not
+/// (empty or wrong values), `None` on a pipeline error or no frame within
+/// 5 s.
+///
+/// Only RGBA is probed: a driver that imports only YUV wrongly through
+/// udmabuf would pass.
 ///
 /// With `through_queue` a `tee ! queue` stands in front of `glupload`; the
 /// allocation proposal then does not reach the source, so the udmabuf path
@@ -157,26 +161,37 @@ pub fn upload_keeps_pixels(through_queue: bool) -> Option<bool> {
     let pipeline = gst::parse::launch(&format!(
         "videotestsrc pattern=white num-buffers=1 ! \
          video/x-raw,format=RGBA,width=64,height=64 ! {front}glupload ! gldownload ! \
-         video/x-raw,format=RGBA ! appsink name=sink sync=false"
+         video/x-raw,format=RGBA ! appsink name=sink sync=false wait-on-eos=false"
     ))
     .map_err(|e| debug!("GL upload probe: failed to create pipeline: {}", e))
     .ok()?
     .downcast::<gst::Pipeline>()
     .ok()?;
+    let kept = run_upload_probe(&pipeline);
+    let _ = pipeline.set_state(gst::State::Null);
+    kept
+}
+
+fn run_upload_probe(pipeline: &gst::Pipeline) -> Option<bool> {
     let sink = pipeline
         .by_name("sink")
         .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())?;
-    if pipeline.set_state(gst::State::Playing).is_err() {
-        let _ = pipeline.set_state(gst::State::Null);
+    let bus = pipeline.bus()?;
+    pipeline.set_state(gst::State::Playing).ok()?;
+    // The sink keeps the frame and, with `wait-on-eos=false`, posts EOS
+    // without waiting for it to be pulled. An error ends the wait at once
+    // instead of after the deadline.
+    let msg = bus.timed_pop_filtered(
+        gst::ClockTime::from_seconds(5),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    )?;
+    if let gst::MessageView::Error(e) = msg.view() {
+        debug!("GL upload probe: {} ({:?})", e.error(), e.debug());
         return None;
     }
-    let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(5));
-    let kept = sample.as_ref().and_then(|s| {
-        let map = s.buffer()?.map_readable().ok()?;
-        Some(map.iter().any(|&b| b != 0))
-    });
-    let _ = pipeline.set_state(gst::State::Null);
-    kept
+    let sample = sink.try_pull_sample(gst::ClockTime::ZERO)?;
+    let map = sample.buffer()?.map_readable().ok()?;
+    Some(!map.is_empty() && map.iter().all(|&b| b == 0xff))
 }
 
 /// Probe the OpenGL renderer via GStreamer's GL context API.
@@ -349,20 +364,32 @@ pub fn detect_gpu_capabilities() -> VideoConvertMode {
     // Probe GL renderer info early (best-effort, independent of CUDA-GL interop)
     let gl_info = detect_gl_renderer();
     if let Some(info) = &gl_info {
-        let broken = upload_keeps_pixels(false) == Some(false);
-        if broken {
-            warn!(
-                "GL upload probe: glupload's udmabuf path gives empty textures with {} (GL {}); \
-                 GL inputs keep their own memory",
-                info.vendor, info.version
-            );
-        } else {
-            debug!(
-                "GL upload probe: glupload keeps the picture (GL {})",
-                info.version
-            );
-        }
-        let _ = UDMABUF_UPLOAD_BROKEN.set(broken);
+        // Once per process; later calls (tests call this often) keep it.
+        UDMABUF_UPLOAD_BROKEN.get_or_init(|| match upload_keeps_pixels(false) {
+            Some(true) => {
+                debug!(
+                    "GL upload probe: glupload keeps the picture (GL {})",
+                    info.version
+                );
+                false
+            }
+            Some(false) => {
+                warn!(
+                    "GL upload probe: glupload's udmabuf path loses the picture with {} (GL {}); \
+                     GL inputs keep their own memory",
+                    info.vendor, info.version
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "GL upload probe: no frame back from glupload (error or timeout) with {} \
+                     (GL {}); assuming the upload works",
+                    info.vendor, info.version
+                );
+                false
+            }
+        });
     }
     let _ = GL_RENDERER_INFO.set(gl_info);
 
