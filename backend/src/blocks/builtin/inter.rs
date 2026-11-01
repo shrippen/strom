@@ -214,10 +214,13 @@ impl BlockBuilder for InterInputBuilder {
             max_time_ms
         );
 
+        // Drops of its queue before GStreamer 1.28, for the block statistics.
+        let count_drops = crate::stats::inter::count_drops(&intersrc);
+
         Ok(BlockBuildResult {
             elements: vec![(element_id, intersrc)],
             internal_links: vec![],
-            bus_message_handler: None,
+            bus_message_handler: Some(count_drops),
             pad_properties: HashMap::new(),
         })
     }
