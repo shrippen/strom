@@ -466,11 +466,45 @@ struct Quotes {
     open: Vec<(usize, usize)>,
     /// How far the text is read.
     read: usize,
-    /// The last partner looked up: a quote open over many words is asked
-    /// for once per URL in them.
-    known: Option<(usize, Option<usize>)>,
-    /// The next `@` from where it was last looked up, or none to the end.
-    at_sign: Option<(usize, Option<usize>)>,
+    /// Built on the first lookup.
+    index: Option<Index>,
+}
+
+/// Where the quotes, blanks and `@` of the text stand, so that a lookup is
+/// a binary search and not a scan: a quote open over many words is asked
+/// for its partner and the word behind it once per URL in them.
+struct Index {
+    /// Each quote as (quote, backslashes right before it, offset), sorted.
+    quotes: Vec<(u8, usize, usize)>,
+    blanks: Vec<usize>,
+    at_signs: Vec<usize>,
+}
+
+impl Index {
+    fn new(s: &str) -> Self {
+        let mut index = Index {
+            quotes: Vec::new(),
+            blanks: Vec::new(),
+            at_signs: Vec::new(),
+        };
+        let mut escapes = 0;
+        for (i, c) in s.char_indices() {
+            match c {
+                '"' | '\'' | '`' => index.quotes.push((c as u8, escapes, i)),
+                '@' => index.at_signs.push(i),
+                c if c.is_whitespace() => index.blanks.push(i),
+                _ => {}
+            }
+            escapes = if c == '\\' { escapes + 1 } else { 0 };
+        }
+        index.quotes.sort_unstable();
+        index
+    }
+
+    /// The first offset in `sorted` at or behind `from`.
+    fn first(sorted: &[usize], from: usize) -> Option<usize> {
+        sorted.get(sorted.partition_point(|&i| i < from)).copied()
+    }
 }
 
 impl Quotes {
@@ -508,29 +542,29 @@ impl Quotes {
         self.read = self.read.max(to);
     }
 
-    /// The partner of the open quote at `open` ([`partner`]), cached.
-    fn partner(&mut self, s: &str, open: usize, escapes: usize) -> Option<usize> {
-        if let Some((o, close)) = self.known {
-            if o == open {
-                return close;
-            }
-        }
-        let close = partner(s.as_bytes(), open, escapes, s.len());
-        self.known = Some((open, close));
-        close
+    fn index(&mut self, s: &str) -> &Index {
+        self.index.get_or_insert_with(|| Index::new(s))
     }
 
-    /// The first `@` at or behind `from`, cached: asked once per URL in a
-    /// quote open over many words.
+    /// The partner of the open quote at `open`, as [`partner`] finds it: the
+    /// backslashes before a later quote never reach back past `open`.
+    fn partner(&mut self, s: &str, open: usize, escapes: usize) -> Option<usize> {
+        let key = (s.as_bytes()[open], escapes, open + 1);
+        let quotes = &self.index(s).quotes;
+        let &(quote, e, close) = quotes.get(quotes.partition_point(|&q| q < key))?;
+        (quote == key.0 && e == escapes).then_some(close)
+    }
+
+    /// The first `@` at or behind `from`.
     fn at_sign_from(&mut self, s: &str, from: usize) -> Option<usize> {
-        if let Some((looked, found)) = self.at_sign {
-            if looked <= from && found.is_none_or(|a| a >= from) {
-                return found;
-            }
-        }
-        let found = s[from..].find('@').map(|i| from + i);
-        self.at_sign = Some((from, found));
-        found
+        Index::first(&self.index(s).at_signs, from)
+    }
+
+    /// The end of the word that `close` stands in, and whether an `@`
+    /// follows in it.
+    fn word_from(&mut self, s: &str, close: usize) -> (usize, bool) {
+        let end = Index::first(&self.index(s).blanks, close).unwrap_or(s.len());
+        (end, self.at_sign_from(s, close).is_some_and(|a| a < end))
     }
 
     /// The innermost quote open at `at`, and its backslashes. A quote that
@@ -565,9 +599,7 @@ impl Quotes {
             return Some(b.len());
         };
         let inner = masked_end(s, from, from, close);
-        let close_end = s[close..]
-            .find(char::is_whitespace)
-            .map_or(s.len(), |i| close + i);
+        let (close_end, at_after) = self.word_from(s, close);
         let after = s[close + 1..].chars().next();
         let ends = after.is_none_or(|c| c.is_whitespace() || ",;)]}".contains(c));
         let stop = if inner > close {
@@ -580,7 +612,7 @@ impl Quotes {
                 close + 1,
                 close_end,
             ))
-        } else if !ends || s[close..close_end].contains('@') {
+        } else if !ends || at_after {
             masked_end(s, close + 1, close + 1, close_end)
         } else {
             close + 1
@@ -672,12 +704,7 @@ fn mask_word(s: &str, at: usize, word: Word, quotes: &mut Quotes, out: &mut Stri
         };
         let (close_end, at_after) = match close < end {
             true => (end, word.at_sign.is_some_and(|a| a > close)),
-            false => {
-                let close_end = s[close..]
-                    .find(char::is_whitespace)
-                    .map_or(s.len(), |i| close + i);
-                (close_end, s[close..close_end].contains('@'))
-            }
+            false => quotes.word_from(s, close),
         };
         let take = close < end
             || at_after
@@ -1344,6 +1371,30 @@ mod tests {
                 let _ = rtmp_url(&input);
             });
             assert!(run.is_ok(), "panicked on {:?}", input);
+        }
+    }
+
+    /// A quote open over the whole text with URLs in it, quoted and not, or
+    /// many quoted URLs in one word: a lookup must not scan the rest of the
+    /// text again for each URL. Quadratic, the first took 30 s in a debug
+    /// build, the others longer; now each takes well under a second.
+    #[test]
+    fn long_quoted_runs_take_linear_time() {
+        let n = 1 << 18;
+        let inputs = [
+            format!("\"{}\"", " 'srt://h:9000' srt://h:9000".repeat(n / 28)),
+            format!(
+                "{:?}",
+                format!("\"{}\"", " \"srt://a\" srt://b".repeat(n / 20))
+            ),
+            "\"srt://h?passphrase=a\",".repeat(n / 23),
+            format!("\"{} \"{}", " srt://h".repeat(n / 16), "x".repeat(n / 2)),
+        ];
+        for input in inputs {
+            let start = std::time::Instant::now();
+            let _ = mask_text(&input);
+            let took = start.elapsed();
+            assert!(took.as_secs() < 5, "{:?} for {:?}…", took, &input[..40]);
         }
     }
 
