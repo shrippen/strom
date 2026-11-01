@@ -344,6 +344,60 @@ mod tests {
         vec!["stun:stun.l.google.com:19302".to_string()]
     }
 
+    /// identity's ts-offset lacks GStreamer's MUTABLE_PLAYING flag but only
+    /// shifts timestamps (an audio delay for lip sync), so it can be changed
+    /// on a running flow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn identity_ts_offset_changes_while_playing() {
+        gst::init().unwrap();
+        let mut flow = create_test_flow();
+        flow.elements.push(Element {
+            id: "delay".to_string(),
+            element_type: "identity".to_string(),
+            properties: HashMap::new(),
+            pad_properties: HashMap::new(),
+            position: (50.0, 0.0),
+        });
+        flow.links = vec![
+            Link {
+                from: "src".to_string(),
+                to: "delay".to_string(),
+            },
+            Link {
+                from: "delay".to_string(),
+                to: "sink".to_string(),
+            },
+        ];
+        let registry = BlockRegistry::new("test_blocks.json");
+        let mut manager = PipelineManager::new(
+            &flow,
+            EventBroadcaster::default(),
+            &registry,
+            default_test_ice_servers(),
+            "all".to_string(),
+            None,
+            std::path::PathBuf::from("./media"),
+            std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        )
+        .unwrap();
+        assert!(manager.start().unwrap().is_active());
+
+        let result = manager.update_element_property(
+            "delay",
+            "ts-offset",
+            &PropertyValue::Int(40_000_000),
+            None,
+        );
+        let value = manager.get_element_property("delay", "ts-offset");
+        manager.stop().unwrap();
+
+        result.expect("ts-offset refused while playing");
+        assert!(
+            matches!(value, Ok(PropertyValue::Int(40_000_000))),
+            "{value:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_start_stop_pipeline() {
         gst::init().unwrap();
