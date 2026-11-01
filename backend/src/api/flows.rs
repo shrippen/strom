@@ -14,10 +14,10 @@ use strom_types::{
     api::{
         AnimateInputRequest, AvailableOutput, AvailableSourcesResponse, BlockPropertiesResponse,
         DynamicPadsResponse, ElementPropertiesResponse, ErrorResponse, FlowDebugInfo,
-        FlowListResponse, FlowResponse, FlowStatsResponse, LatencyResponse, PadPropertiesResponse,
-        SourceFlowInfo, SrtStatsResponse, TransitionResponse, TriggerTransitionRequest,
-        UpdateBlockPropertiesRequest, UpdateFlowPropertiesRequest, UpdatePadPropertyRequest,
-        UpdatePropertyRequest, WebRtcStatsResponse,
+        FlowListResponse, FlowResponse, FlowStatsResponse, LatencyResponse, OutputBytesResponse,
+        PadPropertiesResponse, SourceFlowInfo, SrtStatsResponse, TransitionResponse,
+        TriggerTransitionRequest, UpdateBlockPropertiesRequest, UpdateFlowPropertiesRequest,
+        UpdatePadPropertyRequest, UpdatePropertyRequest, WebRtcStatsResponse,
     },
     Flow, FlowId,
 };
@@ -593,12 +593,6 @@ pub async fn update_flow(
         ));
     }
 
-    // Get old flow to compare for live updates
-    let old_flow = state.get_flow(&id).await.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(ErrorResponse::new("Flow not found")),
-    ))?;
-
     info!("Updating flow: {} ({})", flow.name, flow.id);
     debug!("Update flow request body: {:?}", flow);
 
@@ -614,22 +608,19 @@ pub async fn update_flow(
 
     // Update last_modified timestamp (preserve created_at from old flow)
     flow.properties.last_modified = Some(Local::now().to_rfc3339());
-    if flow.properties.created_at.is_none() {
-        flow.properties.created_at = old_flow.properties.created_at.clone();
-    }
+    let (old_flow, flow) = state
+        .update_flow_with(&id, |stored| {
+            if flow.properties.created_at.is_none() {
+                flow.properties.created_at = stored.properties.created_at.clone();
+            }
+            *stored = flow;
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .await
+        .map_err(|e| flow_update_error(e, "Failed to save flow"))?;
 
     // Check if the flow is currently running
     let is_running = old_flow.running;
-
-    if let Err(e) = state.upsert_flow(flow.clone()).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::with_details(
-                "Failed to save flow",
-                e.to_string(),
-            )),
-        ));
-    }
 
     // If the flow is running, apply pad property changes live
     if is_running {
@@ -1494,32 +1485,19 @@ pub async fn update_flow_properties(
     info!("Updating properties for flow {}", id);
     debug!("Update flow properties request body: {:?}", req);
 
-    // Get the flow
-    let mut flow = state.get_flow(&id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse::new("Flow not found")),
-        )
-    })?;
-
     // Update properties while preserving timestamps
-    let old_created_at = flow.properties.created_at.clone();
-    let old_started_at = flow.properties.started_at.clone();
-    flow.properties = req.properties;
-    flow.properties.created_at = old_created_at;
-    flow.properties.started_at = old_started_at;
-    flow.properties.last_modified = Some(Local::now().to_rfc3339());
-
-    // Save the updated flow
-    if let Err(e) = state.upsert_flow(flow.clone()).await {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::with_details(
-                "Failed to save flow properties",
-                e.to_string(),
-            )),
-        ));
-    }
+    let (_, flow) = state
+        .update_flow_with(&id, |flow| {
+            let old_created_at = flow.properties.created_at.clone();
+            let old_started_at = flow.properties.started_at.clone();
+            flow.properties = req.properties;
+            flow.properties.created_at = old_created_at;
+            flow.properties.started_at = old_started_at;
+            flow.properties.last_modified = Some(Local::now().to_rfc3339());
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .await
+        .map_err(|e| flow_update_error(e, "Failed to save flow properties"))?;
 
     info!("Successfully updated properties for flow {}", id);
 
@@ -1594,6 +1572,40 @@ pub async fn get_srt_stats(
     })?;
 
     Ok(Json(SrtStatsResponse { flow_id: id, stats }))
+}
+
+/// Get the byte counters of a running flow's outputs.
+///
+/// Returns the bytes each output element has sent or written since the flow
+/// started: `rtmp2sink` (bytes on the socket) and the Live Recorder (bytes in
+/// its files), keyed by element name. A client polls it and takes the rate
+/// from two readings.
+#[utoipa::path(
+    get,
+    path = "/api/flows/{id}/output-bytes",
+    tag = "flows",
+    params(
+        ("id" = String, Path, description = "Flow ID (UUID)")
+    ),
+    responses(
+        (status = 200, description = "Output byte counters retrieved", body = OutputBytesResponse),
+        (status = 404, description = "Flow not running", body = ErrorResponse)
+    )
+)]
+pub async fn get_output_bytes(
+    State(state): State<AppState>,
+    Path(id): Path<FlowId>,
+) -> Result<Json<OutputBytesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let stats = state.get_output_bytes(&id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::with_details(
+                "Pipeline not running",
+                e.to_string(),
+            )),
+        )
+    })?;
+    Ok(Json(OutputBytesResponse { flow_id: id, stats }))
 }
 
 /// Get pipeline latency for a running flow.
@@ -1874,6 +1886,44 @@ pub async fn trigger_transition(
     }))
 }
 
+/// Hold the take from program to preview at a T-bar position.
+///
+/// Program and preview must be inputs (not PiPs). The pads show the
+/// transition at `position` until the next call, a take, or position 0.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/tbar",
+    tag = "flows",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Vision mixer block instance ID")
+    ),
+    request_body = strom_types::api::HoldTransitionRequest,
+    responses(
+        (status = 204, description = "Held at the position"),
+        (status = 400, description = "Invalid request, PiP on a bus, or a stinger on air", body = ErrorResponse),
+    )
+)]
+pub async fn hold_transition(
+    State(state): State<AppState>,
+    Path((flow_id, block_id)): Path<(FlowId, String)>,
+    ValidatedJson(req): ValidatedJson<strom_types::api::HoldTransitionRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .hold_vision_mixer_transition(&flow_id, &block_id, &req.transition_type, req.position)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::with_details(
+                    "Failed to hold the transition",
+                    e.to_string(),
+                )),
+            )
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Select a preview source on a vision mixer block.
 #[utoipa::path(
     put,
@@ -2152,7 +2202,7 @@ pub async fn get_vision_mixer_state(
         .collect();
 
     let input_resolutions = state
-        .vision_mixer_input_resolutions(&flow_id, &block_id, overlay.num_inputs)
+        .vision_mixer_input_resolutions(&flow_id, &block_id, overlay.capacity)
         .await;
 
     let fx_available = state.vision_mixer_fx_available(&flow_id, &block_id).await;
@@ -2186,6 +2236,7 @@ pub async fn get_vision_mixer_state(
         fx_available,
         input_effects,
         master_effect,
+        active_inputs: overlay.active_inputs(),
     }))
 }
 
@@ -2277,7 +2328,7 @@ pub async fn toggle_dsk(
     let dsk_index = req.dsk - 1;
 
     state
-        .set_dsk_enabled(&flow_id, &block_id, dsk_index, req.enabled)
+        .set_dsk_enabled(&flow_id, &block_id, dsk_index, req.enabled, req.duration_ms)
         .await
         .map_err(|e| {
             error!("Failed to toggle DSK: {}", e);
@@ -2611,6 +2662,30 @@ pub async fn get_block_thumbnail(
         jpeg_bytes,
     )
         .into_response())
+}
+
+/// The response for a failed `AppState::update_flow_with` (`saving`: what
+/// a failed save says).
+fn flow_update_error(
+    error: crate::state::FlowUpdateError<std::convert::Infallible>,
+    saving: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::state::FlowUpdateError;
+    match error {
+        FlowUpdateError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse::new("Flow not found")),
+        ),
+        FlowUpdateError::IdChanged => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("Flow ID mismatch")),
+        ),
+        FlowUpdateError::Rejected(never) => match never {},
+        FlowUpdateError::Save(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse::with_details(saving, e.to_string())),
+        ),
+    }
 }
 
 #[cfg(test)]

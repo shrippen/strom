@@ -389,6 +389,7 @@ impl BlockBuilder for LiveAudioRouterBuilder {
                 force_live,
                 latency_ms,
                 min_upstream_latency_ms,
+                crate::blocks::builtin::start_time::StartTime::Zero,
             )?;
             mixer.set_property(
                 "output-buffer-duration",

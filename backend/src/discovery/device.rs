@@ -37,13 +37,99 @@ pub struct DiscoveredDevice {
     pub provider: String,
     /// Additional properties from the device.
     pub properties: HashMap<String, String>,
+    /// Speaker position per channel of an audio device, in its order.
+    pub channel_positions: Vec<String>,
     /// When this device was first seen.
     pub first_seen: Instant,
     /// When this device was last seen.
     pub last_seen: Instant,
 }
 
+/// Device properties strom keeps from a provider's list.
+const KEPT_PROPERTIES: [&str; 23] = [
+    "device.api",
+    "device.class",
+    "device.name",
+    "device.description",
+    "device.nick",
+    "device.icon_name",
+    "device.path",
+    "device.serial",
+    "device.vendor",
+    "device.product",
+    "device.bus",
+    "node.name",
+    "node.description",
+    "object.path",
+    "api.alsa.card",
+    "api.alsa.card.name",
+    "api.alsa.path",
+    "api.v4l2.path",
+    // NDI-specific
+    "ip",
+    "url-address",
+    "ndi-name",
+    // DeckLink-specific: the card's index and its stable id
+    "device-number",
+    "persistent-id",
+];
+
+/// GType name of the devices the DeckLink provider announces.
+const DECKLINK_DEVICE_TYPE: &str = "GstDecklinkDevice";
+
+/// Provider name of DeckLink devices.
+const DECKLINK_PROVIDER: &str = "decklinkdeviceprovider";
+
+/// Category of a device of `class` from `provider`. A DeckLink card's
+/// sound only captures next to its picture (`decklinkaudiosrc` needs the
+/// `decklinkvideosrc` of the same device), so it is no audio source of
+/// its own: it comes with the DeckLink Input block.
+fn category_of(class: &str, provider: &str) -> DeviceCategory {
+    let category = DeviceCategory::from_device_class(class);
+    if provider == DECKLINK_PROVIDER && category == DeviceCategory::AudioSource {
+        return DeviceCategory::Other;
+    }
+    category
+}
+
+/// Property `key` as text: strings as they are, numbers and other
+/// values in their GLib text form (DeckLink's `device-number` is a uint).
+fn property_text(props: &gst::StructureRef, key: &str) -> Option<String> {
+    let value = props.value(key).ok()?;
+    if let Ok(text) = value.get::<String>() {
+        return Some(text);
+    }
+    value.transform::<String>().ok()?.get::<String>().ok()
+}
+
 impl DiscoveredDevice {
+    /// The record for `device`, first and last seen now.
+    fn from_gst(device: &gst::Device) -> Self {
+        let name = device.display_name().to_string();
+        let device_class = device.device_class().to_string();
+        let props = device.properties();
+        let get = |key: &str| props.as_ref().and_then(|p| property_text(p, key));
+        let provider = DeviceDiscovery::get_provider_name(device, &device_class);
+        let properties = KEPT_PROPERTIES
+            .iter()
+            .filter_map(|key| Some((key.to_string(), get(key)?)))
+            .collect();
+        let now = Instant::now();
+        Self {
+            id: DeviceDiscovery::device_id_for(device),
+            name,
+            category: category_of(&device_class, &provider),
+            provider,
+            device_class,
+            properties,
+            channel_positions: get("audio.position")
+                .map(|p| channel_positions(&p))
+                .unwrap_or_default(),
+            first_seen: now,
+            last_seen: now,
+        }
+    }
+
     /// Generate a unique ID from device class, provider, and name.
     pub fn generate_id(device_class: &str, provider: &str, name: &str) -> String {
         use std::hash::{Hash, Hasher};
@@ -63,6 +149,7 @@ impl DiscoveredDevice {
             category: self.category,
             provider: self.provider.clone(),
             properties: self.properties.clone(),
+            channel_positions: self.channel_positions.clone(),
             first_seen_secs_ago: self.first_seen.elapsed().as_secs(),
             last_seen_secs_ago: self.last_seen.elapsed().as_secs(),
         }
@@ -73,6 +160,16 @@ impl DiscoveredDevice {
         // Check provider name or NDI-specific property
         self.provider.contains("ndi") || self.properties.contains_key("ndi-name")
     }
+}
+
+/// PipeWire's `audio.position`, `[ FL FR ]` or `[ FL, FR ]`, as a list.
+fn channel_positions(position: &str) -> Vec<String> {
+    position
+        .trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace())
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Device discovery service using GStreamer DeviceMonitor.
@@ -150,7 +247,9 @@ impl DeviceDiscovery {
         // (WASAPI, DirectSound, MF) do hardware probing on enumeration which
         // adds a small one-time cost at startup; this is the trade-off for
         // letting users pick local capture devices from the UI.
+        // Audio/Sink: clients that play on a device need its channel layout.
         monitor.add_filter(Some("Audio/Source"), None);
+        monitor.add_filter(Some("Audio/Sink"), None);
         monitor.add_filter(Some("Video/Source"), None);
         monitor.add_filter(Some("Source/Network"), None);
 
@@ -248,7 +347,8 @@ impl DeviceDiscovery {
     /// 2. `object.path` — PipeWire
     /// 3. `api.v4l2.path` — Linux v4l2 device node (e.g. `/dev/video0`)
     /// 4. `device.serial` — USB serial number when the provider exposes one
-    /// 5. Falls back to `display_name` if none of the above is present
+    /// 5. `persistent-id` — DeckLink sub-device
+    /// 6. Falls back to `display_name` if none of the above is present
     ///    (matches the previous behaviour).
     ///
     /// Hashed together with the device class so an audio device and a
@@ -273,8 +373,9 @@ impl DeviceDiscovery {
             "object.path",
             "api.v4l2.path",
             "device.serial",
+            "persistent-id",
         ] {
-            if let Ok(v) = props.get::<String>(key) {
+            if let Some(v) = property_text(&props, key) {
                 if !v.is_empty() {
                     return Some(v);
                 }
@@ -285,6 +386,10 @@ impl DeviceDiscovery {
 
     /// Get provider name from device properties or infer from device class.
     fn get_provider_name(device: &gst::Device, device_class: &str) -> String {
+        if device.type_().name() == DECKLINK_DEVICE_TYPE {
+            return DECKLINK_PROVIDER.to_string();
+        }
+
         if let Some(props) = device.properties() {
             // Try to get from device.api property
             if let Ok(api) = props.get::<String>("device.api") {
@@ -308,69 +413,15 @@ impl DeviceDiscovery {
 
     /// Handle a device added event.
     async fn handle_device_added(&self, device: &gst::Device) {
-        let display_name = device.display_name().to_string();
-        let device_class = device.device_class().to_string();
-        let category = DeviceCategory::from_device_class(&device_class);
-
-        // Try to infer provider from device properties or class
-        let provider = Self::get_provider_name(device, &device_class);
-
+        let discovered = DiscoveredDevice::from_gst(device);
         debug!(
-            "Device added: {} (class: {}, provider: {})",
-            display_name, device_class, provider
+            "Device added: {} (class: {}, provider: {}, properties: {:?})",
+            discovered.name, discovered.device_class, discovered.provider, discovered.properties
         );
-
-        // Extract all properties from device
-        let mut properties = HashMap::new();
-        if let Some(props) = device.properties() {
-            // Common properties we're interested in
-            let prop_names = [
-                "device.api",
-                "device.class",
-                "device.name",
-                "device.description",
-                "device.nick",
-                "device.icon_name",
-                "device.path",
-                "device.serial",
-                "device.vendor",
-                "device.product",
-                "device.bus",
-                "node.name",
-                "node.description",
-                "object.path",
-                "api.alsa.card",
-                "api.alsa.card.name",
-                "api.alsa.path",
-                "api.v4l2.path",
-                // NDI-specific
-                "ip",
-                "url-address",
-                "ndi-name",
-            ];
-
-            for prop_name in prop_names {
-                if let Ok(value) = props.get::<String>(prop_name) {
-                    properties.insert(prop_name.to_string(), value);
-                }
-            }
-
-            debug!("Device properties for {}: {:?}", display_name, properties);
-        }
-
-        let id = Self::device_id_for(device);
-        let now = Instant::now();
-
-        let discovered = DiscoveredDevice {
-            id: id.clone(),
-            name: display_name.clone(),
-            device_class,
-            category,
-            provider: provider.clone(),
-            properties,
-            first_seen: now,
-            last_seen: now,
-        };
+        let id = discovered.id.clone();
+        let display_name = discovered.name.clone();
+        let provider = discovered.provider.clone();
+        let now = discovered.last_seen;
 
         let mut devices = self.devices.write().await;
         let is_new = !devices.contains_key(&id);
@@ -440,49 +491,15 @@ impl DeviceDiscovery {
             match msg.view() {
                 gst::MessageView::DeviceAdded(device_added) => {
                     let device = device_added.device();
-                    let display_name = device.display_name().to_string();
-                    let device_class = device.device_class().to_string();
-                    let category = DeviceCategory::from_device_class(&device_class);
-
-                    let provider = Self::get_provider_name(&device, &device_class);
-
+                    let discovered = DiscoveredDevice::from_gst(&device);
                     debug!(
                         "Device added event: {} (class: {}, provider: {})",
-                        display_name, device_class, provider
+                        discovered.name, discovered.device_class, discovered.provider
                     );
-
-                    // Extract properties
-                    let mut properties = HashMap::new();
-                    if let Some(props) = device.properties() {
-                        let prop_names = [
-                            "device.api",
-                            "device.name",
-                            "device.description",
-                            "node.name",
-                            "ip",
-                            "url-address",
-                            "ndi-name",
-                        ];
-                        for prop_name in prop_names {
-                            if let Ok(value) = props.get::<String>(prop_name) {
-                                properties.insert(prop_name.to_string(), value);
-                            }
-                        }
-                    }
-
-                    let id = Self::device_id_for(&device);
-                    let now = Instant::now();
-
-                    let discovered = DiscoveredDevice {
-                        id: id.clone(),
-                        name: display_name.clone(),
-                        device_class,
-                        category,
-                        provider: provider.clone(),
-                        properties,
-                        first_seen: now,
-                        last_seen: now,
-                    };
+                    let id = discovered.id.clone();
+                    let display_name = discovered.name.clone();
+                    let provider = discovered.provider.clone();
+                    let now = discovered.last_seen;
 
                     let mut devices_guard = devices.write().await;
                     let is_new = !devices_guard.contains_key(&id);
@@ -571,6 +588,73 @@ mod tests {
             DeviceCategory::from_device_class("Unknown/Class"),
             DeviceCategory::Other
         );
+    }
+
+    // DeckLink devices carry their number and id as integers; a client
+    // needs them to address the card.
+    #[test]
+    fn integer_properties_are_kept_as_text() {
+        gst::init().unwrap();
+        let props = gst::Structure::builder("properties")
+            .field("device-number", 2u32)
+            .field("persistent-id", 1972104050i64)
+            .field("device.path", "/dev/video0")
+            .build();
+        assert_eq!(property_text(&props, "device-number").as_deref(), Some("2"));
+        assert_eq!(
+            property_text(&props, "persistent-id").as_deref(),
+            Some("1972104050")
+        );
+        assert_eq!(
+            property_text(&props, "device.path").as_deref(),
+            Some("/dev/video0")
+        );
+        assert_eq!(property_text(&props, "missing"), None);
+    }
+
+    #[test]
+    fn decklink_sound_is_no_audio_source_of_its_own() {
+        assert_eq!(
+            category_of("Audio/Source/Hardware", DECKLINK_PROVIDER),
+            DeviceCategory::Other
+        );
+        assert_eq!(
+            category_of("Video/Source/Hardware", DECKLINK_PROVIDER),
+            DeviceCategory::VideoSource
+        );
+        assert_eq!(
+            category_of("Audio/Source", "pulsedeviceprovider"),
+            DeviceCategory::AudioSource
+        );
+    }
+
+    // DeckLink cards announce "Video/Source/Hardware"; the monitor's
+    // "Video/Source" filter lets them through, so the category must too.
+    #[test]
+    fn a_class_with_more_parts_keeps_its_category() {
+        assert_eq!(
+            DeviceCategory::from_device_class("Video/Source/Hardware"),
+            DeviceCategory::VideoSource
+        );
+        assert_eq!(
+            DeviceCategory::from_device_class("Audio/Source/Hardware"),
+            DeviceCategory::AudioSource
+        );
+        assert_eq!(
+            DeviceCategory::from_device_class("Video/Sink/Hardware"),
+            DeviceCategory::Other
+        );
+    }
+
+    #[test]
+    fn channel_positions_in_both_pipewire_spellings() {
+        assert_eq!(channel_positions("[ FL, FR ]"), ["FL", "FR"]);
+        assert_eq!(
+            channel_positions("[ FL FR FC LFE RL RR SL SR ]"),
+            ["FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR"]
+        );
+        assert_eq!(channel_positions("[ AUX0,AUX1 ]"), ["AUX0", "AUX1"]);
+        assert!(channel_positions("[ ]").is_empty());
     }
 
     #[test]

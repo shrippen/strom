@@ -67,8 +67,11 @@ enum PortConfigEntry {
     Spec(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
+    /// Address to bind the HTTP(S) listener to.
+    #[serde(default = "default_host")]
+    host: std::net::IpAddr,
     #[serde(default = "default_port")]
     port: u16,
     #[serde(default = "default_ice_servers")]
@@ -84,6 +87,20 @@ struct ServerConfig {
     /// Path to TLS private key file (PEM format).
     #[serde(default)]
     tls_key: Option<PathBuf>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            ice_servers: default_ice_servers(),
+            ice_transport_policy: default_ice_transport_policy(),
+            cors_allowed_origins: Vec::new(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
 }
 
 fn default_ice_servers() -> Vec<String> {
@@ -255,9 +272,17 @@ fn default_port() -> u16 {
     strom_types::DEFAULT_PORT
 }
 
+/// Unchanged from upstream: bind all interfaces unless overridden, so
+/// existing deployments (Docker, network access) keep working.
+fn default_host() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+}
+
 /// Application configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Address to bind the HTTP(S) listener to
+    pub host: std::net::IpAddr,
     /// Port to listen on
     pub port: u16,
     /// Data directory the storage paths default to
@@ -396,6 +421,7 @@ impl Config {
     /// 2. `config.toml` in user config directory (~/.config/strom/ on Linux)
     #[allow(clippy::too_many_arguments)]
     pub fn from_figment(
+        host: Option<std::net::IpAddr>,
         port: Option<u16>,
         data_dir: Option<PathBuf>,
         flows_path: Option<PathBuf>,
@@ -417,6 +443,7 @@ impl Config {
         // 1. Start with defaults
         figment = figment.merge(Serialized::defaults(ConfigFile {
             server: ServerConfig {
+                host: default_host(),
                 port: strom_types::DEFAULT_PORT,
                 ice_servers: default_ice_servers(),
                 ice_transport_policy: default_ice_transport_policy(),
@@ -569,6 +596,9 @@ impl Config {
         if let Some(ref key) = tls_key {
             figment = figment.merge(Serialized::default("server.tls_key", key));
         }
+        if let Some(h) = host {
+            figment = figment.merge(Serialized::default("server.host", h));
+        }
         if let Some(p) = port {
             figment = figment.merge(Serialized::default("server.port", p));
         }
@@ -605,6 +635,7 @@ impl Config {
         let data_paths = DataPaths::resolve(path_config)?;
 
         Ok(Self {
+            host: config_file.server.host,
             port: config_file.server.port,
             data_dir: data_paths.data_dir,
             flows_path: data_paths.flows_path,
@@ -687,6 +718,7 @@ impl Config {
         let data_paths = DataPaths::resolve(path_config)?;
 
         Ok(Self {
+            host: default_host(),
             port,
             data_dir: data_paths.data_dir,
             flows_path: data_paths.flows_path,
@@ -748,6 +780,7 @@ impl Default for Config {
         Self::from_env().unwrap_or_else(|_| {
             // Ultimate fallback (should rarely happen)
             Self {
+                host: default_host(),
                 port: strom_types::DEFAULT_PORT,
                 data_dir: PathBuf::from("."),
                 flows_path: PathBuf::from("flows.json"),
@@ -802,7 +835,8 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         // Restore (ignore errors)
         let _ = std::env::set_current_dir(original_dir);
@@ -827,7 +861,8 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         let _ = std::env::set_current_dir(original_dir);
 
@@ -844,7 +879,8 @@ mod tests {
         std::env::set_var("STROM_LOGGING_STDOUT_LOG_FORMAT", "json");
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         let _ = std::env::set_current_dir(&original_dir);
         std::env::remove_var("STROM_LOGGING_STDOUT_LOG_FORMAT");
@@ -862,7 +898,8 @@ mod tests {
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
 
-        let result = Config::from_figment(None, None, None, None, None, None, None, None, None);
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
 
         let _ = std::env::set_current_dir(&original_dir);
 
@@ -885,7 +922,8 @@ mod tests {
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         let _ = std::env::set_current_dir(original_dir);
 
@@ -908,6 +946,7 @@ mod tests {
         let blocks = temp_dir.path().join("blocks.json");
 
         let config = Config::from_figment(
+            None,
             Some(9000),
             None,
             Some(flows.clone()),
@@ -951,7 +990,8 @@ database_url = "postgresql://localhost/test"
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         // Restore original directory (ignore errors if it fails)
         let _ = std::env::set_current_dir(original_dir);
@@ -996,7 +1036,8 @@ stdout_log_format = ""
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         let _ = std::env::set_current_dir(original_dir);
 
@@ -1042,6 +1083,7 @@ stdout_log_format = ""
             None,
             None,
             None,
+            None,
             Some(String::new()),
             Some(PathBuf::new()),
             Some(PathBuf::new()),
@@ -1073,7 +1115,8 @@ stdout_log_format = ""
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         // Restore (restore dir before temp_dir is dropped, ignore errors)
         let _ = std::env::set_current_dir(&original_dir);
@@ -1109,9 +1152,19 @@ stdout_log_format = ""
         std::env::set_current_dir(&temp_dir).unwrap();
 
         // Pass CLI arg 9999
-        let config =
-            Config::from_figment(Some(9999), None, None, None, None, None, None, None, None)
-                .unwrap();
+        let config = Config::from_figment(
+            None,
+            Some(9999),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Restore (restore dir before temp_dir is dropped, ignore errors)
         let _ = std::env::set_current_dir(&original_dir);
@@ -1158,7 +1211,8 @@ data_dir = "{}"
         std::env::set_current_dir(&temp_dir).unwrap();
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         // Restore (ignore errors)
         let _ = std::env::set_current_dir(original_dir);
@@ -1184,7 +1238,8 @@ data_dir = "{}"
         );
 
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
 
         // Restore
         let _ = std::env::set_current_dir(&original_dir);
@@ -1238,7 +1293,8 @@ data_dir = "{}"
         let temp_dir = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
-        let config = Config::from_figment(None, None, None, None, None, None, None, None, None);
+        let config =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
         let _ = std::env::set_current_dir(original_dir);
         config.unwrap()
     }
@@ -1337,7 +1393,8 @@ data_dir = "{}"
         let temp_dir = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
-        let result = Config::from_figment(None, None, None, None, None, None, None, None, None);
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
         let _ = std::env::set_current_dir(original_dir);
 
         assert!(result.is_err());
@@ -1361,7 +1418,8 @@ lease_ttl_seconds = 600
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
 
-        let result = Config::from_figment(None, None, None, None, None, None, None, None, None);
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
 
         let _ = std::env::set_current_dir(original_dir);
         let config = result.unwrap();
@@ -1377,13 +1435,14 @@ lease_ttl_seconds = 600
         let _ports = EnvGuard::remove("STROM_PORTS");
         let _ttl = EnvGuard::remove("STROM_PORT_LEASE_TTL");
         let _probe = EnvGuard::set("STROM_PORT_PROBE_BEFORE_HANDOUT", "maybe");
-        let err =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap_err();
+        let err = Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+            .unwrap_err();
         assert!(err.to_string().contains("STROM_PORT_PROBE_BEFORE_HANDOUT"));
 
         let _probe = EnvGuard::set("STROM_PORT_PROBE_BEFORE_HANDOUT", "off");
         let config =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap();
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+                .unwrap();
         assert!(!config.probe_before_handout);
     }
 
@@ -1412,8 +1471,8 @@ lease_ttl_seconds = 600
         assert_eq!(settings.max_bytes, 1000);
 
         let _allow = EnvGuard::set("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES", "perhaps");
-        let err =
-            Config::from_figment(None, None, None, None, None, None, None, None, None).unwrap_err();
+        let err = Config::from_figment(None, None, None, None, None, None, None, None, None, None)
+            .unwrap_err();
         assert!(err
             .to_string()
             .contains("STROM_MEDIA_DOWNLOAD_ALLOW_PRIVATE_ADDRESSES"));
@@ -1428,7 +1487,8 @@ lease_ttl_seconds = 600
         .unwrap();
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&temp_dir).unwrap();
-        let result = Config::from_figment(None, None, None, None, None, None, None, None, None);
+        let result =
+            Config::from_figment(None, None, None, None, None, None, None, None, None, None);
         let _ = std::env::set_current_dir(original_dir);
         let settings = result.unwrap().media_download_settings();
         assert!(settings.allow_private_addresses);

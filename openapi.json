@@ -990,6 +990,458 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/aux_buses": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "List the aux buses of an audio mixer: its capacity, the static buses\nand the dynamic ones with their channels.",
+        "operationId": "list_mixer_aux_buses",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mixer's aux buses",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The stored bus list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add an aux bus to a running audio mixer. The bus takes the requested\nfree number (or the lowest free one), gets a send from every channel\n(level 0 until set with `chM_auxN_level`) and publishes its output on\nthe inter channel. It is stored with the flow and built again on\nrestart.",
+        "operationId": "add_mixer_aux_bus",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMixerAuxBusRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Bus added; the mixer's aux buses afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or the mixer has no free buses (max_aux_buses)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested number or the channel is taken, or every number is",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GStreamer could not build the bus",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/aux_buses/{aux}": {
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a dynamic aux bus from an audio mixer. Its stored properties\n(fader, sends) go with it.",
+        "operationId": "remove_mixer_aux_bus",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "aux",
+            "in": "path",
+            "description": "Aux bus number (as in auxN_fader)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bus removed; the mixer's aux buses afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerAuxBuses"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer, or no dynamic bus with this number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A static bus (num_aux_buses), or the stored bus list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/channels": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "List the channels of an audio mixer: its capacity, the number of static\nchannels and the dynamic ones with their sources.",
+        "operationId": "list_mixer_channels",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mixer's channels",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The stored channel list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add a channel to a running audio mixer. The channel takes the requested\nfree number (or the lowest free one), its sound from the inter channel\n`source`, a send into every aux bus (level 0 until set with\n`chN_auxM_level`) and its stored `chN_…` settings. It is stored with the\nflow and built again on restart.",
+        "operationId": "add_mixer_channel",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddMixerChannelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Channel added; the mixer's channels afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or the mixer has no free channels (max_channels)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running audio mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested number is taken, or every number is",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GStreamer could not build the channel",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/channels/{channel}": {
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a dynamic channel from an audio mixer. Its stored settings\n(`chN_…`) go with it.",
+        "operationId": "remove_mixer_channel",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Audio mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "channel",
+            "in": "path",
+            "description": "Channel number (as in chN_fader)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Channel removed; the mixer's channels afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MixerChannels"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Channel 0 (channels are numbered from 1)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No audio mixer, or no dynamic channel with this number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A static channel (num_channels, also one stored as dynamic before num_channels grew), or the stored channel list does not parse",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/devtools/link": {
       "post": {
         "tags": [
@@ -1037,6 +1489,73 @@
           },
           "404": {
             "description": "No such block, or it is not rendering a page yet"
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/devtools/page": {
+      "post": {
+        "tags": [
+          "devtools"
+        ],
+        "summary": "Run a command in the page an HTML Input block renders: JavaScript, CSS,\nfreeze or resume (see [`HtmlPageCommand`]).",
+        "description": "The block needs Page Scripting on. Unlike a remote control link this is\nfor a control system, not a person: it goes straight to the page's own\nDevTools endpoint, outside the link filter, which refuses\n`Runtime.evaluate` on purpose.",
+        "operationId": "page_command",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block instance id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HtmlPageCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What the command returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlPageResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "The block has Page Scripting switched off"
+          },
+          "404": {
+            "description": "No such block, or it is not rendering a page yet"
+          },
+          "422": {
+            "description": "The page refused the command, or the script threw"
+          },
+          "502": {
+            "description": "The page did not answer"
           }
         }
       }
@@ -1214,6 +1733,217 @@
           },
           "400": {
             "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/inputs": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "List the inputs of a running vision mixer: its slots, the static inputs\nand the dynamic ones with their sources.",
+        "operationId": "list_vision_mixer_inputs",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mixer's inputs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMixerInputs"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running vision mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Add an input to a running vision mixer, fed from an inter channel. The\ninput takes the requested free slot (or the lowest free one), shows as\na multiview thumbnail and can then be put on preview and program like\nany other input. It is stored with the flow and built again on restart.",
+        "operationId": "add_vision_mixer_input",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddVisionMixerInputRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Input added; the mixer's inputs afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMixerInputs"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, or the mixer has no free slots (max_inputs) or no dynamic inputs (OpenGL backend)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running vision mixer with this ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The requested slot is taken, or every slot is",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GStreamer could not build the input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/inputs/{index}": {
+      "delete": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Remove a dynamic input from a running vision mixer. Refused while the\ninput is on program or preview, part of a PiP, or a transition runs.",
+        "operationId": "remove_vision_mixer_input",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "index",
+            "in": "path",
+            "description": "Input index",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Input removed; the mixer's inputs afterwards",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMixerInputs"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running vision mixer, or no dynamic input at this index",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A static input, or the input is on program or preview, in a PiP, or a transition runs",
             "content": {
               "application/json": {
                 "schema": {
@@ -2158,6 +2888,1003 @@
         }
       }
     },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback": {
+      "get": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "The block's zones, stages, sounds and pictures.",
+        "operationId": "get_show_playback",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Zones, stages, sounds and pictures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShowPlaybackState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Show a picture on a stage, preloaded or at once; one of the same id is replaced.",
+        "operationId": "add_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddPictureRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Picture added"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such stage, or too many pictures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/fade": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Fade a picture's opacity along an S-curve, optionally stopping it at the end.",
+        "operationId": "fade_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PictureFadeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Fading"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/pause": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Pause a picture: its frame stays, a video keeps its place.",
+        "operationId": "pause_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture, or it does not play",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/play": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Show a preloaded picture.",
+        "operationId": "play_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Showing"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/resume": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Resume a paused picture where it was.",
+        "operationId": "resume_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Showing again"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture, or it is not paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/stop": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Take a picture off its stage, faded out.",
+        "operationId": "stop_picture",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "picture_id",
+            "in": "path",
+            "description": "Picture ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundStopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stopping"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such picture",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Add a sound: preloaded to start at once on `play`, or played as soon as\nit is decoded. A sound of the same id is replaced.",
+        "operationId": "add_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddSoundRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Sound added"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The sound cannot be added (zone, channel, limit)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/fade": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Fade a sound's level along an S-curve, optionally stopping it at the end.",
+        "operationId": "fade_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundFadeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Fading"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/pause": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Pause a sound where it is (RUN.5).",
+        "operationId": "pause_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Paused"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it does not play",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/play": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Play a sound.",
+        "operationId": "play_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Playing, or plays once decoded; a paused one plays on"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it has ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/resume": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Resume a paused sound where it was.",
+        "operationId": "resume_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Playing again"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound, or it is not paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/stop": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Stop a sound, faded out over `fade_ms`.",
+        "operationId": "stop_sound",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sound_id",
+            "in": "path",
+            "description": "Sound ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SoundStopRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stopping"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such sound",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/stages/{stage}": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Set a stage's brightness (its dimmer), faded.",
+        "operationId": "set_stage_level",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "Stage index, from 0",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StageLevelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Brightness set"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such stage",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/show_playback/zones/{zone}": {
+      "post": {
+        "tags": [
+          "show_playback"
+        ],
+        "summary": "Set a zone's level and mute, faded.",
+        "operationId": "set_zone_level",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Block ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "zone",
+            "in": "path",
+            "description": "Zone index, from 0",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ZoneLevelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Level set"
+          },
+          "404": {
+            "description": "No running Show Playback block",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No such zone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flows/{flow_id}/blocks/{block_id}/state": {
       "get": {
         "tags": [
@@ -2726,6 +4453,61 @@
           },
           "409": {
             "description": "The library changed: `file` is not the clip that would play",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{flow_id}/blocks/{block_id}/tbar": {
+      "post": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Hold the take from program to preview at a T-bar position.",
+        "description": "Program and preview must be inputs (not PiPs). The pads show the\ntransition at `position` until the next call, a take, or position 0.",
+        "operationId": "hold_transition",
+        "parameters": [
+          {
+            "name": "flow_id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "block_id",
+            "in": "path",
+            "description": "Vision mixer block instance ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HoldTransitionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Held at the position"
+          },
+          "400": {
+            "description": "Invalid request, PiP on a bus, or a stinger on air",
             "content": {
               "application/json": {
                 "schema": {
@@ -3582,6 +5364,49 @@
           },
           "404": {
             "description": "Flow not running or latency not available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/flows/{id}/output-bytes": {
+      "get": {
+        "tags": [
+          "flows"
+        ],
+        "summary": "Get the byte counters of a running flow's outputs.",
+        "description": "Returns the bytes each output element has sent or written since the flow\nstarted: `rtmp2sink` (bytes on the socket) and the Live Recorder (bytes in\nits files), keyed by element name. A client polls it and takes the rate\nfrom two readings.",
+        "operationId": "get_output_bytes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Flow ID (UUID)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Output byte counters retrieved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputBytesResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Flow not running",
             "content": {
               "application/json": {
                 "schema": {
@@ -6119,6 +7944,173 @@
           }
         }
       },
+      "AddMixerAuxBusRequest": {
+        "type": "object",
+        "description": "Request to add an aux bus to a running mixer.",
+        "required": [
+          "channel"
+        ],
+        "properties": {
+          "aux": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Bus number to fill; `None` takes the lowest free one.",
+            "minimum": 0
+          },
+          "channel": {
+            "type": "string",
+            "description": "Inter channel to publish the bus's output on."
+          },
+          "pre_fader": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Tap every channel's send before the fader (`true`) or after it.\nSets each `chM_auxN_pre`; `None` keeps the stored values (post fader\nwhen there are none)."
+          }
+        }
+      },
+      "AddMixerChannelRequest": {
+        "type": "object",
+        "description": "Request to add a channel to a running mixer.",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "channel": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Channel number to fill; `None` takes the lowest free one.",
+            "minimum": 0
+          },
+          "max_time_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Buffer time of the subscriber in ms.",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Inter channel the sound comes from."
+          }
+        }
+      },
+      "AddPictureRequest": {
+        "type": "object",
+        "description": "Show a picture (video or still image) on a stage.",
+        "required": [
+          "id",
+          "uri"
+        ],
+        "properties": {
+          "end": {
+            "$ref": "#/components/schemas/PictureEnd"
+          },
+          "fit": {
+            "$ref": "#/components/schemas/PictureFit"
+          },
+          "id": {
+            "type": "string",
+            "description": "Name of the picture in this block; a picture of the same id is\nreplaced."
+          },
+          "layer": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0 to [`MAX_LAYER`]; on the same layer the later picture is in front.",
+            "minimum": 0
+          },
+          "opacity": {
+            "type": "number",
+            "format": "double",
+            "description": "0 (clear) to 1."
+          },
+          "repeat": {
+            "$ref": "#/components/schemas/SoundRepeat",
+            "description": "Plays of a video; `end` applies after the last (a still image\nshows until stopped anyway)."
+          },
+          "stage": {
+            "type": "integer",
+            "description": "Stage, by its index in the block's `stages`.",
+            "minimum": 0
+          },
+          "start": {
+            "$ref": "#/components/schemas/SoundStart"
+          },
+          "uri": {
+            "type": "string",
+            "description": "`file://` URI (or a path in the media folder) of the file."
+          }
+        }
+      },
+      "AddSoundRequest": {
+        "type": "object",
+        "description": "Add a sound to the block.",
+        "required": [
+          "id",
+          "uri"
+        ],
+        "properties": {
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Level of the whole sound (dB)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Name of the sound in this block; a sound of the same id is replaced."
+          },
+          "repeat": {
+            "$ref": "#/components/schemas/SoundRepeat"
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundRoute"
+            },
+            "description": "Where its channels go. Empty: each file channel to the same channel\nof the first zone."
+          },
+          "start": {
+            "$ref": "#/components/schemas/SoundStart"
+          },
+          "uri": {
+            "type": "string",
+            "description": "`file://` URI (or a path in the media folder) of the sound file."
+          }
+        }
+      },
+      "AddVisionMixerInputRequest": {
+        "type": "object",
+        "description": "Request to add an input to a running vision mixer.",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Slot to fill; `None` takes the lowest free one.",
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/DynamicInputSource"
+          }
+        }
+      },
       "AnimateInputRequest": {
         "type": "object",
         "description": "Request to animate a single input's position/size.",
@@ -7060,6 +9052,13 @@
             "$ref": "#/components/schemas/DeviceCategory",
             "description": "Device category."
           },
+          "channel_positions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Speaker position of each channel of an audio device, in the\ndevice's channel order: PipeWire's names (`FL`, `FR`, `FC`, `LFE`,\n`RL`, `SL`, ..., `AUX0`... on pro-audio profiles). A sound server\nroutes a stream to a device by position, not by index, so a client\nthat addresses one device channel needs them. Empty when the device\ndoes not say."
+          },
           "device_class": {
             "type": "string",
             "description": "Device class (e.g., \"Audio/Source\", \"Video/Source\", \"Source/Network\")."
@@ -7188,6 +9187,12 @@
             "description": "DSK layer number (1 or 2, 1-based)",
             "minimum": 0
           },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Fade duration in milliseconds (0 = instant, the default)",
+            "minimum": 0
+          },
           "enabled": {
             "type": "boolean",
             "description": "Enable or disable the DSK layer"
@@ -7215,6 +9220,112 @@
             "type": "string"
           }
         }
+      },
+      "DynamicAuxBus": {
+        "type": "object",
+        "description": "An aux bus added while the flow runs.",
+        "required": [
+          "aux",
+          "channel"
+        ],
+        "properties": {
+          "aux": {
+            "type": "integer",
+            "description": "Bus number, as in the properties `auxN_fader` and `chM_auxN_level`\n(`num_aux_buses < aux <= max_aux_buses`).",
+            "minimum": 0
+          },
+          "channel": {
+            "type": "string",
+            "description": "Inter channel the bus's output is published on (the producer name an\nInter Input block or `intersrc` subscribes to)."
+          }
+        }
+      },
+      "DynamicChannel": {
+        "type": "object",
+        "description": "A channel added while the flow runs.",
+        "required": [
+          "channel",
+          "source"
+        ],
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "description": "Channel number, as in the properties `chN_fader`\n(`num_channels < channel <= max_channels`).",
+            "minimum": 0
+          },
+          "max_time_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Buffer time of the subscriber in ms; `None` keeps the element\ndefault. It also bounds the channel's delay (`chN_delay`).",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "Inter channel the sound comes from (the producer name of an Inter\nOutput block or an `intersink`)."
+          }
+        }
+      },
+      "DynamicInput": {
+        "type": "object",
+        "description": "A dynamic input: its slot, source and label.",
+        "required": [
+          "index",
+          "source"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "description": "Input index (`num_inputs <= index < max_inputs`).",
+            "minimum": 0
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Multiview label; `None` shows the default \"In N\"."
+          },
+          "source": {
+            "$ref": "#/components/schemas/DynamicInputSource"
+          }
+        }
+      },
+      "DynamicInputSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An inter channel published by an Inter Output block (or any\n`intersink` with this producer name).",
+            "required": [
+              "channel",
+              "type"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string",
+                "description": "Producer name of the channel (the Inter Input block's `channel`)."
+              },
+              "max_time_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Buffer time of the subscriber in ms (the Inter Input block's\n`max_time`); `None` keeps the element default.",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "inter"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Where a dynamic input's video comes from."
       },
       "DynamicPadsResponse": {
         "type": "object",
@@ -7605,6 +9716,14 @@
           }
         }
       },
+      "FadeEnd": {
+        "type": "string",
+        "description": "What a fade leaves behind.",
+        "enum": [
+          "keep",
+          "stop"
+        ]
+      },
       "FadeToBlackRequest": {
         "type": "object",
         "description": "Request to toggle Fade to Black on a vision mixer block.",
@@ -7873,6 +9992,13 @@
             ],
             "description": "Force direct media timing (`base_time=0`, `start_time=NONE`) so buffer\nPTS corresponds to absolute pipeline-clock time.\n\n- `Some(true)`: explicitly on.\n- `Some(false)`: explicitly off.\n- `None` (default): follow the clock-type default — `true` for `Ptp`\n  (AES67 contract, RFC 7273 `mediaclk:direct=0`), `false` otherwise.\n\nUse this for narrow pipelines where every element cooperates with\nwall-clock timing (PTP+AES67, or TAI disciplined by `ptp4l`/`phc2sys`\nfeeding AES67 with TAI timestamps). Avoid for general pipelines\n(MPEG-TS demuxers, RTP jitter buffers, WHEP session sinks) that assume\n`running_time` starts near 0."
           },
+          "eos_on_stop": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On stop, send EOS and wait (bounded) for it to pass before tearing\nthe pipeline down, so muxers finalize their files (recordings).\nOff by default: stopping stays immediate."
+          },
           "ephemeral": {
             "type": "boolean",
             "description": "When true, the flow is not persisted to storage. Useful for temporary or\nAPI-created flows that should not survive a server restart."
@@ -8066,6 +10192,22 @@
           "used_memory"
         ],
         "properties": {
+          "decoder_utilization": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Hardware video decoder (e.g. NVDEC) utilization percentage (if available)"
+          },
+          "encoder_utilization": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Hardware video encoder (e.g. NVENC) utilization percentage (if available)"
+          },
           "index": {
             "type": "integer",
             "format": "int32",
@@ -8131,6 +10273,110 @@
           "default": {
             "type": "string",
             "description": "The default GST_DEBUG filter the server started with"
+          }
+        }
+      },
+      "HoldTransitionRequest": {
+        "type": "object",
+        "description": "Request to hold the take from program to preview at a T-bar position.",
+        "required": [
+          "position"
+        ],
+        "properties": {
+          "position": {
+            "type": "number",
+            "format": "double",
+            "description": "How far the take is: 0 = program as it is, 1 = preview fully in.\nThe take itself is a transition request: a cut at 1 goes on from\nthe held picture, a take with a duration (or a stinger) starts from\nprogram as it rests."
+          },
+          "transition_type": {
+            "type": "string",
+            "description": "The transition the bar runs, as for a take (\"fade\", \"slide_left\",\n\"push_up\", \"dip_to_black\", ...). Wipes and master FX show as a fade."
+          }
+        }
+      },
+      "HtmlPageCommand": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Run JavaScript in the page, such as one of its functions, and return\nthe value. A promise is awaited.",
+            "required": [
+              "expression",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "evaluate"
+                ]
+              },
+              "expression": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Replace the stylesheet added to the page; empty removes it. It lasts\nuntil the page loads again.",
+            "required": [
+              "css",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "set_css"
+                ]
+              },
+              "css": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Freeze the page: its scripts and animations stop until it resumes.",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "freeze"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Run a frozen page again.",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "resume"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A command for the page an HTML Input block renders, sent through\nChromium's DevTools protocol. Only for blocks with Page Scripting on."
+      },
+      "HtmlPageResult": {
+        "type": "object",
+        "description": "What a page command returned.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "type": "object",
+            "description": "For `evaluate`, the value as JSON; null otherwise and for a value\nJSON cannot carry."
           }
         }
       },
@@ -8663,6 +10909,69 @@
           "Video"
         ]
       },
+      "MixerAuxBuses": {
+        "type": "object",
+        "description": "The aux buses of a running mixer.",
+        "required": [
+          "capacity",
+          "num_static",
+          "dynamic"
+        ],
+        "properties": {
+          "capacity": {
+            "type": "integer",
+            "description": "Highest bus number (`max_aux_buses`).",
+            "minimum": 0
+          },
+          "dynamic": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicAuxBus"
+            },
+            "description": "The dynamic buses, ascending by number."
+          },
+          "num_static": {
+            "type": "integer",
+            "description": "Buses built with the flow (`num_aux_buses`): they cannot be removed.",
+            "minimum": 0
+          },
+          "unbuilt": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicAuxBus"
+            },
+            "description": "Stored buses the mixer does not build: they no longer fit the\nnumbers (`num_aux_buses`, `max_aux_buses`). They come back when the\nnumbers fit again; removing one takes it out of the store."
+          }
+        }
+      },
+      "MixerChannels": {
+        "type": "object",
+        "description": "The channels of a mixer.",
+        "required": [
+          "capacity",
+          "num_static",
+          "dynamic"
+        ],
+        "properties": {
+          "capacity": {
+            "type": "integer",
+            "description": "Highest channel number (`max_channels`).",
+            "minimum": 0
+          },
+          "dynamic": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicChannel"
+            },
+            "description": "The dynamic channels, ascending by number."
+          },
+          "num_static": {
+            "type": "integer",
+            "description": "Channels built with the flow (`num_channels`): they cannot be\nremoved.",
+            "minimum": 0
+          }
+        }
+      },
       "MultiviewEndpointResponse": {
         "type": "object",
         "description": "Response for a vision mixer multiview endpoint query.",
@@ -8877,6 +11186,68 @@
           }
         }
       },
+      "OutputByteCount": {
+        "type": "object",
+        "description": "Bytes one output element has sent or written since the flow started.",
+        "required": [
+          "medium",
+          "bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total since the element started. A reconnecting network sink may\nstart again from zero; a client taking a rate from two readings\ntreats a smaller value as a new start.",
+            "minimum": 0
+          },
+          "medium": {
+            "$ref": "#/components/schemas/OutputMedium"
+          }
+        }
+      },
+      "OutputBytes": {
+        "type": "object",
+        "description": "Byte counters of a flow's output elements, keyed by element name\n(e.g. `block_id:rtmp_sink`).",
+        "required": [
+          "outputs"
+        ],
+        "properties": {
+          "outputs": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/OutputByteCount"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "OutputBytesResponse": {
+        "type": "object",
+        "description": "Response containing a flow's output byte counters.",
+        "required": [
+          "flow_id",
+          "stats"
+        ],
+        "properties": {
+          "flow_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/OutputBytes"
+          }
+        }
+      },
+      "OutputMedium": {
+        "type": "string",
+        "description": "Where an output's bytes go.",
+        "enum": [
+          "network",
+          "file"
+        ]
+      },
       "OverlayAlphaRequest": {
         "type": "object",
         "description": "Request to set the multiview overlay alpha on a vision mixer block.",
@@ -9017,6 +11388,45 @@
             "description": "Links between elements"
           }
         }
+      },
+      "PictureEnd": {
+        "type": "string",
+        "description": "What a video does at its end.",
+        "enum": [
+          "hold",
+          "stop"
+        ]
+      },
+      "PictureFadeRequest": {
+        "type": "object",
+        "description": "Fade a picture's opacity (S-curve).",
+        "required": [
+          "opacity",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/FadeEnd"
+          },
+          "opacity": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "PictureFit": {
+        "type": "string",
+        "description": "How a picture fills its stage.",
+        "enum": [
+          "fit",
+          "fill",
+          "stretch"
+        ]
       },
       "PipState": {
         "type": "object",
@@ -10044,6 +12454,13 @@
               "type": "string"
             },
             "description": "List of file URIs (e.g., \"file:///path/to/video.mp4\")"
+          },
+          "loop_playlist": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Loop back to the first file at the end; unchanged when absent."
           }
         }
       },
@@ -10079,6 +12496,226 @@
           },
           "message": {
             "type": "string"
+          }
+        }
+      },
+      "ShowPlaybackState": {
+        "type": "object",
+        "description": "The block's sounds and pictures.",
+        "required": [
+          "zones",
+          "sounds"
+        ],
+        "properties": {
+          "pictures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundInfo"
+            },
+            "description": "The pictures on the stages."
+          },
+          "sounds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundInfo"
+            }
+          },
+          "stages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShowStage"
+            }
+          },
+          "zones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ShowZone"
+            }
+          }
+        }
+      },
+      "ShowStage": {
+        "type": "object",
+        "description": "One stage: a picture surface of its own, one block output.",
+        "required": [
+          "name",
+          "width",
+          "height"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "ShowZone": {
+        "type": "object",
+        "description": "One zone: a named group of output channels, one block output.",
+        "required": [
+          "name",
+          "channels"
+        ],
+        "properties": {
+          "channels": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 to [`MAX_ZONE_CHANNELS`].",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "SoundFadeRequest": {
+        "type": "object",
+        "description": "Fade a sound's level (S-curve).",
+        "required": [
+          "gain_db",
+          "duration_ms"
+        ],
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "end": {
+            "$ref": "#/components/schemas/FadeEnd"
+          },
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Target level (dB); [`GAIN_MIN_DB`] or lower is silence."
+          }
+        }
+      },
+      "SoundInfo": {
+        "type": "object",
+        "description": "One sound of the block.",
+        "required": [
+          "id",
+          "state"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SoundState"
+          }
+        }
+      },
+      "SoundRepeat": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "once"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "This many plays in all (1 is once).",
+            "required": [
+              "times"
+            ],
+            "properties": {
+              "times": {
+                "type": "integer",
+                "format": "int32",
+                "description": "This many plays in all (1 is once).",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "string",
+            "description": "Until it is stopped.",
+            "enum": [
+              "forever"
+            ]
+          }
+        ],
+        "description": "How often a sound or video plays (SND.3, VIS.2); its plays follow\neach other without a gap."
+      },
+      "SoundRoute": {
+        "type": "object",
+        "description": "One crosspoint: a channel of the sound's file into a channel of a zone.",
+        "required": [
+          "channel",
+          "zone",
+          "zone_channel"
+        ],
+        "properties": {
+          "channel": {
+            "type": "integer",
+            "format": "int32",
+            "description": "File channel, from 0.",
+            "minimum": 0
+          },
+          "gain_db": {
+            "type": "number",
+            "format": "double",
+            "description": "Level of this crosspoint (dB)."
+          },
+          "zone": {
+            "type": "integer",
+            "description": "Zone, by its index in the block's `zones`.",
+            "minimum": 0
+          },
+          "zone_channel": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Zone channel, from 0.",
+            "minimum": 0
+          }
+        }
+      },
+      "SoundStart": {
+        "type": "string",
+        "description": "When a sound or picture added to the block starts.",
+        "enum": [
+          "preload",
+          "play"
+        ]
+      },
+      "SoundState": {
+        "type": "string",
+        "description": "Where a sound or picture is.",
+        "enum": [
+          "loading",
+          "ready",
+          "playing",
+          "paused",
+          "ended",
+          "failed"
+        ]
+      },
+      "SoundStopRequest": {
+        "type": "object",
+        "description": "Stop a sound, faded out over `fade_ms`.",
+        "properties": {
+          "fade_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -10417,6 +13054,24 @@
           },
           "stats": {
             "$ref": "#/components/schemas/SrtStats"
+          }
+        }
+      },
+      "StageLevelRequest": {
+        "type": "object",
+        "description": "Set a stage's brightness (dimmer, 0 = black), faded over `duration_ms`.",
+        "required": [
+          "brightness"
+        ],
+        "properties": {
+          "brightness": {
+            "type": "number",
+            "format": "double"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -13036,6 +15691,48 @@
           },
           {
             "type": "object",
+            "description": "Inputs were added to or removed from a running vision mixer.",
+            "required": [
+              "data",
+              "type"
+            ],
+            "properties": {
+              "data": {
+                "type": "object",
+                "description": "Inputs were added to or removed from a running vision mixer.",
+                "required": [
+                  "flow_id",
+                  "block_id",
+                  "active_inputs"
+                ],
+                "properties": {
+                  "active_inputs": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "description": "The inputs the mixer has now, by index, ascending."
+                  },
+                  "block_id": {
+                    "type": "string"
+                  },
+                  "flow_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "VisionMixerInputsChanged"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "Vision mixer video effect changed (shader FX engine)",
             "required": [
               "data",
@@ -13492,6 +16189,15 @@
           "num_cores": {
             "type": "integer",
             "description": "Number of CPU cores available to this process (cgroup-aware)",
+            "minimum": 0
+          },
+          "process_memory": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Resident memory of the strom process in bytes (if available)",
             "minimum": 0
           },
           "timestamp": {
@@ -14290,6 +16996,70 @@
         ],
         "description": "A persistent video effect (\"look\") applied to a vision mixer input or to\nthe PGM master output.\n\nJSON encoding is internally tagged on `type`:\n`{\"type\": \"pixelate\", \"block_size\": 24.0}`.\n\nAll numeric parameters are clamped server-side (see [`VideoEffect::sanitized`]);\ncolors are `#RRGGBB` hex strings."
       },
+      "VisionMixerInputInfo": {
+        "type": "object",
+        "description": "One input of a vision mixer, as the inputs endpoint lists it.",
+        "required": [
+          "index",
+          "label"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "label": {
+            "type": "string",
+            "description": "Multiview label."
+          },
+          "source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DynamicInputSource",
+                "description": "`None` for a static input (fed by a flow link); the source of a\ndynamic one."
+              }
+            ]
+          }
+        }
+      },
+      "VisionMixerInputs": {
+        "type": "object",
+        "description": "The inputs of a running vision mixer.",
+        "required": [
+          "capacity",
+          "num_static",
+          "inputs"
+        ],
+        "properties": {
+          "capacity": {
+            "type": "integer",
+            "description": "Number of input slots (`max_inputs`).",
+            "minimum": 0
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VisionMixerInputInfo"
+            },
+            "description": "Every input the mixer has, ascending by index."
+          },
+          "num_static": {
+            "type": "integer",
+            "description": "Static inputs (`num_inputs`): indices below this cannot be removed.",
+            "minimum": 0
+          },
+          "unrestored": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DynamicInput"
+            },
+            "description": "Stored dynamic inputs that failed to build when the flow started\n(GStreamer refused them). They stay stored and are tried\nagain at the next start; removing one drops it, adding an input at\nits index replaces it."
+          }
+        }
+      },
       "VisionMixerState": {
         "type": "object",
         "description": "Current runtime state of a vision mixer block.\n\nThis is the snapshot a client uses to reconcile on (re)connect when WS\nevents have not yet arrived. Static config (input count, labels, DSK\ncount) is *not* included — that lives on the block resource itself.",
@@ -14300,6 +17070,14 @@
           "pips"
         ],
         "properties": {
+          "active_inputs": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "The inputs the mixer has, by index, ascending: the static ones and\nthe dynamic ones added at runtime. Per-input lists above are indexed\nby input index and cover every slot (`max_inputs`)."
+          },
           "dsk_enabled": {
             "type": "array",
             "items": {
@@ -14590,6 +17368,30 @@
             "description": "Border width in PGM canvas pixels, drawn outward from the box edge.\nEvery render target scales it by `region_width / pgm_width`, so the\nborder looks proportionally identical on PGM, the PVW big display and\nthe PiP thumbnails regardless of resolution."
           }
         }
+      },
+      "ZoneLevelRequest": {
+        "type": "object",
+        "description": "Set a zone's level and mute, faded over `duration_ms`.",
+        "properties": {
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gain_db": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "mute": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
       }
     }
   },
@@ -14649,6 +17451,10 @@
     {
       "name": "media_player",
       "description": "Media player control endpoints"
+    },
+    {
+      "name": "show_playback",
+      "description": "Sounds in the zones and pictures on the stages of a Show Playback block"
     },
     {
       "name": "probes",

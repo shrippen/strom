@@ -19,7 +19,7 @@ fn vision_mixer_definition() -> BlockDefinition {
             name: "compositor_preference".to_string(),
             label: "Backend".to_string(),
             description:
-                "Compositor backend: Auto (GPU first, fallback to CPU), GPU Only, or CPU Only"
+                "Compositor backend: Auto (GPU first, fallback to CPU), GPU Only, CUDA (NVIDIA), or CPU Only"
                     .to_string(),
             property_type: PropertyType::Enum {
                 values: vec![
@@ -30,6 +30,10 @@ fn vision_mixer_definition() -> BlockDefinition {
                     EnumValue {
                         value: "gpu".to_string(),
                         label: Some("GPU Only (OpenGL)".to_string()),
+                    },
+                    EnumValue {
+                        value: "cuda".to_string(),
+                        label: Some("CUDA (NVIDIA)".to_string()),
                     },
                     EnumValue {
                         value: "cpu".to_string(),
@@ -51,14 +55,37 @@ fn vision_mixer_definition() -> BlockDefinition {
             name: "num_inputs".to_string(),
             label: "Number of Inputs".to_string(),
             description: format!(
-                "Number of video inputs ({}-{})",
-                MIN_NUM_INPUTS, MAX_NUM_INPUTS
+                "Number of video inputs built with the flow ({}-{}; {} with free input slots)",
+                MIN_NUM_INPUTS,
+                MAX_NUM_INPUTS,
+                strom_types::vision_mixer::MIN_NUM_INPUTS_WITH_FREE_SLOTS
             ),
             property_type: PropertyType::UInt,
             default_value: Some(PropertyValue::UInt(DEFAULT_NUM_INPUTS as u64)),
             mapping: PropertyMapping {
                 element_id: "_block".to_string(),
                 property_name: "num_inputs".to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        // Input slots for dynamic inputs
+        ExposedProperty {
+            name: strom_types::vision_mixer::MAX_INPUTS_PROPERTY.to_string(),
+            label: "Input Slots".to_string(),
+            description: format!(
+                "Input slots, for inputs added while the flow runs (CPU and CUDA \
+                 backends; with Auto and Shader FX off, free slots pick CUDA or CPU \
+                 over OpenGL; the API's inputs endpoint adds them). 0 = no free \
+                 slots, else at least Number of Inputs, at most {}.",
+                strom_types::vision_mixer::MAX_INPUT_CAPACITY
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::MAX_INPUTS_PROPERTY.to_string(),
                 transform: None,
             },
             live: false,
@@ -155,6 +182,8 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Output start time
+        crate::blocks::builtin::start_time::start_time_property(),
         // Min upstream latency
         ExposedProperty {
             name: "min_upstream_latency".to_string(),
@@ -311,11 +340,137 @@ fn vision_mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Preview output
+        ExposedProperty {
+            name: strom_types::vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY.to_string(),
+            label: "Preview Output".to_string(),
+            description: "Add a preview output (PVW) at program size: what the multiview's preview shows, an input or a PiP, without labels and tallies. Costs one more compositor at program size.".to_string(),
+            property_type: PropertyType::Bool,
+            default_value: Some(PropertyValue::Bool(false)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        // Tile output
+        ExposedProperty {
+            name: strom_types::vision_mixer::ENABLE_TILES_OUT_PROPERTY.to_string(),
+            label: "Tile Output".to_string(),
+            description: "Add a tile output: every input scaled into its own cell of one grid, in input order, for a control surface that shows all inputs live from one stream. Costs one more compositor at the grid's size.".to_string(),
+            property_type: PropertyType::Bool,
+            default_value: Some(PropertyValue::Bool(false)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::ENABLE_TILES_OUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_CELL_PROPERTY.to_string(),
+            label: "Tile Size".to_string(),
+            description: "Size of one cell of the tile output (WIDTHxHEIGHT). Inputs keep their aspect inside it.".to_string(),
+            property_type: PropertyType::String,
+            default_value: Some(PropertyValue::String(
+                strom_types::vision_mixer::DEFAULT_TILES_CELL.to_string(),
+            )),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_CELL_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_COLUMNS_PROPERTY.to_string(),
+            label: "Tile Columns".to_string(),
+            description: "Columns of the tile output; 0 makes the grid square.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_COLUMNS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FIRST_INPUT_PROPERTY.to_string(),
+            label: "First Tile Input".to_string(),
+            description: "The input in the first cell of the tile output; inputs before it get no cell.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FIRST_INPUT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_CELLS_PROPERTY.to_string(),
+            label: "Tile Cells".to_string(),
+            description: "Cells of the tile output; 0 gives every input slot one. Inputs beyond the last cell get none; more cells than slots from the first input on are cut to those.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_CELLS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FRAMERATE_PROPERTY.to_string(),
+            label: "Tile Framerate".to_string(),
+            description: "Frame rate of the tile output; empty follows the multiview.".to_string(),
+            property_type: PropertyType::String,
+            default_value: Some(PropertyValue::String(String::new())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FRAMERATE_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        ExposedProperty {
+            name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+            label: "Tile Pixel Format".to_string(),
+            description: "Pixel format of the tile output. Auto lets GStreamer negotiate."
+                .to_string(),
+            property_type: PropertyType::Enum {
+                values: {
+                    let mut v = vec![EnumValue {
+                        value: String::new(),
+                        label: Some("Auto".to_string()),
+                    }];
+                    v.extend(common_video_pixel_format_enum_values(false));
+                    v
+                },
+            },
+            default_value: Some(PropertyValue::String(String::new())),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::vision_mixer::TILES_FORMAT_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Stinger input
         ExposedProperty {
             name: strom_types::stinger::ENABLE_STINGER_PROPERTY.to_string(),
             label: "Stinger Input".to_string(),
-            description: "Add a stinger input: wire a Media Player with Stinger Clip Source turned on into it, and take stingers from the vision mixer panel. Classic stingers run on both backends; track-matte and mask-only stingers need the GPU backend and play as classic on the CPU one.".to_string(),
+            description: "Add a stinger input: wire a Media Player with Stinger Clip Source turned on into it, and take stingers from the vision mixer panel. Classic stingers run on every mixer (CPU, OpenGL, CUDA); track-matte and mask-only stingers need the OpenGL mixer and play as classic on the CPU and CUDA ones.".to_string(),
             property_type: PropertyType::Bool,
             default_value: Some(PropertyValue::Bool(false)),
             mapping: PropertyMapping {
@@ -360,7 +515,7 @@ fn vision_mixer_definition() -> BlockDefinition {
         ExposedProperty {
             name: "num_dsk_inputs".to_string(),
             label: "DSK Inputs".to_string(),
-            description: "Number of Downstream Keyer inputs for graphics overlay (0-4)".to_string(),
+            description: "Number of Downstream Keyer inputs for graphics overlay (0-9)".to_string(),
             property_type: PropertyType::Enum {
                 values: vec![
                     EnumValue {
@@ -382,6 +537,26 @@ fn vision_mixer_definition() -> BlockDefinition {
                     EnumValue {
                         value: "4".to_string(),
                         label: Some("4 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "5".to_string(),
+                        label: Some("5 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "6".to_string(),
+                        label: Some("6 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "7".to_string(),
+                        label: Some("7 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "8".to_string(),
+                        label: Some("8 DSK".to_string()),
+                    },
+                    EnumValue {
+                        value: "9".to_string(),
+                        label: Some("9 DSK".to_string()),
                     },
                 ],
             },

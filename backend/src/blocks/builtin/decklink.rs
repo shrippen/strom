@@ -6,15 +6,18 @@
 //! - **DeckLink Input** — always creates `decklinkvideosrc` because the plugin
 //!   requires it for `decklinkaudiosrc` to operate on the same device. In
 //!   `audio` mode the video src is drained internally to a `fakesink`.
-//! - **DeckLink Output** — always creates `decklinkvideosink` for the mirrored
-//!   constraint on the playback side. In `audio` mode the videosink is fed
-//!   internally by a `videotestsrc` (black, 1920x1080@25 UYVY) so it can reach
-//!   PLAYING.
+//! - **DeckLink Output** — `decklink2sink` from GStreamer's decklink2 plugin
+//!   (GStreamer 1.30). It takes sound only as part of the picture, so with
+//!   sound a `decklink2combiner` puts both together. In `audio` mode black
+//!   frames (`videotestsrc`, 1920x1080@25 UYVY) carry the sound.
 //!
 //! No format conversion elements are inserted on either side — peer blocks must
 //! accept (input) or deliver (output) the card's native pixel/audio formats.
 //!
-//! Uses GStreamer's DeckLink plugin (gst-plugins-bad) for hardware integration.
+//! The input uses GStreamer's decklink plugin, the output its decklink2
+//! plugin (both gst-plugins-bad). The old `decklinkvideosink` shows every
+//! frame late once an output starts a second time in the same process
+//! (GStreamer work item 5391); decklink2 replaces it.
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
 use gstreamer as gst;
@@ -22,6 +25,8 @@ use gstreamer::prelude::*;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use strom_types::{
     block::{StreamMode, *},
     element::ElementPadRef,
@@ -259,18 +264,167 @@ impl BlockBuilder for DeckLinkInputBuilder {
 
 /// DeckLink Output block builder.
 ///
-/// Combined video + audio playback. The `stream_mode` property controls which pads
-/// are exposed (`audio_video`, `video`, `audio`). `decklinkvideosink` is always
-/// created internally — required by the DeckLink GStreamer plugin even when only
-/// audio is sent externally. In audio-only mode an internal `videotestsrc` (black,
-/// 1920x1080@25 UYVY) drives the videosink so the pipeline can reach PLAYING.
+/// Combined video + audio playback through `decklink2sink`. The `stream_mode`
+/// property controls which pads are exposed (`audio_video`, `video`, `audio`).
+/// The sink takes sound only attached to the frames, so with sound both go
+/// through a `decklink2combiner`; in audio-only mode an internal
+/// `videotestsrc` (black, 1920x1080@25 UYVY) gives the sound its frames.
 pub struct DeckLinkOutputBuilder;
 
-/// Internal video mode used to drive `decklinkvideosink` when only audio is exposed.
+/// GStreamer's own default for a sink's processing deadline.
+const DEFAULT_PROCESSING_DEADLINE_MS: u64 = 20;
+/// More lead time than this only delays the picture.
+const MAX_PROCESSING_DEADLINE_MS: u64 = 1000;
+
+/// GStreamer's own preroll for decklink2sink: frames queued on the
+/// card before playback starts, and so the picture's delay.
+const DEFAULT_BUFFERED_FRAMES: u64 = 7;
+/// Fewer frames leave the card nothing to bridge a late one with.
+const MIN_BUFFERED_FRAMES: u64 = 2;
+/// Two below the sink's `max-buffered-frames` (14), past which it
+/// drops frames: room for two that come close together.
+const MAX_BUFFERED_FRAMES: u64 = 12;
+/// The sink's default `min-buffered-frames`: at that many frames left
+/// it starts repeating.
+const DEFAULT_REPEAT_BELOW: u64 = 3;
+
+/// Internal video mode used to carry the sound when only audio is exposed.
 /// Lowest broadcast-quality progressive mode supported by virtually all DeckLink
 /// cards; the actual SDI output is irrelevant in this mode (just black frames).
 const AUDIO_ONLY_INTERNAL_MODE: &str = "1080p25";
 const AUDIO_ONLY_INTERNAL_FORMAT: &str = "8bit-yuv";
+
+/// Element ids inside the output block.
+const OUTPUT_SINK: &str = "decklink2sink";
+const OUTPUT_COMBINER: &str = "decklink2combiner";
+/// Mixer in front of the combiner's sound: the block's sound and silence.
+const OUTPUT_SOUND: &str = "sound";
+/// Samples per silence buffer: 10 ms at 48 kHz. The mixer's output
+/// buffers and its latency follow the smallest input buffer.
+const SILENCE_SAMPLES: i32 = 480;
+
+/// How long after the first frame the silence waits for the sound's
+/// caps before it starts on its own.
+const SILENCE_WAIT_MS: u64 = 500;
+
+/// Format of the sound at the combiner: the card takes S16LE or S32LE,
+/// and the mixer would bring anything else (F32LE) down to S16LE.
+const OUTPUT_SOUND_FORMAT: &str = "S32LE";
+
+/// Starts `silence` (through its capsfilter `caps`) in the caps of the
+/// first sound on `mixer`'s `sink_0`: format, rate and channels. The
+/// mixer fixes its output by those; later format changes it converts,
+/// later channel or rate changes fail (the card would refuse them too).
+/// Has the sound no caps `SILENCE_WAIT_MS` after the combiner's first
+/// frame (pad not linked, or a source that never sends), the silence
+/// starts on its own in what the sound's source offers, else in two
+/// channels: a live output must not freeze without a word.
+fn follow_the_sound(
+    mixer: &gst::Element,
+    combiner: &gst::Element,
+    silence: &gst::Element,
+    caps: &gst::Element,
+) {
+    let (Some(sound), Some(picture)) = (mixer.static_pad("sink_0"), combiner.static_pad("video"))
+    else {
+        return;
+    };
+    let started = Arc::new(AtomicBool::new(false));
+    let start = {
+        let silence = silence.downgrade();
+        let caps = caps.downgrade();
+        move |with: gst::Caps| {
+            let (Some(silence), Some(filter)) = (silence.upgrade(), caps.upgrade()) else {
+                return;
+            };
+            filter.set_property("caps", with);
+            if !started.swap(true, Ordering::SeqCst) {
+                silence.set_locked_state(false);
+                silence.call_async(|s| {
+                    let _ = s.sync_state_with_parent();
+                });
+            }
+        }
+    };
+    let on_caps = start.clone();
+    sound.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data {
+            if let gst::EventView::Caps(c) = event.view() {
+                on_caps(c.caps_owned());
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+    let combiner = combiner.downgrade();
+    let sound = sound.downgrade();
+    picture.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        let Some(clock) = combiner.upgrade().and_then(|c| c.clock()) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let at = clock.time() + gst::ClockTime::from_mseconds(SILENCE_WAIT_MS);
+        let sound = sound.clone();
+        let start = start.clone();
+        let _ = clock.new_single_shot_id(at).wait_async(move |_, _, _| {
+            let Some(sound) = sound.upgrade() else {
+                return;
+            };
+            if sound.current_caps().is_none() {
+                start(offered_caps(&sound));
+            }
+        });
+        gst::PadProbeReturn::Remove
+    });
+}
+
+/// Caps for silence on `pad` that has none: S32LE at 48 kHz in what
+/// its peer offers, two channels where it lets us choose.
+fn offered_caps(pad: &gst::Pad) -> gst::Caps {
+    let raw = |channels: Option<i32>| {
+        let mut caps = gst::Caps::builder("audio/x-raw")
+            .field("format", OUTPUT_SOUND_FORMAT)
+            .field("rate", 48000i32)
+            .field("layout", "interleaved");
+        if let Some(channels) = channels {
+            caps = caps.field("channels", channels);
+        }
+        caps.build()
+    };
+    let offered = pad
+        .peer()
+        .map(|peer| peer.query_caps(None))
+        .unwrap_or_else(gst::Caps::new_any);
+    for wanted in [raw(Some(2)), raw(None)] {
+        let mut caps = offered.intersect(&wanted);
+        if !caps.is_empty() {
+            caps.fixate();
+            return caps;
+        }
+    }
+    raw(Some(2))
+}
+
+/// `factory`'s element named `name`; for a missing one an error that says
+/// where the plugin comes from.
+fn card_element(factory: &str, name: &str) -> Result<gst::Element, BlockBuildError> {
+    if gst::ElementFactory::find(factory).is_none() {
+        return Err(BlockBuildError::ElementCreation(format!(
+            "{factory} not found: the DeckLink output needs GStreamer's decklink2 plugin \
+             (GStreamer 1.30 or later, or built from GStreamer main and put on GST_PLUGIN_PATH)"
+        )));
+    }
+    gst::ElementFactory::make(factory)
+        .name(name)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("{factory}: {e}")))
+}
+
+/// Whether `element`'s enum property `property` has the value `nick`.
+fn enum_has_nick(element: &gst::Element, property: &str, nick: &str) -> bool {
+    element
+        .find_property(property)
+        .and_then(|pspec| gst::glib::EnumClass::with_type(pspec.value_type()))
+        .is_some_and(|class| class.value_by_nick(nick).is_some())
+}
 
 impl BlockBuilder for DeckLinkOutputBuilder {
     fn get_external_pads(
@@ -287,6 +441,11 @@ impl BlockBuilder for DeckLinkOutputBuilder {
 
         let mut inputs = Vec::new();
         if mode.has_video() {
+            let (element, pad) = if mode.has_audio() {
+                (OUTPUT_COMBINER, "video")
+            } else {
+                (OUTPUT_SINK, "sink")
+            };
             inputs.push(ExternalPad {
                 label: if mode.has_audio() {
                     Some("V".to_string())
@@ -295,8 +454,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 },
                 name: "video_in".to_string(),
                 media_type: MediaType::Video,
-                internal_element_id: "decklinkvideosink".to_string(),
-                internal_pad_name: "sink".to_string(),
+                internal_element_id: element.to_string(),
+                internal_pad_name: pad.to_string(),
             });
         }
         if mode.has_audio() {
@@ -308,8 +467,8 @@ impl BlockBuilder for DeckLinkOutputBuilder {
                 },
                 name: "audio_in".to_string(),
                 media_type: MediaType::Audio,
-                internal_element_id: "decklinkaudiosink".to_string(),
-                internal_pad_name: "sink".to_string(),
+                internal_element_id: OUTPUT_SOUND.to_string(),
+                internal_pad_name: "sink_0".to_string(),
             });
         }
 
@@ -344,7 +503,7 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             })
             .unwrap_or(0);
 
-        // In audio-only mode the videosink runs in a fixed internal mode regardless
+        // In audio-only mode the sink runs in a fixed internal mode regardless
         // of the user's `mode`/`video_format` settings — those only apply when the
         // video pad is actually wired up.
         let (video_mode, video_format) = if stream_mode.has_video() {
@@ -367,79 +526,180 @@ impl BlockBuilder for DeckLinkOutputBuilder {
             (AUDIO_ONLY_INTERNAL_MODE, AUDIO_ONLY_INTERNAL_FORMAT)
         };
 
-        let videosink_id = format!("{}:decklinkvideosink", instance_id);
-        let videosink = gst::ElementFactory::make("decklinkvideosink")
-            .name(&videosink_id)
-            .property("device-number", device_number)
-            .property_from_str("mode", video_mode)
-            .property_from_str("video-format", video_format)
-            .build()
-            .map_err(|e| BlockBuildError::ElementCreation(format!("decklinkvideosink: {}", e)))?;
+        let processing_deadline = gst::ClockTime::from_mseconds(
+            properties
+                .get("processing_deadline_ms")
+                .and_then(|v| match v {
+                    PropertyValue::UInt(u) => Some(*u),
+                    PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
+                    _ => None,
+                })
+                .unwrap_or(DEFAULT_PROCESSING_DEADLINE_MS)
+                .min(MAX_PROCESSING_DEADLINE_MS),
+        );
 
-        let mut elements: Vec<(String, gst::Element)> = vec![(videosink_id.clone(), videosink)];
+        let sink_id = format!("{}:{}", instance_id, OUTPUT_SINK);
+        let sink = card_element(OUTPUT_SINK, &sink_id)?;
+        sink.set_property("device-number", device_number);
+        for (property, value) in [("mode", video_mode), ("video-format", video_format)] {
+            if !enum_has_nick(&sink, property, value) {
+                return Err(BlockBuildError::ElementCreation(format!(
+                    "{OUTPUT_SINK} has no {property} \"{value}\""
+                )));
+            }
+            sink.set_property_from_str(property, value);
+        }
+        sink.set_property("processing-deadline", processing_deadline.nseconds());
+
+        // The card's queue sets the picture's delay; the sink repeats a
+        // frame once only `min-buffered-frames` are left, two below the
+        // queue (between 1 and its default 3).
+        let buffered = properties
+            .get("buffered_frames")
+            .and_then(|v| match v {
+                PropertyValue::UInt(u) => Some(*u),
+                PropertyValue::Int(i) if *i >= 0 => Some(*i as u64),
+                _ => None,
+            })
+            .unwrap_or(DEFAULT_BUFFERED_FRAMES)
+            .clamp(MIN_BUFFERED_FRAMES, MAX_BUFFERED_FRAMES);
+        let repeat_below = (buffered - 2).clamp(1, DEFAULT_REPEAT_BELOW);
+        sink.set_property("n-preroll-frames", buffered as i32);
+        sink.set_property("min-buffered-frames", repeat_below as i32);
+
+        let mut elements: Vec<(String, gst::Element)> = vec![(sink_id.clone(), sink)];
         let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
 
-        // Audio-only: feed videosink with black frames so it can reach PLAYING.
-        // (decklinkaudiosink requires decklinkvideosink to be running on the same device.)
-        if !stream_mode.has_video() {
-            let testsrc_id = format!("{}:video_filler", instance_id);
-            let capsfilter_id = format!("{}:video_filler_caps", instance_id);
-
-            let testsrc = gst::ElementFactory::make("videotestsrc")
-                .name(&testsrc_id)
-                .property_from_str("pattern", "black")
-                .property("is-live", true)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("videotestsrc (filler): {}", e))
-                })?;
-
-            // Caps must match the videosink's hardcoded internal mode.
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", "UYVY")
-                .field("width", 1920i32)
-                .field("height", 1080i32)
-                .field("framerate", gst::Fraction::new(25, 1))
-                .field("interlace-mode", "progressive")
-                .build();
-            let capsfilter = gst::ElementFactory::make("capsfilter")
-                .name(&capsfilter_id)
-                .property("caps", &caps)
-                .build()
-                .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("capsfilter (filler): {}", e))
-                })?;
-
-            internal_links.push((
-                ElementPadRef::pad(&testsrc_id, "src"),
-                ElementPadRef::pad(&capsfilter_id, "sink"),
-            ));
-            internal_links.push((
-                ElementPadRef::pad(&capsfilter_id, "src"),
-                ElementPadRef::pad(&videosink_id, "sink"),
-            ));
-            elements.push((testsrc_id, testsrc));
-            elements.push((capsfilter_id, capsfilter));
-        }
-
         if stream_mode.has_audio() {
-            let audiosink_id = format!("{}:decklinkaudiosink", instance_id);
-            let audiosink = gst::ElementFactory::make("decklinkaudiosink")
-                .name(&audiosink_id)
-                .property("device-number", device_number)
+            let combiner_id = format!("{}:{}", instance_id, OUTPUT_COMBINER);
+            let combiner = card_element(OUTPUT_COMBINER, &combiner_id)?;
+            internal_links.push((
+                ElementPadRef::pad(&combiner_id, "src"),
+                ElementPadRef::pad(&sink_id, "sink"),
+            ));
+            elements.push((combiner_id.clone(), combiner.clone()));
+
+            // The combiner waits for sound for every frame: sound that
+            // ends or pauses would hold the picture. A mixer with live
+            // silence keeps it going (and fills gaps); it starts at the
+            // first buffer, as the flow's running time may be hours.
+            let sound_id = format!("{}:{}", instance_id, OUTPUT_SOUND);
+            let sound = gst::ElementFactory::make("audiomixer")
+                .name(&sound_id)
+                .property_from_str("start-time-selection", "first")
+                .build()
+                .map_err(|e| BlockBuildError::ElementCreation(format!("audiomixer: {e}")))?;
+            for pad in ["sink_0", "sink_1"] {
+                sound.request_pad_simple("sink_%u").ok_or_else(|| {
+                    BlockBuildError::ElementCreation(format!("audiomixer: no {pad}"))
+                })?;
+            }
+            // Silence in the first sound's caps (format, rate,
+            // channels), see `follow_the_sound`.
+            let silence_id = format!("{}:silence", instance_id);
+            let silence = gst::ElementFactory::make("audiotestsrc")
+                .name(&silence_id)
+                .property("is-live", true)
+                .property("do-timestamp", true)
+                .property("samplesperbuffer", SILENCE_SAMPLES)
+                .property_from_str("wave", "silence")
                 .build()
                 .map_err(|e| {
-                    BlockBuildError::ElementCreation(format!("decklinkaudiosink: {}", e))
+                    BlockBuildError::ElementCreation(format!("audiotestsrc (silence): {e}"))
                 })?;
-            elements.push((audiosink_id, audiosink));
+            silence.set_locked_state(true);
+            let silence_caps_id = format!("{}:silence_caps", instance_id);
+            let silence_caps = gst::ElementFactory::make("capsfilter")
+                .name(&silence_caps_id)
+                .build()
+                .map_err(|e| {
+                    BlockBuildError::ElementCreation(format!("capsfilter (silence): {e}"))
+                })?;
+            follow_the_sound(&sound, &combiner, &silence, &silence_caps);
+            internal_links.push((
+                ElementPadRef::pad(&silence_id, "src"),
+                ElementPadRef::pad(&silence_caps_id, "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(&silence_caps_id, "src"),
+                ElementPadRef::pad(&sound_id, "sink_1"),
+            ));
+            let sound_format_id = format!("{}:sound_format", instance_id);
+            let sound_format = gst::ElementFactory::make("capsfilter")
+                .name(&sound_format_id)
+                .property(
+                    "caps",
+                    gst::Caps::builder("audio/x-raw")
+                        .field("format", OUTPUT_SOUND_FORMAT)
+                        .build(),
+                )
+                .build()
+                .map_err(|e| {
+                    BlockBuildError::ElementCreation(format!("capsfilter (sound format): {e}"))
+                })?;
+            internal_links.push((
+                ElementPadRef::pad(&sound_id, "src"),
+                ElementPadRef::pad(&sound_format_id, "sink"),
+            ));
+            internal_links.push((
+                ElementPadRef::pad(&sound_format_id, "src"),
+                ElementPadRef::pad(&combiner_id, "audio"),
+            ));
+            elements.push((sound_id, sound));
+            elements.push((sound_format_id, sound_format));
+            elements.push((silence_id, silence));
+            elements.push((silence_caps_id, silence_caps));
+
+            // Audio-only: black frames carry the sound.
+            if !stream_mode.has_video() {
+                let testsrc_id = format!("{}:video_filler", instance_id);
+                let capsfilter_id = format!("{}:video_filler_caps", instance_id);
+
+                let testsrc = gst::ElementFactory::make("videotestsrc")
+                    .name(&testsrc_id)
+                    .property_from_str("pattern", "black")
+                    .property("is-live", true)
+                    .build()
+                    .map_err(|e| {
+                        BlockBuildError::ElementCreation(format!("videotestsrc (filler): {}", e))
+                    })?;
+
+                // Caps must match the sink's internal mode.
+                let caps = gst::Caps::builder("video/x-raw")
+                    .field("format", "UYVY")
+                    .field("width", 1920i32)
+                    .field("height", 1080i32)
+                    .field("framerate", gst::Fraction::new(25, 1))
+                    .field("interlace-mode", "progressive")
+                    .build();
+                let capsfilter = gst::ElementFactory::make("capsfilter")
+                    .name(&capsfilter_id)
+                    .property("caps", &caps)
+                    .build()
+                    .map_err(|e| {
+                        BlockBuildError::ElementCreation(format!("capsfilter (filler): {}", e))
+                    })?;
+
+                internal_links.push((
+                    ElementPadRef::pad(&testsrc_id, "src"),
+                    ElementPadRef::pad(&capsfilter_id, "sink"),
+                ));
+                internal_links.push((
+                    ElementPadRef::pad(&capsfilter_id, "src"),
+                    ElementPadRef::pad(&combiner_id, "video"),
+                ));
+                elements.push((testsrc_id, testsrc));
+                elements.push((capsfilter_id, capsfilter));
+            }
         }
 
         info!(
-            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}",
+            "DeckLink Output configured: device={}, stream_mode={}, mode={}, video-format={}, lead time={}",
             device_number,
             stream_mode.as_str(),
             video_mode,
-            video_format
+            video_format,
+            processing_deadline
         );
 
         Ok(BlockBuildResult {
@@ -825,13 +1085,13 @@ fn decklink_output_definition() -> BlockDefinition {
     BlockDefinition {
         id: "builtin.decklink_output".to_string(),
         name: "DeckLink Output".to_string(),
-        description: "Outputs video and/or audio to a Blackmagic DeckLink SDI/HDMI card. Accepts the card's native pixel and audio formats only — no internal conversion. In audio-only mode the videosink is internally driven with black frames so it can reach PLAYING.".to_string(),
+        description: "Outputs video and/or audio to a Blackmagic DeckLink SDI/HDMI card (decklink2sink, GStreamer 1.30). Accepts the card's native pixel and audio formats only — no internal conversion. In audio-only mode black frames carry the sound.".to_string(),
         category: "Outputs".to_string(),
         exposed_properties: vec![
             ExposedProperty {
                 name: "stream_mode".to_string(),
                 label: "Stream Mode".to_string(),
-                description: "Which media tracks to expose: video only, audio only, or both. (decklinkvideosink is always created internally — required by the DeckLink plugin even in audio-only mode.)".to_string(),
+                description: "Which media tracks to expose: video only, audio only, or both. (The card takes sound only with frames: in audio-only mode black frames carry it.)".to_string(),
                 property_type: PropertyType::Enum {
                     values: vec![
                         EnumValue {
@@ -893,12 +1153,49 @@ fn decklink_output_definition() -> BlockDefinition {
                 label: "Video Format".to_string(),
                 description: "Pixel format the card expects. Native formats only — no conversion is performed; upstream must deliver this exact format. Ignored in audio-only mode.".to_string(),
                 property_type: PropertyType::Enum {
-                    values: decklink_video_format_enum_values(),
+                    values: decklink_output_video_format_enum_values(),
                 },
                 default_value: Some(PropertyValue::String("8bit-yuv".to_string())),
                 mapping: PropertyMapping {
                     element_id: "_block".to_string(),
                     property_name: "video_format".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
+                name: "processing_deadline_ms".to_string(),
+                label: "Lead Time (ms)".to_string(),
+                description: "How long before its display time a frame is handed to the \
+                              sink (processing deadline). decklink2sink queues frames on \
+                              the card by its own count, so a frame that comes a little \
+                              late waits there; GStreamer's default is enough."
+                    .to_string(),
+                property_type: PropertyType::UInt,
+                default_value: Some(PropertyValue::UInt(DEFAULT_PROCESSING_DEADLINE_MS)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "processing_deadline_ms".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
+                name: "buffered_frames".to_string(),
+                label: "Buffered Frames".to_string(),
+                description: "Frames queued on the card before playback starts (2-12). \
+                              Each frame adds one frame of delay; fewer frames leave \
+                              less room for a late one, which the card then repeats. \
+                              With 2 even small jitter repeats frames. GStreamer's \
+                              default is 7."
+                    .to_string(),
+                property_type: PropertyType::UInt,
+                default_value: Some(PropertyValue::UInt(DEFAULT_BUFFERED_FRAMES)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "buffered_frames".to_string(),
                     transform: None,
                 },
                 live: false,
@@ -913,15 +1210,15 @@ fn decklink_output_definition() -> BlockDefinition {
                     label: Some("V".to_string()),
                     name: "video_in".to_string(),
                     media_type: MediaType::Video,
-                    internal_element_id: "decklinkvideosink".to_string(),
-                    internal_pad_name: "sink".to_string(),
+                    internal_element_id: OUTPUT_COMBINER.to_string(),
+                    internal_pad_name: "video".to_string(),
                 },
                 ExternalPad {
                     label: Some("A".to_string()),
                     name: "audio_in".to_string(),
                     media_type: MediaType::Audio,
-                    internal_element_id: "decklinkaudiosink".to_string(),
-                    internal_pad_name: "sink".to_string(),
+                    internal_element_id: OUTPUT_SOUND.to_string(),
+                    internal_pad_name: "sink_0".to_string(),
                 },
             ],
             outputs: vec![],
@@ -933,5 +1230,496 @@ fn decklink_output_definition() -> BlockDefinition {
             height: Some(1.5),
             ..Default::default()
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(properties: &[(&str, PropertyValue)]) -> HashMap<String, PropertyValue> {
+        properties
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn mode(stream_mode: &str) -> (&'static str, PropertyValue) {
+        (
+            "stream_mode",
+            PropertyValue::String(stream_mode.to_string()),
+        )
+    }
+
+    /// The output block, or `None` (the test passes) where GStreamer has
+    /// no decklink2 plugin: it is new in 1.30.
+    fn output(properties: &[(&str, PropertyValue)]) -> Option<BlockBuildResult> {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("decklink2sink").is_none() {
+            eprintln!("skipped: no decklink2 plugin");
+            return None;
+        }
+        Some(
+            DeckLinkOutputBuilder
+                .build(
+                    "out",
+                    &props(properties),
+                    &BlockBuildContext::new(Vec::new(), "all".to_string()),
+                )
+                .expect("DeckLink output block"),
+        )
+    }
+
+    fn element<'a>(result: &'a BlockBuildResult, id: &str) -> &'a gst::Element {
+        result
+            .elements
+            .iter()
+            .find(|(element_id, _)| element_id == id)
+            .map(|(_, element)| element)
+            .unwrap_or_else(|| panic!("no element {id}"))
+    }
+
+    fn deadline_of(result: &BlockBuildResult, id: &str) -> gst::ClockTime {
+        gst::ClockTime::from_nseconds(element(result, id).property::<u64>("processing-deadline"))
+    }
+
+    fn targets(pads: &ExternalPads) -> Vec<(String, String, String)> {
+        pads.inputs
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.internal_element_id.clone(),
+                    p.internal_pad_name.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn has_link(result: &BlockBuildResult, from: (&str, &str), to: (&str, &str)) -> bool {
+        result.internal_links.iter().any(|(a, b)| {
+            a.element_id == from.0
+                && a.pad_name.as_deref() == Some(from.1)
+                && b.element_id == to.0
+                && b.pad_name.as_deref() == Some(to.1)
+        })
+    }
+
+    // decklink2sink takes sound only as part of the picture: with sound,
+    // both go into the combiner (the sound through a mixer that fills
+    // gaps with silence); picture alone goes straight to the sink.
+    #[test]
+    fn sound_meets_the_picture_in_the_combiner() {
+        let both = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("audio_video")]))
+            .unwrap();
+        assert_eq!(
+            targets(&both),
+            vec![
+                (
+                    "video_in".into(),
+                    "decklink2combiner".into(),
+                    "video".into()
+                ),
+                ("audio_in".into(), "sound".into(), "sink_0".into()),
+            ]
+        );
+        let sound = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("audio")]))
+            .unwrap();
+        assert_eq!(
+            targets(&sound),
+            vec![("audio_in".into(), "sound".into(), "sink_0".into())]
+        );
+        let picture = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("video")]))
+            .unwrap();
+        assert_eq!(
+            targets(&picture),
+            vec![("video_in".into(), "decklink2sink".into(), "sink".into())]
+        );
+    }
+
+    // The block's elements as the pads above say: the combiner feeds the
+    // sink, and with sound only black frames drive the picture.
+    #[test]
+    fn the_combiner_feeds_the_sink() {
+        let Some(both) = output(&[mode("audio_video")]) else {
+            return;
+        };
+        assert!(has_link(
+            &both,
+            ("out:decklink2combiner", "src"),
+            ("out:decklink2sink", "sink")
+        ));
+        let Some(sound) = output(&[mode("audio")]) else {
+            return;
+        };
+        assert!(has_link(
+            &sound,
+            ("out:video_filler_caps", "src"),
+            ("out:decklink2combiner", "video")
+        ));
+        assert!(has_link(
+            &sound,
+            ("out:decklink2combiner", "src"),
+            ("out:decklink2sink", "sink")
+        ));
+        let Some(picture) = output(&[mode("video")]) else {
+            return;
+        };
+        assert!(picture.internal_links.is_empty());
+        assert_eq!(picture.elements.len(), 1);
+    }
+
+    // The sink takes the device, the mode and the lead time. Without the
+    // property it keeps 20 ms, GStreamer's own default: that half
+    // documents it and guards nothing.
+    #[test]
+    fn the_sink_takes_device_mode_and_lead_time() {
+        let Some(ahead) = output(&[
+            ("device_number", PropertyValue::UInt(3)),
+            ("mode", PropertyValue::String("720p50".into())),
+            ("processing_deadline_ms", PropertyValue::UInt(100)),
+        ]) else {
+            return;
+        };
+        let sink = element(&ahead, "out:decklink2sink");
+        assert_eq!(sink.property::<i32>("device-number"), 3);
+        assert_eq!(enum_nick(sink, "mode"), "720p50");
+        assert_eq!(
+            deadline_of(&ahead, "out:decklink2sink"),
+            gst::ClockTime::from_mseconds(100)
+        );
+
+        let Some(plain) = output(&[]) else {
+            return;
+        };
+        assert_eq!(
+            deadline_of(&plain, "out:decklink2sink"),
+            gst::ClockTime::from_mseconds(20)
+        );
+    }
+
+    fn enum_nick(element: &gst::Element, name: &str) -> String {
+        let value = element.property_value(name);
+        let (_, enum_value) = gst::glib::EnumValue::from_value(&value).unwrap();
+        enum_value.nick().to_string()
+    }
+
+    // A lead time of hours (or u64::MAX ms, which would overflow) is cut
+    // to a second.
+    #[test]
+    fn lead_time_has_a_ceiling() {
+        let Some(huge) = output(&[("processing_deadline_ms", PropertyValue::UInt(u64::MAX))])
+        else {
+            return;
+        };
+        assert_eq!(
+            deadline_of(&huge, "out:decklink2sink"),
+            gst::ClockTime::SECOND
+        );
+    }
+
+    // The card holds as many frames as asked (GStreamer's 7 are 280 ms
+    // at 25p); the sink repeats a frame at two below that, between one
+    // and three left. Out of range is clamped.
+    #[test]
+    fn buffered_frames_set_the_card_queue() {
+        let queue = |frames: Option<u64>| {
+            let properties: Vec<_> = frames
+                .map(|n| ("buffered_frames", PropertyValue::UInt(n)))
+                .into_iter()
+                .collect();
+            output(&properties).map(|result| {
+                let sink = element(&result, "out:decklink2sink");
+                (
+                    sink.property::<i32>("n-preroll-frames"),
+                    sink.property::<i32>("min-buffered-frames"),
+                    sink.property::<i32>("max-buffered-frames"),
+                )
+            })
+        };
+        let Some(default) = queue(None) else {
+            return;
+        };
+        assert_eq!(default, (7, 3, 14));
+        assert_eq!(queue(Some(3)), Some((3, 1, 14)));
+        assert_eq!(queue(Some(0)), Some((2, 1, 14)));
+        assert_eq!(queue(Some(99)), Some((12, 3, 14)));
+    }
+
+    // Without the decklink2 plugin the block fails and says what is
+    // missing and where it comes from.
+    #[test]
+    fn a_missing_plugin_says_what_to_install() {
+        gst::init().unwrap();
+        let Err(BlockBuildError::ElementCreation(message)) =
+            card_element("decklink2nosuchsink", "out:x")
+        else {
+            panic!("an element from nowhere");
+        };
+        assert!(message.contains("decklink2nosuchsink"), "{message}");
+        assert!(message.contains("GStreamer 1.30"), "{message}");
+        assert!(message.contains("GST_PLUGIN_PATH"), "{message}");
+    }
+
+    // Every mode and picture format the block offers exists on
+    // decklink2sink; without the plugin the format list stays as it is.
+    #[test]
+    fn offered_modes_and_formats_exist_on_the_sink() {
+        let definition = decklink_output_definition();
+        let offered = |name: &str| -> Vec<String> {
+            let property = definition
+                .exposed_properties
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap();
+            let PropertyType::Enum { values } = &property.property_type else {
+                panic!("{name} is no enum");
+            };
+            values.iter().map(|v| v.value.clone()).collect()
+        };
+        assert_eq!(
+            offered("video_format"),
+            [
+                "auto",
+                "8bit-yuv",
+                "10bit-yuv",
+                "8bit-argb",
+                "8bit-bgra",
+                "10bit-rgb"
+            ]
+        );
+        gst::init().unwrap();
+        let Some(factory) = gst::ElementFactory::find(OUTPUT_SINK) else {
+            return;
+        };
+        let sink = factory.create().build().unwrap();
+        for (name, property) in [("mode", "mode"), ("video_format", "video-format")] {
+            for value in offered(name) {
+                assert!(
+                    enum_has_nick(&sink, property, &value),
+                    "{OUTPUT_SINK} has no {property} {value}"
+                );
+            }
+        }
+    }
+
+    // A format or mode the sink does not know fails the build; it used to
+    // panic in property_from_str.
+    #[test]
+    fn an_unknown_format_fails_the_build() {
+        gst::init().unwrap();
+        if gst::ElementFactory::find(OUTPUT_SINK).is_none() {
+            return;
+        }
+        for (key, value) in [("video_format", "12bit-rgb"), ("mode", "1080p26")] {
+            let result = DeckLinkOutputBuilder.build(
+                "out",
+                &props(&[(key, PropertyValue::String(value.into()))]),
+                &BlockBuildContext::new(Vec::new(), "all".to_string()),
+            );
+            let Err(BlockBuildError::ElementCreation(message)) = result else {
+                panic!("{key} {value} built");
+            };
+            assert!(message.contains(value), "{message}");
+        }
+    }
+
+    // Without the decklink2 plugin the block fails and says what to
+    // install (runs where GStreamer has no decklink2).
+    #[test]
+    fn without_the_plugin_the_build_says_what_to_install() {
+        gst::init().unwrap();
+        if gst::ElementFactory::find(OUTPUT_SINK).is_some() {
+            return;
+        }
+        let result = DeckLinkOutputBuilder.build(
+            "out",
+            &props(&[]),
+            &BlockBuildContext::new(Vec::new(), "all".to_string()),
+        );
+        let Err(BlockBuildError::ElementCreation(message)) = result else {
+            panic!("built without decklink2");
+        };
+        assert!(message.contains("GStreamer 1.30"), "{message}");
+    }
+
+    /// Raw sound for the tests: `format`, 48 kHz, `channels`
+    /// unpositioned beyond two.
+    fn raw_sound(format: &str, channels: u32) -> String {
+        let mask = if channels > 2 {
+            ",channel-mask=(bitmask)0"
+        } else {
+            ""
+        };
+        format!(
+            "audio/x-raw,format={format},rate=48000,channels={channels},layout=interleaved{mask}"
+        )
+    }
+
+    // Sound that ends (or pauses) must not stop the picture: the
+    // combiner waits for sound for every frame. Sound for half a
+    // second, picture for three seconds at 25 fps. The card gets the
+    // sound in its own format, rate and channels.
+    #[test]
+    fn the_picture_runs_on_when_the_sound_stops() {
+        for channels in [2, 8] {
+            let sound = format!(
+                "audiotestsrc is-live=true num-buffers=50 samplesperbuffer=480 \
+                 ! capsfilter caps={}",
+                raw_sound("S32LE", channels)
+            );
+            let Some((shown, caps)) = play(Some(&sound)) else {
+                return;
+            };
+            assert!(
+                shown >= 60,
+                "{channels} channels: {shown} of 75 frames after the sound stopped"
+            );
+            assert!(caps.contains("format=(string)S32LE"), "{caps}");
+            assert!(
+                caps.contains(&format!("channels=(int){channels}")),
+                "{caps}"
+            );
+            assert!(caps.contains("rate=(int)48000"), "{caps}");
+        }
+    }
+
+    // The card knows only S16LE and S32LE: float sound must not end up
+    // as 16 bits.
+    #[test]
+    fn float_sound_reaches_the_card_in_32_bits() {
+        let sound = format!(
+            "audiotestsrc is-live=true samplesperbuffer=480 ! capsfilter caps={}",
+            raw_sound("F32LE", 2)
+        );
+        let Some((shown, caps)) = play(Some(&sound)) else {
+            return;
+        };
+        assert!(shown >= 60, "{shown} of 75 frames");
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+    }
+
+    // A live output must never freeze silently: with no sound at all
+    // (pad not linked, or linked to a source that never sends) the
+    // silence starts on its own, in the channels the sound's source
+    // offers, else two.
+    #[test]
+    fn the_picture_runs_without_any_sound() {
+        let Some((shown, caps)) = play(None) else {
+            return;
+        };
+        assert!(shown >= 50, "unlinked sound: {shown} of 75 frames");
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+        assert!(caps.contains("channels=(int)2"), "{caps}");
+
+        // A live source that never sends (with a latency, as live
+        // sources have) behind fixed caps in eight channels.
+        let quiet = format!(
+            "appsrc is-live=true format=time min-latency=10000000 ! capsfilter caps={}",
+            raw_sound("S32LE", 8)
+        );
+        let Some((shown, caps)) = play(Some(&quiet)) else {
+            return;
+        };
+        assert!(
+            shown >= 50,
+            "sound without data: {shown} of 75 frames, {caps}"
+        );
+        assert!(caps.contains("format=(string)S32LE"), "{caps}");
+        assert!(caps.contains("channels=(int)8"), "{caps}");
+    }
+
+    /// Plays the block up to the card, with a fakesink in its place: 75
+    /// frames at 25 fps and `sound` (a bin description) on its sound
+    /// pad, if any. The frames that reached the sink and the sound's
+    /// caps at the combiner; `None` without the decklink2 plugin.
+    fn play(sound: Option<&str>) -> Option<(u64, String)> {
+        let block = output(&[mode("audio_video")])?;
+        let pads = DeckLinkOutputBuilder
+            .get_external_pads(&props(&[mode("audio_video")]))
+            .unwrap();
+        let pipeline = gst::Pipeline::new();
+        let sink_id = format!("out:{OUTPUT_SINK}");
+        for (id, element) in &block.elements {
+            if *id != sink_id {
+                pipeline.add(element).unwrap();
+            }
+        }
+        let by_id = |id: &str| {
+            block
+                .elements
+                .iter()
+                .find(|(e, _)| e == id)
+                .map(|(_, e)| e.clone())
+                .unwrap_or_else(|| panic!("no element {id}"))
+        };
+        let pad = |element_id: &str, name: &str| {
+            let element = by_id(element_id);
+            element
+                .static_pad(name)
+                .or_else(|| element.request_pad_simple(name))
+                .unwrap_or_else(|| panic!("no pad {name} on {element_id}"))
+        };
+        let frames = gst::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .build()
+            .unwrap();
+        pipeline.add(&frames).unwrap();
+        for (from, to) in &block.internal_links {
+            let src = pad(&from.element_id, from.pad_name.as_deref().unwrap());
+            let sink = if to.element_id == sink_id {
+                frames.static_pad("sink").unwrap()
+            } else {
+                pad(&to.element_id, to.pad_name.as_deref().unwrap())
+            };
+            src.link(&sink).unwrap();
+        }
+        let picture = gst::parse::bin_from_description(
+            "videotestsrc is-live=true num-buffers=75 \
+             ! capsfilter caps=video/x-raw,format=UYVY,width=1920,height=1080,framerate=25/1",
+            true,
+        )
+        .unwrap();
+        let mut inputs = vec![(picture, "video_in")];
+        if let Some(sound) = sound {
+            inputs.push((
+                gst::parse::bin_from_description(sound, true).unwrap(),
+                "audio_in",
+            ));
+        }
+        for (bin, name) in &inputs {
+            pipeline.add(bin).unwrap();
+            let target = pads.inputs.iter().find(|p| p.name == *name).unwrap();
+            let into = pad(
+                &format!("out:{}", target.internal_element_id),
+                &target.internal_pad_name,
+            );
+            bin.static_pad("src").unwrap().link(&into).unwrap();
+        }
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = count.clone();
+        frames
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let caps = by_id(&format!("out:{OUTPUT_COMBINER}"))
+            .static_pad("audio")
+            .unwrap()
+            .current_caps()
+            .map(|c| c.to_string());
+        pipeline.set_state(gst::State::Null).unwrap();
+        let shown = count.load(std::sync::atomic::Ordering::Relaxed);
+        Some((
+            shown,
+            caps.unwrap_or_else(|| format!("no sound caps at the combiner ({shown} frames)")),
+        ))
     }
 }

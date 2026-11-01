@@ -12,7 +12,18 @@
 //!            → capsfilter(GL,RGBA,WxH) → gldownload
 //!            → capsfilter(RGBA,WxH) → appsink
 //!
-//! System-memory path (CUDA memory gets a cudadownload in front):
+//! CUDA path (JPEG on the GPU; without `nvjpegenc` like GL, via cudadownload):
+//! [tee] ─┬─ (passthrough)
+//!         └─ queue ─[pad probe: rate limit]─→ cudaconvertscale
+//!            → capsfilter(CUDA,NV12,WxH) → nvjpegenc
+//!            → capsfilter(image/jpeg) → appsink
+//!
+//! VA path (AMD/Intel decoders; unverified, no VA hardware tested):
+//! [tee] ─┬─ (passthrough)
+//!         └─ queue ─[pad probe: rate limit]─→ vapostproc
+//!            → capsfilter(RGBA,WxH) → appsink
+//!
+//! System-memory path:
 //! [tee] ─┬─ (passthrough)
 //!         └─ queue ─[pad probe: rate limit]─→ [cudadownload] → videoconvertscale
 //!            → capsfilter(RGBA,WxH) → appsink
@@ -41,6 +52,49 @@ use tracing::{debug, error, warn};
 
 use crate::gst::thumbnail::ThumbnailError;
 use crate::gst::video_adapt::{self, Adapter, Consumer};
+
+const GL_MEMORY_FEATURE: &str = "memory:GLMemory";
+const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
+const VA_MEMORY_FEATURE: &str = "memory:VAMemory";
+
+/// Where the tapped frames live; picks the branch's scaler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapMemory {
+    System,
+    Gl,
+    Cuda,
+    Va,
+}
+
+impl TapMemory {
+    fn of(caps: &gst::CapsRef) -> Self {
+        let Some(features) = caps.features(0) else {
+            return Self::System;
+        };
+        if features.contains(GL_MEMORY_FEATURE) {
+            return Self::Gl;
+        }
+        if features.contains(CUDA_MEMORY_FEATURE) {
+            return Self::Cuda;
+        }
+        if features.contains(VA_MEMORY_FEATURE) {
+            return Self::Va;
+        }
+        Self::System
+    }
+}
+
+/// What the branch hands to the appsink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapOutput {
+    /// Scaled RGBA frame, JPEG-encoded in the appsink callback.
+    Rgba,
+    /// Finished JPEG from a GPU encoder.
+    Jpeg,
+}
+
+/// Caps of GPU-encoded thumbnails.
+const JPEG_CAPS: &str = "image/jpeg";
 
 /// Configuration for a thumbnail tap.
 #[derive(Debug, Clone)]
@@ -228,11 +282,20 @@ impl ThumbnailTap {
         // the CPU cannot read is refused here, before anything is attached.
         // A branch that cannot take the tee's caps would only have its link
         // refused.
-        let adapters = match video_adapt::decide(
-            &tee_caps,
-            Consumer::SystemMemory,
-            video_adapt::factory_available,
-        ) {
+        // CUDA and VA memory are scaled on the GPU first (see below); VA is
+        // read on the CPU only after `vapostproc`, which `decide` knows nothing
+        // of.
+        let memory = TapMemory::of(&tee_caps);
+        let decided = if memory == TapMemory::Va {
+            Ok(Vec::new())
+        } else {
+            video_adapt::decide(
+                &tee_caps,
+                Consumer::SystemMemory,
+                video_adapt::factory_available,
+            )
+        };
+        let adapters = match decided {
             Ok(adapters) => {
                 state.refused_caps = None;
                 adapters
@@ -273,8 +336,24 @@ impl ThumbnailTap {
 
         let mut branch_elements: Vec<gst::Element> = Vec::new();
         let adapter_prefix = format!("{}_thumb", prefix);
+        let mut output = TapOutput::Rgba;
 
-        if adapters == [Adapter::GlDownload] {
+        // GPU memory on the tee: scale on the GPU, download only the small
+        // frame. Without `cudaconvertscale` (an nvcodec build lacking it),
+        // download first as for system memory.
+        if memory == TapMemory::Cuda && gst::ElementFactory::find("cudaconvertscale").is_some() {
+            let (elements, cuda_output) = self.cuda_scale_elements()?;
+            branch_elements.extend(elements);
+            output = cuda_output;
+        } else if memory == TapMemory::Va {
+            // Scales on the GPU and maps out only the small RGBA frame
+            // (the system-memory capsfilter below).
+            let scale = gst::ElementFactory::make("vapostproc")
+                .name(format!("{}_thumb_vascale", prefix))
+                .build()
+                .map_err(|e| ThumbnailError::FrameMapping(format!("vapostproc: {}", e)))?;
+            branch_elements.push(scale);
+        } else if adapters == [Adapter::GlDownload] {
             // GL path: scale on GPU, then download the small frame.
             // glcolorscale requires RGBA — the compositor tee already carries RGBA.
             let scale = gst::ElementFactory::make("glcolorscale")
@@ -314,10 +393,13 @@ impl ThumbnailTap {
             branch_elements.push(convert);
         }
 
-        let caps_str = format!(
-            "video/x-raw,format=RGBA,width={},height={}",
-            self.config.width, self.config.height
-        );
+        let caps_str = match output {
+            TapOutput::Rgba => format!(
+                "video/x-raw,format=RGBA,width={},height={}",
+                self.config.width, self.config.height
+            ),
+            TapOutput::Jpeg => JPEG_CAPS.to_string(),
+        };
         let caps = gst::Caps::from_str(&caps_str)
             .map_err(|e| ThumbnailError::FrameMapping(format!("caps: {}", e)))?;
         let capsfilter = gst::ElementFactory::make("capsfilter")
@@ -376,6 +458,17 @@ impl ThumbnailTap {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
 
+                    // Encoded on the GPU already: keep the bytes.
+                    if caps.structure(0).is_some_and(|s| s.name() == JPEG_CAPS) {
+                        let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                        let Some(callback_state) = callback_state.upgrade() else {
+                            return Err(gst::FlowError::Flushing);
+                        };
+                        let mut state = callback_state.lock().unwrap();
+                        state.cached_jpeg = Some((map.to_vec(), Instant::now()));
+                        return Ok(gst::FlowSuccess::Ok);
+                    }
+
                     let video_info =
                         gst_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
 
@@ -408,7 +501,8 @@ impl ThumbnailTap {
 
         // Build the full element chain:
         //   GL:     queue [pad probe] → glcolorscale → glcaps → gldownload → capsfilter → appsink
-        //   system: queue [pad probe] → [cudadownload] → videoconvertscale → capsfilter → appsink
+        //   CUDA:   queue [pad probe] → cudaconvertscale → cudacaps → cudadownload → capsfilter → appsink
+        //   system: queue [pad probe] → videoconvertscale → capsfilter → appsink
         let mut elements: Vec<gst::Element> = vec![queue.clone()];
         elements.extend(branch_elements.iter().cloned());
         elements.push(capsfilter.clone());
@@ -440,21 +534,6 @@ impl ThumbnailTap {
                 })?;
             }
 
-            // Request a high-numbered pad (src_999) to avoid colliding with
-            // pipeline-assigned pads (src_0, src_1, ...) regardless of activation order.
-            // This is intentional — auto-assigned pads would work but a fixed name
-            // makes the branch easily identifiable in debug graphs and logs.
-            let tee_pad = self
-                .tee
-                .request_pad_simple("src_999")
-                .ok_or_else(|| ThumbnailError::PadNotFound("tee src_999".to_string()))?;
-            let queue_sink = queue
-                .static_pad("sink")
-                .ok_or_else(|| ThumbnailError::PadNotFound("queue sink".to_string()))?;
-            tee_pad.link(&queue_sink).map_err(|e| {
-                ThumbnailError::FrameMapping(format!("Failed to link tee→queue: {}", e))
-            })?;
-
             // Rate-limit via pad probe on queue src: drop buffers that arrive
             // sooner than update_interval since the last passed buffer.
             // This is invisible to caps negotiation (unlike videorate).
@@ -474,8 +553,12 @@ impl ThumbnailTap {
                 gst::PadProbeReturn::Ok
             });
 
-            // Sync all elements to parent state
-            for elem in &elements {
+            // Start the branch from the sink up, and only then let the tee
+            // feed it. An element not running yet answers a push with
+            // FLUSHING, and the tee hands that upstream (allow-not-linked
+            // forgives only NOT_LINKED): the tapped chain's source pauses its
+            // task without an error, and picture and thumbnail stand still.
+            for elem in elements.iter().rev() {
                 elem.sync_state_with_parent().map_err(|e| {
                     ThumbnailError::FrameMapping(format!(
                         "Failed to sync {} state: {}",
@@ -484,6 +567,21 @@ impl ThumbnailTap {
                     ))
                 })?;
             }
+
+            // Request a high-numbered pad (src_999) to avoid colliding with
+            // pipeline-assigned pads (src_0, src_1, ...) regardless of activation order.
+            // This is intentional — auto-assigned pads would work but a fixed name
+            // makes the branch easily identifiable in debug graphs and logs.
+            let tee_pad = self
+                .tee
+                .request_pad_simple("src_999")
+                .ok_or_else(|| ThumbnailError::PadNotFound("tee src_999".to_string()))?;
+            let queue_sink = queue
+                .static_pad("sink")
+                .ok_or_else(|| ThumbnailError::PadNotFound("queue sink".to_string()))?;
+            tee_pad.link(&queue_sink).map_err(|e| {
+                ThumbnailError::FrameMapping(format!("Failed to link tee→queue: {}", e))
+            })?;
 
             Ok(())
         })();
@@ -516,6 +614,53 @@ impl ThumbnailTap {
 
         debug!("Thumbnail branch activated for {}", self.name_prefix);
         Ok(())
+    }
+
+    /// `cudaconvertscale → capsfilter(CUDA,RGBA,WxH) → cudadownload`.
+    fn cuda_scale_elements(&self) -> Result<(Vec<gst::Element>, TapOutput), ThumbnailError> {
+        let prefix = &self.name_prefix;
+        let scale = gst::ElementFactory::make("cudaconvertscale")
+            .name(format!("{}_thumb_cudascale", prefix))
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cudaconvertscale: {}", e)))?;
+
+        // nvjpegenc takes NV12 in CUDA memory; the RGBA download path is
+        // the fallback for hosts without it.
+        let jpeg_encoder = gst::ElementFactory::make("nvjpegenc")
+            .name(format!("{}_thumb_nvjpegenc", prefix))
+            .property("quality", u32::from(self.config.jpeg_quality))
+            .build()
+            .ok();
+        // JPEG (JFIF) is full-range BT.601 and nvjpegenc does not convert:
+        // video-range NV12 would show black as 16 and white as 235.
+        let format = if jpeg_encoder.is_some() {
+            "NV12,colorimetry=1:4:0:0"
+        } else {
+            "RGBA"
+        };
+
+        let caps_str = format!(
+            "video/x-raw({}),format={},width={},height={}",
+            CUDA_MEMORY_FEATURE, format, self.config.width, self.config.height
+        );
+        let caps = gst::Caps::from_str(&caps_str)
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cuda caps: {}", e)))?;
+        let capsfilter = gst::ElementFactory::make("capsfilter")
+            .name(format!("{}_thumb_cudacaps", prefix))
+            .property("caps", &caps)
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cuda capsfilter: {}", e)))?;
+
+        if let Some(encoder) = jpeg_encoder {
+            return Ok((vec![scale, capsfilter, encoder], TapOutput::Jpeg));
+        }
+
+        let download = gst::ElementFactory::make("cudadownload")
+            .name(format!("{}_thumb_cudadownload", prefix))
+            .build()
+            .map_err(|e| ThumbnailError::FrameMapping(format!("cudadownload: {}", e)))?;
+
+        Ok((vec![scale, capsfilter, download], TapOutput::Rgba))
     }
 
     /// Detach the processing branch from the tee.
@@ -627,6 +772,175 @@ pub fn new_tap_store() -> ThumbnailTapStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tap_memory_from_caps() {
+        gst::init().unwrap();
+        let of = |s: &str| TapMemory::of(&gst::Caps::from_str(s).unwrap());
+
+        assert_eq!(of("video/x-raw,format=NV12"), TapMemory::System);
+        assert_eq!(
+            of("video/x-raw(memory:GLMemory),format=RGBA"),
+            TapMemory::Gl
+        );
+        assert_eq!(
+            of("video/x-raw(memory:CUDAMemory),format=NV12"),
+            TapMemory::Cuda
+        );
+        assert_eq!(
+            of("video/x-raw(memory:VAMemory),format=NV12"),
+            TapMemory::Va
+        );
+    }
+
+    #[test]
+    fn test_thumbnail_tap_config_default() {
+        let config = ThumbnailTapConfig::default();
+        assert_eq!(config.width, 320);
+        assert_eq!(config.height, 180);
+        assert_eq!(config.jpeg_quality, 75);
+        assert_eq!(config.idle_timeout, Duration::from_secs(10));
+        assert_eq!(config.update_interval, Duration::from_secs(1));
+        assert_eq!(config.cache_ttl, Duration::from_millis(500));
+    }
+
+    /// Attaching a branch must not make a live pipeline lose PLAYING:
+    /// other taps refuse to activate until it is back (serial startup),
+    /// and the running output goes through a state change.
+    #[test]
+    fn test_activation_keeps_pipeline_playing() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! video/x-raw,width=320,height=180,framerate=30/1 ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink sync=true",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tee = pipeline.by_name("t").unwrap();
+        let tap = ThumbnailTap::new_with_tee(&pipeline, "state_test", tee, Default::default());
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert!(res.is_ok() && state == gst::State::Playing);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tap.state.lock().unwrap().active && Instant::now() < deadline {
+            let _ = tap.get_thumbnail();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (_, state, pending) = pipeline.state(gst::ClockTime::ZERO);
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert_eq!(
+            (state, pending),
+            (gst::State::Playing, gst::State::VoidPending)
+        );
+    }
+
+    /// Attaching the branch must never stop the chain it taps. A tee pad
+    /// linked to a branch that is not running yet answers the tee's push
+    /// with FLUSHING, and the tee hands that upstream: the source pauses
+    /// its task without an error, the chain stands still and the branch,
+    /// active, waits for a frame that never comes (504 for as long as it is
+    /// polled; lmix vm-check, 2026-10-30). A source that never waits makes
+    /// the window between linking and starting the branch easy to hit.
+    #[test]
+    fn test_attaching_never_stops_the_tapped_chain() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc ! video/x-raw,width=64,height=36 ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink name=out sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let passed = Arc::new(AtomicU64::new(0));
+        let counter = passed.clone();
+        pipeline
+            .by_name("out")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        let tee = pipeline.by_name("t").unwrap();
+        let tap = ThumbnailTap::new_with_tee(&pipeline, "attach_test", tee, Default::default());
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert!(res.is_ok());
+
+        let flows = |passed: &AtomicU64| {
+            let before = passed.load(Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while passed.load(Ordering::Relaxed) == before && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            passed.load(Ordering::Relaxed) != before
+        };
+        let mut stopped_at = None;
+        for attempt in 0..200 {
+            tap.activate_branch().unwrap();
+            if !flows(&passed) {
+                stopped_at = Some(attempt);
+                break;
+            }
+            tap.deactivate_branch().unwrap();
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert_eq!(
+            stopped_at, None,
+            "the chain stopped after attaching the branch"
+        );
+    }
+
+    /// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+    #[test]
+    #[ignore = "needs NVIDIA CUDA (cudaupload)"]
+    fn test_thumbnail_from_cuda_memory() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true pattern=white ! video/x-raw,width=640,height=360,framerate=30/1 ! \
+             cudaupload ! video/x-raw(memory:CUDAMemory) ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tee = pipeline.by_name("t").unwrap();
+        let config = ThumbnailTapConfig {
+            update_interval: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let tap = ThumbnailTap::new_with_tee(&pipeline, "cuda_test", tee, config);
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut result = tap.get_thumbnail();
+        while result.is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            result = tap.get_thumbnail();
+        }
+        // JPEG encoded on the GPU, not on the CPU after a download.
+        let encoded_on_gpu = pipeline.by_name("cuda_test_thumb_nvjpegenc").is_some();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let jpeg = result.expect("no thumbnail from a CUDA-memory tee");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        assert!(encoded_on_gpu);
+        // Full range: white is white, not video-range 235.
+        let rgb = image::load_from_memory(&jpeg).unwrap().to_rgb8();
+        let white = rgb.get_pixel(rgb.width() / 2, rgb.height() / 2);
+        assert!(
+            white.0.iter().all(|&v| v >= 250),
+            "white decoded as {:?}",
+            white.0
+        );
+    }
 
     /// Detaching must not wait on a frame the branch is still encoding.
     /// The appsink callback stores its JPEG under the tap's state lock; a

@@ -531,6 +531,47 @@ fn split_files_each_play_on_their_own() {
     }
 }
 
+/// The output byte counter (`/flows/{id}/output-bytes`) reads what the sink
+/// wrote to disk: growing while it records, and over a split equal to the
+/// files together, not only the current one. The muxer has no counter.
+#[test]
+fn the_byte_counter_matches_what_reaches_the_files() {
+    use strom::blocks::builtin::live_recorder::FRAGMENT_SINK_SUFFIX;
+    use strom::gst::pipeline::output_bytes::output_byte_count;
+    use strom_types::api::OutputMedium;
+
+    init();
+    let dir = tempfile::tempdir().unwrap();
+    let pipeline = gst::Pipeline::new();
+    let (rec, _venc, _aenc) = av_recorder(
+        &pipeline,
+        "rec",
+        dir.path(),
+        &[("max_size_time_secs", PropertyValue::UInt(2))],
+    );
+    let sink = rec.input(FRAGMENT_SINK_SUFFIX);
+    assert_eq!(output_byte_count(&rec.mux()), None);
+
+    pipeline.set_state(gst::State::Playing).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let early = output_byte_count(&sink).expect("the file sink has a counter");
+    std::thread::sleep(Duration::from_secs(3));
+    let later = output_byte_count(&sink).unwrap();
+    no_errors(&pipeline);
+    finish(&pipeline);
+
+    assert_eq!(early.medium, OutputMedium::File);
+    assert!(
+        later.bytes > early.bytes && early.bytes > 0,
+        "the counter must grow while recording: {} then {}",
+        early.bytes,
+        later.bytes
+    );
+    let files = recorder::recordings(dir.path(), "rec");
+    assert!(files.len() >= 2, "expected a split, got {:?}", files);
+    assert_eq!(output_byte_count(&sink).unwrap().bytes, file_size(&files));
+}
+
 /// Nothing the block leaves behind may keep a stopped pipeline alive: not its
 /// probes, not the keepalive thread, not the sink's file callback.
 #[test]

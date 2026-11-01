@@ -7,6 +7,15 @@ use std::str::FromStr;
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
 
+mod dynamic;
+mod pad_map;
+pub use dynamic::{
+    parse_dynamic_inputs, validate_dynamic_inputs, AddVisionMixerInputRequest, DynamicInput,
+    DynamicInputSource, VisionMixerInputInfo, VisionMixerInputs, DYNAMIC_INPUTS_PROPERTY,
+    MAX_INPUTS_PROPERTY, MAX_INPUT_CAPACITY,
+};
+pub use pad_map::PadMap;
+
 /// A source that can be assigned to PGM or PVW.
 ///
 /// JSON encoding is externally tagged: `{"input": 5}` or `{"pip": 1}`.
@@ -78,14 +87,18 @@ impl FromStr for Source {
 /// Default number of video inputs.
 pub const DEFAULT_NUM_INPUTS: usize = 4;
 
-/// Maximum number of video inputs. Soft cap — CPU/GPU/memory are the real
-/// ceiling. The multiview thumbnail grid scales rows dynamically so any value
-/// in `[MIN_NUM_INPUTS, MAX_NUM_INPUTS]` produces a usable layout (smaller
+/// Maximum number of video inputs. A flow asking for more fails to build.
+/// The multiview thumbnail grid scales rows dynamically so any value in
+/// `[MIN_NUM_INPUTS, MAX_NUM_INPUTS]` produces a usable layout (smaller
 /// thumbnails for larger N).
-pub const MAX_NUM_INPUTS: usize = 16;
+pub const MAX_NUM_INPUTS: usize = 32;
 
 /// Minimum number of video inputs.
 pub const MIN_NUM_INPUTS: usize = 2;
+
+/// Minimum number of video inputs of a mixer with free slots
+/// (`max_inputs` above `num_inputs`): the others come at runtime.
+pub const MIN_NUM_INPUTS_WITH_FREE_SLOTS: usize = 1;
 
 /// Default PGM (distribution) output resolution.
 pub const DEFAULT_PGM_RESOLUTION: &str = "1920x1080";
@@ -109,7 +122,7 @@ pub const PGM_BORDER_WIDTH: f64 = 4.0;
 pub const THUMBNAIL_BORDER_WIDTH: f64 = 4.0;
 
 /// Maximum number of DSK (Downstream Keyer) inputs.
-pub const MAX_DSK_INPUTS: usize = 4;
+pub const MAX_DSK_INPUTS: usize = 9;
 
 /// Default number of DSK inputs (0 = no DSK).
 pub const DEFAULT_DSK_INPUTS: usize = 0;
@@ -150,6 +163,62 @@ pub const DEFAULT_ENABLE_FX: bool = true;
 /// are mirrored.
 pub const DEFAULT_SWAP_PVW_PGM: bool = false;
 
+/// Block property that builds the preview output.
+pub const ENABLE_PREVIEW_OUT_PROPERTY: &str = "enable_preview_out";
+
+/// Output pad of the preview: at program size, what the multiview's PVW
+/// shows (an input or a PiP), without the multiview's labels and tallies.
+pub const PREVIEW_OUTPUT_PAD: &str = "pvw_out";
+
+/// Block property that builds the tile output.
+pub const ENABLE_TILES_OUT_PROPERTY: &str = "enable_tiles_out";
+
+/// Output pad of the tiles: every input scaled into its own cell of one
+/// grid, in input order, without labels or tallies. A control surface
+/// shows all inputs live from this one stream instead of one per input.
+pub const TILES_OUTPUT_PAD: &str = "tiles_out";
+
+/// Block property: size of one cell of the tile output, `WIDTHxHEIGHT`.
+pub const TILES_CELL_PROPERTY: &str = "tiles_cell";
+
+/// Default cell size of the tile output.
+pub const DEFAULT_TILES_CELL: &str = "640x360";
+
+/// Block property: columns of the tile output; 0 picks them (see
+/// [`tiles_grid`]).
+pub const TILES_COLUMNS_PROPERTY: &str = "tiles_columns";
+
+/// Block property: the input in the tile output's first cell. Inputs
+/// before it get no cell (a background, say).
+pub const TILES_FIRST_INPUT_PROPERTY: &str = "tiles_first_input";
+
+/// Block property: cells of the tile output; 0 gives every input slot
+/// from `tiles_first_input` up to the capacity one. Inputs beyond the last
+/// cell get none: a mixer with many slots keeps a tile picture of a size
+/// the viewer can take.
+pub const TILES_CELLS_PROPERTY: &str = "tiles_cells";
+
+/// Block property: frame rate of the tile output; empty follows the
+/// multiview's.
+pub const TILES_FRAMERATE_PROPERTY: &str = "tiles_framerate";
+
+/// Block property: pixel format of the tile output; empty lets the
+/// mixer pick (as `output_format`). A viewer that draws RGBA asks for it,
+/// so it shows the frames without converting them.
+pub const TILES_FORMAT_PROPERTY: &str = "tiles_format";
+
+/// Columns and rows of the tile output for `cells` inputs. `columns` 0
+/// picks a square grid (the smallest that fits).
+pub fn tiles_grid(cells: usize, columns: usize) -> (usize, usize) {
+    let cells = cells.max(1);
+    let columns = if columns == 0 {
+        (1..=cells).find(|c| c * c >= cells).unwrap_or(cells)
+    } else {
+        columns.min(cells)
+    };
+    (columns, cells.div_ceil(columns))
+}
+
 // --- Z-order constants for compositor pads ---
 
 /// Z-order for thumbnail pads on the multiview compositor.
@@ -175,13 +244,6 @@ pub const DIST_STINGER_INCOMING_ZORDER: u32 = 91;
 
 /// Z-order of the stinger graphic: over the program, under the DSKs.
 pub const DIST_STINGER_FILL_ZORDER: u32 = 92;
-
-/// Index of the stinger graphic's sink pad on the distribution compositor;
-/// the matte's (GPU only) is the next one. Stinger pads come after the
-/// inputs, the DSKs and the border underlays (present with PiPs).
-pub fn dist_stinger_pad_base(num_inputs: usize, num_dsk_inputs: usize, num_pips: usize) -> usize {
-    num_inputs + num_dsk_inputs + if num_pips > 0 { num_inputs } else { 0 }
-}
 
 /// Z-order for PiP overlay pads on the distribution compositor when PGM is a PiP source.
 /// Must be above [`DIST_PGM_ZORDER`] (which the bg uses) and below DSK.
@@ -833,6 +895,17 @@ pub fn compute_pip_overlay_rects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiles_grid_is_square_unless_columns_are_given() {
+        assert_eq!(tiles_grid(1, 0), (1, 1));
+        assert_eq!(tiles_grid(16, 0), (4, 4));
+        assert_eq!(tiles_grid(17, 0), (5, 4));
+        assert_eq!(tiles_grid(32, 0), (6, 6));
+        assert_eq!(tiles_grid(32, 8), (8, 4));
+        assert_eq!(tiles_grid(3, 8), (3, 1));
+        assert_eq!(tiles_grid(0, 0), (1, 1));
+    }
 
     #[test]
     fn test_pip_overlay_rects_one_full_aspect() {
