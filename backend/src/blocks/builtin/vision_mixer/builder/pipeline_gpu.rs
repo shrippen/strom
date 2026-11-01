@@ -212,10 +212,14 @@ pub(super) fn build_gpu_pipeline(
         // Passes through what glupload takes and converts the rest: clips
         // decode to whatever their codec gives (10-bit 4:4:4 with alpha for
         // ProRes 4444), and each clip may differ from the last.
-        elems.push((
-            vc_id.clone(),
-            elements::make_element("videoconvert", &vc_id)?,
-        ));
+        let videoconvert = elements::make_element("videoconvert", &vc_id)?;
+        // When it converts, videoconvert allocates its output from what
+        // glupload proposes: the udmabuf path, which loses the picture where
+        // it is broken.
+        if let Some(src) = videoconvert.static_pad("src") {
+            crate::gst::gl_input_front::keep_own_memory(&src);
+        }
+        elems.push((vc_id.clone(), videoconvert));
         elems.push((up_id.clone(), glupload));
         elems.push((
             cc_id.clone(),

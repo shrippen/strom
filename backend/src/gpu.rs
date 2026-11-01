@@ -128,15 +128,70 @@ pub fn has_hardware_gl() -> bool {
     }
 }
 
+/// Whether `glupload`'s udmabuf path loses the picture on this host,
+/// probed once at startup by [`detect_gpu_capabilities`].
+static UDMABUF_UPLOAD_BROKEN: OnceLock<bool> = OnceLock::new();
+
 /// True when `glupload`'s udmabuf path yields empty textures on this host.
 ///
-/// GStreamer 1.28's `glupload` offers upstream a udmabuf allocator and
-/// imports the frames as DMABuf into EGL. The NVIDIA driver imports them
-/// as empty textures: a system-memory source linked straight into a GL
-/// mixer composites as black (seen on an RTX 3090, driver 615). Mesa
-/// (AMD/Intel) is what the udmabuf path was built for and is left alone.
+/// GStreamer 1.28's `glupload` offers upstream a udmabuf allocator (when the
+/// process can open `/dev/udmabuf`) and imports the frames as DMABuf into
+/// EGL. Some drivers (seen with NVIDIA's proprietary driver) import them as
+/// empty textures: a system-memory source linked straight into a GL mixer
+/// composites as black. Decided by a functional probe at startup, not by the
+/// vendor, so it follows driver fixes, `/dev/udmabuf` access and containers.
+/// False until [`detect_gpu_capabilities`] has run.
 pub fn udmabuf_upload_broken() -> bool {
-    gl_renderer_info().is_some_and(|info| info.vendor.to_lowercase().contains("nvidia"))
+    UDMABUF_UPLOAD_BROKEN.get().copied().unwrap_or(false)
+}
+
+/// Upload one white RGBA frame with `glupload` and download it again.
+/// `Some(true)` when it comes back white, `Some(false)` when it does not
+/// (empty or wrong values), `None` on a pipeline error or no frame within
+/// 5 s.
+///
+/// Only RGBA is probed: a driver that imports only YUV wrongly through
+/// udmabuf would pass.
+///
+/// With `through_queue` a `tee ! queue` stands in front of `glupload`; the
+/// allocation proposal then does not reach the source, so the udmabuf path
+/// is never taken. That is the reference a working GL must pass.
+pub fn upload_keeps_pixels(through_queue: bool) -> Option<bool> {
+    let front = if through_queue { "tee ! queue ! " } else { "" };
+    let pipeline = gst::parse::launch(&format!(
+        "videotestsrc pattern=white num-buffers=1 ! \
+         video/x-raw,format=RGBA,width=64,height=64 ! {front}glupload ! gldownload ! \
+         video/x-raw,format=RGBA ! appsink name=sink sync=false wait-on-eos=false"
+    ))
+    .map_err(|e| debug!("GL upload probe: failed to create pipeline: {}", e))
+    .ok()?
+    .downcast::<gst::Pipeline>()
+    .ok()?;
+    let kept = run_upload_probe(&pipeline);
+    let _ = pipeline.set_state(gst::State::Null);
+    kept
+}
+
+fn run_upload_probe(pipeline: &gst::Pipeline) -> Option<bool> {
+    let sink = pipeline
+        .by_name("sink")
+        .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())?;
+    let bus = pipeline.bus()?;
+    pipeline.set_state(gst::State::Playing).ok()?;
+    // The sink keeps the frame and, with `wait-on-eos=false`, posts EOS
+    // without waiting for it to be pulled. An error ends the wait at once
+    // instead of after the deadline.
+    let msg = bus.timed_pop_filtered(
+        gst::ClockTime::from_seconds(5),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    )?;
+    if let gst::MessageView::Error(e) = msg.view() {
+        debug!("GL upload probe: {} ({:?})", e.error(), e.debug());
+        return None;
+    }
+    let sample = sink.try_pull_sample(gst::ClockTime::ZERO)?;
+    let map = sample.buffer()?.map_readable().ok()?;
+    Some(!map.is_empty() && map.iter().all(|&b| b == 0xff))
 }
 
 /// Probe the OpenGL renderer via GStreamer's GL context API.
@@ -308,6 +363,34 @@ fn capture_contexts(description: &str, context_type: &str) -> Vec<gst::Context> 
 pub fn detect_gpu_capabilities() -> VideoConvertMode {
     // Probe GL renderer info early (best-effort, independent of CUDA-GL interop)
     let gl_info = detect_gl_renderer();
+    if let Some(info) = &gl_info {
+        // Once per process; later calls (tests call this often) keep it.
+        UDMABUF_UPLOAD_BROKEN.get_or_init(|| match upload_keeps_pixels(false) {
+            Some(true) => {
+                debug!(
+                    "GL upload probe: glupload keeps the picture (GL {})",
+                    info.version
+                );
+                false
+            }
+            Some(false) => {
+                warn!(
+                    "GL upload probe: glupload's udmabuf path loses the picture with {} (GL {}); \
+                     GL inputs keep their own memory",
+                    info.vendor, info.version
+                );
+                true
+            }
+            None => {
+                warn!(
+                    "GL upload probe: no frame back from glupload (error or timeout) with {} \
+                     (GL {}); assuming the upload works",
+                    info.vendor, info.version
+                );
+                false
+            }
+        });
+    }
     let _ = GL_RENDERER_INFO.set(gl_info);
 
     let cuda = capture_contexts(CUDA_CONTEXT_PROBE, CUDA_CONTEXT_TYPE);
