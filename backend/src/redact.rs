@@ -201,8 +201,8 @@ fn plain_name(name: &str) -> String {
 /// the rest, except in a `file:` URL. `rtmp*` schemes: as [`rtmp_url`];
 /// `http`, `https`, `ws`, `wss`: only the origin and path segments that are
 /// known words (`PATH_WORDS`, also as a file name: `index.m3u8`,
-/// `segment_001.ts`), the query masked. Text that does not start with
-/// `scheme://` is masked whole.
+/// `segment_001.ts`, with at most 10 digits), the query masked. Text that
+/// does not start with `scheme://` is masked whole.
 ///
 /// ```text
 /// srt://h:9000?mode=caller&passphrase=abc -> srt://h:9000?mode=caller&passphrase=***
@@ -343,9 +343,11 @@ impl Rules {
 }
 
 /// Whether a path segment is a word of [`PATH_WORDS`], or a file name
-/// whose parts (split at `_` and `-`) are such words, each with up to 10
-/// digits behind it, or numbers: `whip`, `v1`, `index.m3u8`,
-/// `chunk-stream0-00001.m4s`. A number alone is no word.
+/// whose parts (split at `_` and `-`) are such words, each with digits
+/// behind it, or numbers: `whip`, `v1`, `index.m3u8`,
+/// `chunk-stream0-00001.m4s`. A number alone is no word, and a segment
+/// with more than 10 digits in all is none (`live-1234567890-9876543210`
+/// may be a numeric key).
 fn path_word(segment: &str) -> bool {
     let (stem, ext) = match segment.rsplit_once('.') {
         Some((stem, ext)) => (stem, Some(ext)),
@@ -354,12 +356,12 @@ fn path_word(segment: &str) -> bool {
     if ext.is_some_and(|ext| !FILE_EXTENSIONS.iter().any(|e| ext.eq_ignore_ascii_case(e))) {
         return false;
     }
+    if stem.bytes().filter(u8::is_ascii_digit).count() > 10 {
+        return false;
+    }
     let mut word = false;
     for part in stem.split(['_', '-']) {
         let letters = part.trim_end_matches(|c: char| c.is_ascii_digit());
-        if part.len() - letters.len() > 10 {
-            return false;
-        }
         if letters.is_empty() && !part.is_empty() {
             continue;
         }
@@ -589,9 +591,10 @@ fn plain_host(authority: &str) -> bool {
 ///   that ends in a secret ending ([`is_secret_name`]) masks the value: up to
 ///   the end of the word; when the separator ends the word, the next word
 ///   behind `=` (`passphrase= abc`) and the rest of the line behind `:`
-///   (`auth-token: a b`, a header); one more word behind `Bearer`, `Basic`,
-///   `Digest`. A value that starts with a quote is the quoted run through
-///   its partner (`{"passphrase":"a b","x":1}`).
+///   (`auth-token: a b`, a header) up to a blank followed by a known pair
+///   or a `!` (`auth-token: a b latency=1`); one more word behind `Bearer`,
+///   `Basic`, `Digest`. A value that starts with a quote is the quoted run
+///   through its partner (`{"passphrase":"a b","x":1}`).
 /// - `user:pass@host` without `//` is masked whole.
 /// - A quote that opens in a masked part (`passphrase="two words"`,
 ///   `passphrase=(string)"a b"`, `\"` in a `{:?}` dump) masks through its
@@ -608,7 +611,11 @@ fn plain_host(authority: &str) -> bool {
 ///   partner of the innermost one, or to the end of the text; on past it
 ///   when a letter follows (an apostrophe in the value), to the end of its
 ///   word when the value does not end there (`'a'\''b'`) or an `@` is in
-///   that word. The partner itself and what follows show. Inside the quote
+///   that word. A quote opened in the value that is still open at the
+///   partner masks to its own partner or the end of the text, so a shell
+///   quote in a quoted value hides the rest
+///   (`'passphrase="my"'\''s secret'`). The partner itself and what follows
+///   show. Inside the quote
 ///   the mask ends early at a blank followed by a known pair
 ///   (`"passphrase=a b latency=120"`, see `pair_start`). A mask that ends
 ///   inside its URL, with shown parts behind it
@@ -961,11 +968,11 @@ impl Quotes {
         let inner = masked_end(s, from, from, close);
         let (close_end, at_after) = self.word_from(s, close);
         let after = s[close + 1..].chars().next();
-        let stop = if inner > close {
-            Stop::At(inner)
-        } else if after.is_some_and(char::is_alphanumeric) {
+        // What follows the partner, read as it would be behind a value
+        // that ends at the partner; none when the value ends there.
+        let behind = if after.is_some_and(char::is_alphanumeric) {
             // An apostrophe: the value goes on to the next one.
-            Stop::At(
+            Some(
                 masked_end(s, close, close - escapes, close + 1).max(masked_end(
                     s,
                     close + 1,
@@ -974,9 +981,16 @@ impl Quotes {
                 )),
             )
         } else if !ends_value(s, close + 1) || at_after {
-            Stop::At(masked_end(s, close + 1, close + 1, close_end))
+            Some(masked_end(s, close + 1, close + 1, close_end))
         } else {
-            Stop::Partner(close, escapes)
+            None
+        };
+        // A quote opened in the value that runs past the partner does not
+        // excuse what follows it: `'passphrase="my"'\''s secret'`.
+        let stop = match (inner > close, behind) {
+            (true, behind) => Stop::At(inner.max(behind.unwrap_or(0))),
+            (false, Some(behind)) => Stop::At(behind),
+            (false, None) => Stop::Partner(close, escapes),
         };
         self.read = self.read.max(match stop {
             Stop::At(at) => at,
@@ -1711,8 +1725,19 @@ mod tests {
         ("https://h/stream-SEKRET/whip", &["SEKRET"]),
         ("https://h/whip/12345678901", &["12345678901"]),
         ("https://h/v12345678901", &["12345678901"]),
+        (
+            "https://h/live/live-1234567890-9876543210-5555555555",
+            &["9876543210", "5555555555"],
+        ),
+        ("https://h/live/chunk-12345-678901.m4s", &["678901"]),
         ("wss://h/whip/SEKRET", &["SEKRET"]),
         ("https://h/whip?token=SEKRET", &["SEKRET"]),
+        // A shell quote in a quoted value: the rest of the text is masked.
+        ("srtsrc 'passphrase=\"SEKA\"'\\''s SEKB' x", &["SEKA", "SEKB"]),
+        (
+            "srtsrc 'passphrase=SEKA\"SEKB\"SEKC'\\'', SEKD' x",
+            &["SEKA", "SEKB", "SEKC", "SEKD"],
+        ),
         // A header value runs to the end of its line.
         ("auth-token: SEKA SEKB", &["SEKA", "SEKB"]),
         ("x-auth-token: SEKA SEKB, SEKC", &["SEKA", "SEKB", "SEKC"]),
@@ -1756,6 +1781,7 @@ mod tests {
         // HTTP path words and file names, other paths without tokens.
         "GET https://h:8443/live/index.m3u8: 404 Not Found",
         "https://h/hls/stream0/segment_001.ts not found",
+        "https://h/hls/segment_1730000000.ts not found",
         "Element { name: \"whep\", uri: \"https://h/whep/resource\" }",
         "rtsp://h:554/Streaming/Channels/101",
         "rtsp://h/cam/realmonitor?channel=1&subtype=0",
@@ -2206,6 +2232,15 @@ mod tests {
             ),
             ("rtsp://h:554/0123456789abcdef0/live", "rtsp://h:554/***"),
             ("auth-token: a b", "auth-token: ***"),
+            (
+                "srtsrc 'passphrase=\"my\"'\\''s secret' x",
+                "srtsrc 'passphrase=***",
+            ),
+            (
+                "https://h/live/live-1234567890-9876543210-5555555555",
+                "https://h/live/***",
+            ),
+            ("auth-token: a b latency=1 c", "auth-token: *** latency=1 c"),
         ] {
             assert_eq!(text(raw), shown, "{}", raw);
         }
