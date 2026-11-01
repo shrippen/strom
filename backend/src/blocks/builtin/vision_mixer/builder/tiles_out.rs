@@ -222,7 +222,7 @@ pub(crate) fn append_input_branch(
         return Ok(());
     };
     let q_id = spec.id(&format!("queue_to_tiles_out_{}", i));
-    elems.push((q_id.clone(), elements::make_queue(&q_id)?));
+    elems.push((q_id.clone(), elements::make_monitor_queue(&q_id)?));
     links.push((
         ElementPadRef::pad(spec.id(&format!("tee_{}", i)), format!("src_{}", tee_src)),
         ElementPadRef::pad(&q_id, "sink"),

@@ -223,12 +223,13 @@ pub fn make_queue(name: &str) -> Result<gst::Element, BlockBuildError> {
 /// Frames a multiview branch may hold before it drops its oldest.
 const MONITOR_QUEUE_BUFFERS: u32 = 2;
 
-/// Create the queue between an input's tee and the multiview compositor.
+/// Create the queue between an input's tee and a compositor that only shows
+/// the inputs (multiview, preview output, tile output).
 ///
 /// The tee pushes into all its branches in turn, so a branch that blocks
-/// holds up the others, program included. The multiview only shows the
-/// inputs: when it falls behind (a busy CPU scaling every tile), it drops
-/// its own oldest frames instead.
+/// holds up the others, program included. When such a compositor falls
+/// behind (a busy CPU scaling every tile), it drops its own oldest frames
+/// instead.
 pub fn make_monitor_queue(name: &str) -> Result<gst::Element, BlockBuildError> {
     let queue = make_queue(name)?;
     queue.set_property_from_str("leaky", "downstream");
