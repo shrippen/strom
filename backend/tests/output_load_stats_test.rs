@@ -183,11 +183,21 @@ fn inter_input_reports_queued_and_dropped_frames() {
             PropertyValue::String(MAX_TIME_MS.to_string()),
         ),
     ]);
-    let built = InterInputBuilder
+    let mut built = InterInputBuilder
         .build("in", &properties, &context())
         .expect("build the inter input block");
     let consumer = gst::Pipeline::new();
     let elements = install(&consumer, &built);
+    // Before GStreamer 1.28 the drops are counted from the bus, as the
+    // pipeline manager connects it.
+    let bus = consumer.bus().unwrap();
+    bus.add_signal_watch();
+    let connect = built.bus_message_handler.take().expect("a bus handler");
+    connect(
+        &bus,
+        uuid::Uuid::nil(),
+        strom::events::EventBroadcaster::with_capacity(1),
+    );
     let blocks = strom::blocks::builtin::inter::get_blocks();
     let (_, output) = ends(definition(blocks, "builtin.inter_input"), "in", &elements);
     let sink = gst::ElementFactory::make("fakesink").build().unwrap();
@@ -207,7 +217,10 @@ fn inter_input_reports_queued_and_dropped_frames() {
     producer.set_state(gst::State::Playing).unwrap();
     wait_for_eos(&producer);
 
+    let context = gst::glib::MainContext::default();
+    while context.iteration(false) {}
     let stats = collect(&consumer, &flow_of("in", "builtin.inter_input"));
+    bus.remove_signal_watch();
     producer.set_state(gst::State::Null).unwrap();
     consumer.set_state(gst::State::Null).unwrap();
 

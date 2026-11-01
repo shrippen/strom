@@ -6,6 +6,7 @@
 
 pub mod collector;
 pub mod encoder;
+pub mod inter;
 pub mod rtp;
 
 pub use collector::StatsCollector;
