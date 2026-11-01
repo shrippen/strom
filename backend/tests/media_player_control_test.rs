@@ -430,6 +430,46 @@ async fn a_paused_player_switching_files_keeps_feeding_its_output() {
     }
 }
 
+/// At the end of the playlist the player holds its last frame. A seek then
+/// plays the file again, and the hold must end: a repeat running next to
+/// the playback doubles the frames at the output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seek_after_the_end_of_the_playlist_ends_the_hold() {
+    gstreamer::init().unwrap();
+    run_glib_main_loop();
+
+    let dir = tempfile::tempdir().unwrap();
+    // 2 s at 25 fps.
+    let playlist = vec![write_h264_clip(dir.path(), "short.mp4", 50)];
+
+    let (state, _files) = new_app_state();
+    let mut flow = build_player_flow("media_player_seek_after_end", &playlist);
+    flow.blocks[0]
+        .properties
+        .insert("loop_playlist".to_string(), PropertyValue::Bool(false));
+    let (flow_id, frames) = start_counting_frames(&state, flow).await;
+    let player = player_of(flow_id);
+    player.play().expect("play");
+    wait_for_frames(&frames, 0).await;
+    // Past the end: the player holds its last frame.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let held = frames_in_two_seconds(&frames).await;
+
+    player.seek(0).expect("seek");
+    let replayed = frames_in_two_seconds(&frames).await;
+    drop(player);
+    state.stop_flow(&flow_id).await.expect("stop_flow failed");
+
+    assert!(held >= 25, "the finished player fed {} frames in 2 s", held);
+    // 2 s at 25 fps is 50 frames; with the hold still running it is twice
+    // that.
+    assert!(
+        replayed < 75,
+        "after the seek the player fed {} frames in 2 s: the hold ran on next to the playback",
+        replayed
+    );
+}
+
 fn player_of(
     flow_id: strom_types::FlowId,
 ) -> Arc<strom::blocks::builtin::mediaplayer::MediaPlayerState> {

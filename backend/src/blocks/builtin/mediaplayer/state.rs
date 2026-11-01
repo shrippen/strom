@@ -1198,6 +1198,14 @@ impl MediaPlayerState {
             self.timing.reset(guard.as_ref(), &self.main_pipeline);
         }
 
+        // A player that is not paused plays on from the new position: one
+        // that held its last frame at the end of the playlist ends the hold,
+        // or the repeat runs next to the playback. A paused one (stop
+        // included) keeps holding.
+        if !self.is_paused.load(Ordering::SeqCst) {
+            self.still.release();
+        }
+
         let seek_result = source.seek_simple(
             gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
             gst::ClockTime::from_nseconds(position_ns),
