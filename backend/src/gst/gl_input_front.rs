@@ -812,20 +812,33 @@ fn splice_when_idle(
 }
 
 /// Where `glupload`'s udmabuf path is broken (see
-/// `gpu::udmabuf_upload_broken`), hide its allocation proposal from
-/// everything upstream of `pad`, so the source keeps its own memory and
-/// `glupload` does a plain texture upload.
+/// [`crate::gpu::udmabuf_upload_broken`]), hide its allocation proposal for
+/// system memory from everything upstream of `pad`, so the source keeps its
+/// own memory and `glupload` does a plain texture upload.
 pub(crate) fn keep_own_memory(pad: &gst::Pad) {
     if crate::gpu::udmabuf_upload_broken() {
-        // Per allocation query (each negotiation), not per buffer.
-        pad.add_probe(
-            gst::PadProbeType::QUERY_DOWNSTREAM,
-            |_pad, info| match info.query() {
-                Some(q) if q.type_() == gst::QueryType::Allocation => gst::PadProbeReturn::Drop,
-                _ => gst::PadProbeReturn::Ok,
-            },
-        );
+        // Per allocation query (each negotiation), not per buffer. Only for
+        // system memory: GL, CUDA or DMABuf producers keep their allocation.
+        pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_pad, info| match info
+            .query()
+            .map(|q| q.view())
+        {
+            Some(gst::QueryView::Allocation(q)) if is_raw_system_memory(q.get().0) => {
+                gst::PadProbeReturn::Drop
+            }
+            _ => gst::PadProbeReturn::Ok,
+        });
     }
+}
+
+/// Raw video in system memory (no `memory:` feature but system memory).
+fn is_raw_system_memory(caps: Option<&gst::CapsRef>) -> bool {
+    caps.and_then(|c| c.iter_with_features().next())
+        .is_some_and(|(structure, features)| {
+            structure.name() == "video/x-raw"
+                && !features.is_any()
+                && video_adapt::is_system_memory(features)
+        })
 }
 
 /// Insert an `adapter_factory` element between `upload`'s sink pad and its peer,

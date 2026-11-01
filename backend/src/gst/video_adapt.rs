@@ -233,7 +233,7 @@ fn offers_no_raw_video(caps: &gst::CapsRef) -> Option<String> {
 
 /// True when `features` put the buffer in system memory: no memory feature, or
 /// the system-memory one, with or without metas next to it.
-fn is_system_memory(features: &gst::CapsFeaturesRef) -> bool {
+pub(crate) fn is_system_memory(features: &gst::CapsFeaturesRef) -> bool {
     features.contains(gst::CAPS_FEATURE_MEMORY_SYSTEM_MEMORY)
         || !features.iter().any(|f| f.starts_with("memory:"))
 }
