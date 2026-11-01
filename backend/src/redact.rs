@@ -365,15 +365,28 @@ fn plain_host(authority: &str) -> bool {
 ///   (`"passphrase=a b"`, `'uri=srt://h?passphrase=a b'`, a quote opened in
 ///   an earlier word), the mask runs through the partner of the innermost
 ///   one, or to the end of the text; on past it when a letter follows (an
-///   apostrophe in the value) or an `@` in its word.
+///   apostrophe in the value), to the end of its word when anything but a
+///   blank or `,;)]}` follows (`'a'\''b'`) or an `@` is in that word.
 ///
 /// Not covered, because nothing tells them from prose: a raw blank inside a
 /// URL that is not quoted (`srt://u:a b@h` shows `b@h`), a raw `&` inside a
 /// secret query value followed by `name=` (`passphrase=a&b=c` shows `b=c`), a
 /// secret in the path of a URL that is neither HTTP nor RTMP, and a secret
 /// behind a name that has no secret ending or with no `=` or `:` between
-/// them. A property value is no prose: [`value`] masks a URL in it whole.
+/// them. A stray quote before a quoted secret (`the '90s … 'passphrase=a b'`)
+/// pairs with the wrong one and leaves the rest of the secret outside.
+/// A property value is no prose: [`value`] masks a URL in it whole.
+///
+/// A bug in here must neither abort strom (bus messages are masked in a
+/// GLib callback, where a panic aborts) nor let a secret through: a panic
+/// masks the whole text.
 pub fn text(s: &str) -> Cow<'_, str> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mask_text(s)))
+        .unwrap_or_else(|_| Cow::Owned(MASK.to_string()))
+}
+
+/// [`text`] without the guard against a panic.
+fn mask_text(s: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(s.len());
     let mut at = 0;
     let mut word = Word {
@@ -414,7 +427,8 @@ pub fn text(s: &str) -> Cow<'_, str> {
             if let Some(stop) = quotes.masked_to(s, from) {
                 out.truncate(shown_at);
                 out.push_str(MASK);
-                (at, value_next) = (stop, false);
+                // Never short of what `mask_word` masked.
+                (at, value_next) = (stop.max(step.next), false);
             }
         }
     }
@@ -519,20 +533,31 @@ impl Quotes {
         found
     }
 
-    /// The innermost quote open at `at`, and its backslashes.
+    /// The innermost quote open at `at`, and its backslashes. A quote that
+    /// closed in a part skipped as masked is dropped here.
     fn open_at(&mut self, s: &str, at: usize) -> Option<(usize, usize)> {
         self.read_to(s, at);
-        self.open.last().copied()
+        while let Some(&(open, escapes)) = self.open.last() {
+            match self.partner(s, open, escapes) {
+                Some(close) if close < at => {
+                    self.open.pop();
+                }
+                _ => return Some((open, escapes)),
+            }
+        }
+        None
     }
 
     /// Where a mask that begins at `from` ends when a quote is open there:
     /// behind its partner, or the end of `s`. Past the partner the mask goes
-    /// on when a quote opened in the value runs past it (`masked_end`), when
-    /// a letter follows (`'it's a'`: the partner was an apostrophe) or when
-    /// an `@` follows in its word (a password with a quote).
+    /// on when a quote opened in the value runs past it (`masked_end`), to
+    /// the next such quote when a letter follows (`'it's a'`: the partner was
+    /// an apostrophe), and to the end of the partner's word when anything
+    /// but a blank or `,;)]}` follows (`'a'\''b'`, `"a"'b'`: the value goes
+    /// on) or an `@` follows in that word (a password with a quote).
     fn masked_to(&mut self, s: &str, from: usize) -> Option<usize> {
-        self.read_to(s, from);
-        let (open, escapes) = self.open.pop()?;
+        let (open, escapes) = self.open_at(s, from)?;
+        self.open.pop();
         let b = s.as_bytes();
         let Some(close) = self.partner(s, open, escapes) else {
             self.open.clear();
@@ -543,15 +568,19 @@ impl Quotes {
         let close_end = s[close..]
             .find(char::is_whitespace)
             .map_or(s.len(), |i| close + i);
-        let glued = s[close + 1..]
-            .chars()
-            .next()
-            .is_some_and(char::is_alphanumeric);
+        let after = s[close + 1..].chars().next();
+        let ends = after.is_none_or(|c| c.is_whitespace() || ",;)]}".contains(c));
         let stop = if inner > close {
             inner
-        } else if glued {
-            masked_end(s, close, close - escapes, close + 1)
-        } else if s[close..close_end].contains('@') {
+        } else if after.is_some_and(char::is_alphanumeric) {
+            // An apostrophe: the value goes on to the next one.
+            masked_end(s, close, close - escapes, close + 1).max(masked_end(
+                s,
+                close + 1,
+                close + 1,
+                close_end,
+            ))
+        } else if !ends || s[close..close_end].contains('@') {
             masked_end(s, close + 1, close + 1, close_end)
         } else {
             close + 1
@@ -663,6 +692,9 @@ fn mask_word(s: &str, at: usize, word: Word, quotes: &mut Quotes, out: &mut Stri
         if take {
             stop = if at_after { close_end } else { close - escapes };
         }
+        // Never before the end of the scheme (a stale quote must not cut
+        // the URL backwards).
+        stop = stop.max(url_at + sep + 3);
     }
 
     let part = &s[url_at..stop];
@@ -753,7 +785,7 @@ fn masked_end(s: &str, from: usize, run_at: usize, end: usize) -> usize {
     let mut end = end;
     let mut i = from;
     while i < end {
-        if b[i] == b'"' || b[i] == b'\'' {
+        if matches!(b[i], b'"' | b'\'' | b'`') {
             let escapes = backslashes_before(b, run_at, i);
             match partner(b, i, escapes, b.len()) {
                 Some(close) => {
@@ -1127,6 +1159,11 @@ mod tests {
         ("://", &[]),
         ("?://@", &[]),
         ("h/live/KEYX?cb=http://x", &[]),
+        // A mask must not end before the end of the word `mask_word` masked.
+        ("srtsrc 'passphrase=SEKA'\\''SEKB' latency=1", &["SEKA", "SEKB"]),
+        ("srtsrc 'passphrase=SEKA'\"'\"'SEKB'", &["SEKA", "SEKB"]),
+        ("srtsrc \"passphrase=SEKA\"'SEKB'", &["SEKA", "SEKB"]),
+        ("'passphrase=SEKA'SEKB'SEKC'", &["SEKA", "SEKB", "SEKC"]),
     ];
 
     /// Ordinary lines that must come back unchanged.
@@ -1195,6 +1232,74 @@ mod tests {
         inputs
     }
 
+    /// Inputs that once panicked: a quote that closed in a skipped part,
+    /// a backtick, more nested quotes than are tracked.
+    fn panic_inputs() -> Vec<String> {
+        let mut inputs: Vec<String> = [
+            "'til now: srtsrc \"passphrase=it's\" ! srtsink uri='srt://h:9000'",
+            "the '90s srtsrc \"passphrase=it's x\" ! srtsink 'uri=srt://h:9000'",
+            "a `\"passphrase=x` b\" srt://h:9000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for quote in ["\"", "'", "`"] {
+            let nested: String = (0..20)
+                .map(|i| format!(" {}{}a", "\\".repeat(i % 4), quote))
+                .collect();
+            inputs.push(format!("{} passphrase=x srt://h:9000?a=1 b", nested));
+            inputs.push(format!("passphrase={} srt://h:9000 x", nested));
+        }
+        inputs
+    }
+
+    /// `n` pseudo-random gst-like lines of quotes, backslashes, pairs and
+    /// URLs, the same on every run.
+    fn fuzz_inputs(n: usize) -> impl Iterator<Item = String> {
+        const TOKENS: &[&str] = &[
+            "\"",
+            "'",
+            "`",
+            "\\",
+            " ",
+            " ",
+            "a",
+            "it's",
+            "=",
+            ":",
+            "@",
+            "?",
+            "&",
+            ",",
+            ")",
+            "!",
+            "srt://h:9000",
+            "srt://u:p@h",
+            "https://h/p?x=1",
+            "rtmp://h/live/k",
+            "passphrase=",
+            "uri=",
+            "token:",
+            "Bearer ",
+            "?passphrase=",
+            "ü",
+            "\n",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n).map(move |_| {
+            let len = 1 + next() % 24;
+            (0..len)
+                .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                .collect()
+        })
+    }
+
     #[test]
     fn shared_vectors_leak_nothing() {
         for (raw, secrets) in LEAKS {
@@ -1226,6 +1331,19 @@ mod tests {
             let _ = text(&input);
             let _ = url(&input);
             let _ = rtmp_url(&input);
+        }
+    }
+
+    /// The masking itself must not panic, not only `text` behind its guard.
+    #[test]
+    fn fuzzed_inputs_do_not_panic() {
+        for input in panic_inputs().into_iter().chain(fuzz_inputs(100_000)) {
+            let run = std::panic::catch_unwind(|| {
+                let _ = mask_text(&input);
+                let _ = url(&input);
+                let _ = rtmp_url(&input);
+            });
+            assert!(run.is_ok(), "panicked on {:?}", input);
         }
     }
 
