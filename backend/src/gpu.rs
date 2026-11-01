@@ -40,6 +40,17 @@ static VIDEO_CONVERT_MODE: OnceLock<VideoConvertMode> = OnceLock::new();
 /// Global GL renderer info, probed once at startup.
 static GL_RENDERER_INFO: OnceLock<Option<GlRendererInfo>> = OnceLock::new();
 
+/// GPU contexts every pipeline shares, captured once at startup.
+static SHARED_CONTEXTS: OnceLock<Vec<gst::Context>> = OnceLock::new();
+
+/// GStreamer context type of a CUDA device context (`nvcodec`).
+const CUDA_CONTEXT_TYPE: &str = "gst.cuda.context";
+
+/// Creates a CUDA context and posts it as HAVE_CONTEXT.
+const CUDA_CONTEXT_PROBE: &str = "videotestsrc num-buffers=1 ! cudaupload ! fakesink";
+
+/// Set to `1` to skip GPU detection and always use software conversion.
+const FORCE_SOFTWARE_CONVERT_ENV: &str = "STROM_FORCE_SOFTWARE_CONVERT";
 /// Pipeline that the CUDA-GL interop probe runs, in `gst-launch-1.0` syntax.
 #[cfg(not(target_os = "macos"))]
 const INTEROP_PROBE_PIPELINE: &str = "videotestsrc num-buffers=1 \
@@ -117,6 +128,17 @@ pub fn has_hardware_gl() -> bool {
     }
 }
 
+/// True when `glupload`'s udmabuf path yields empty textures on this host.
+///
+/// GStreamer 1.28's `glupload` offers upstream a udmabuf allocator and
+/// imports the frames as DMABuf into EGL. The NVIDIA driver imports them
+/// as empty textures: a system-memory source linked straight into a GL
+/// mixer composites as black (seen on an RTX 3090, driver 615). Mesa
+/// (AMD/Intel) is what the udmabuf path was built for and is left alone.
+pub fn udmabuf_upload_broken() -> bool {
+    gl_renderer_info().is_some_and(|info| info.vendor.to_lowercase().contains("nvidia"))
+}
+
 /// Probe the OpenGL renderer via GStreamer's GL context API.
 ///
 /// Creates a minimal in-process pipeline (`videotestsrc ! glupload ! appsink`),
@@ -132,8 +154,12 @@ fn detect_gl_renderer() -> Option<GlRendererInfo> {
     const GL_VERSION: u32 = 0x1F02;
     const GL_SHADING_LANGUAGE_VERSION: u32 = 0x8B8C;
 
+    // The GLMemory capsfilter is required: without it, GStreamer 1.28's
+    // glupload negotiates DMABuf output towards an unconstrained appsink,
+    // the buffer carries no GL context and the probe reports "no GL".
     let pipeline = gst::parse::launch(
-        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! glupload ! appsink name=sink",
+        "videotestsrc num-buffers=1 ! video/x-raw,width=64,height=64 ! glupload ! \
+         video/x-raw(memory:GLMemory) ! appsink name=sink",
     )
     .map_err(|e| warn!("GL probe: failed to create pipeline: {}", e))
     .ok()?;
@@ -231,12 +257,62 @@ fn detect_gl_renderer() -> Option<GlRendererInfo> {
     Some(gl_info)
 }
 
+/// Hand the process-wide GPU contexts to `pipeline`.
+///
+/// Without this every pipeline (each flow, and each media player's internal
+/// decode pipeline) creates its own CUDA context: measured ~250 MB host
+/// memory and ~300 MB VRAM per pipeline with 16 NVDEC inputs. A bin answers
+/// its elements' NEED_CONTEXT from contexts set on it, so setting them here
+/// before the pipeline starts is enough. No-op when no GPU context exists.
+pub fn share_gpu_contexts(pipeline: &gst::Pipeline) {
+    for context in SHARED_CONTEXTS.get().into_iter().flatten() {
+        pipeline.set_context(context);
+    }
+}
+
+/// Run `description` to completion and return the contexts of `context_type`
+/// its elements announced (HAVE_CONTEXT). Empty if an element is missing.
+fn capture_contexts(description: &str, context_type: &str) -> Vec<gst::Context> {
+    let Ok(pipeline) = gst::parse::launch(description) else {
+        return Vec::new();
+    };
+    let Some(bus) = pipeline.bus() else {
+        return Vec::new();
+    };
+    if pipeline.set_state(gst::State::Playing).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Vec::new();
+    }
+
+    let mut contexts = Vec::new();
+    let wanted = [
+        gst::MessageType::HaveContext,
+        gst::MessageType::Eos,
+        gst::MessageType::Error,
+    ];
+    while let Some(msg) = bus.timed_pop_filtered(gst::ClockTime::from_seconds(5), &wanted) {
+        let gst::MessageView::HaveContext(have) = msg.view() else {
+            break;
+        };
+        let context = have.context();
+        if context.context_type() == context_type {
+            contexts.push(context);
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    contexts
+}
+
 /// Detect GPU capabilities and set the global video conversion mode.
 /// This should be called once at startup after GStreamer is initialized.
 pub fn detect_gpu_capabilities() -> VideoConvertMode {
     // Probe GL renderer info early (best-effort, independent of CUDA-GL interop)
     let gl_info = detect_gl_renderer();
     let _ = GL_RENDERER_INFO.set(gl_info);
+
+    let cuda = capture_contexts(CUDA_CONTEXT_PROBE, CUDA_CONTEXT_TYPE);
+    info!("Shared GPU contexts: {} CUDA", cuda.len());
+    let _ = SHARED_CONTEXTS.set(cuda.into_iter().take(1).collect());
 
     let mode = detect_convert_mode();
     let _ = VIDEO_CONVERT_MODE.set(mode);
@@ -275,6 +351,17 @@ fn detect_convert_mode() -> VideoConvertMode {
     if is_wsl() {
         info!("WSL detected - using software video conversion (CUDA-GL interop unsupported)");
         // deprioritize_nv_decoders();
+        return VideoConvertMode::Software;
+    }
+
+    // Explicit override, for hosts where the CUDA-GL probe passes but
+    // autovideoconvert then fails to negotiate (not-negotiated on every
+    // vision mixer input with GStreamer 1.28).
+    if std::env::var(FORCE_SOFTWARE_CONVERT_ENV).is_ok_and(|v| v == "1") {
+        info!(
+            "{}=1 - using software video conversion",
+            FORCE_SOFTWARE_CONVERT_ENV
+        );
         return VideoConvertMode::Software;
     }
 
@@ -879,5 +966,13 @@ mod tests {
              discover it, so re-measure GpuAccelerated against threaded Software on macOS",
             converters
         );
+    }
+
+    /// Run with `cargo test -- --ignored` on a host with a hardware GL driver.
+    #[test]
+    #[ignore = "needs a hardware GL driver"]
+    fn test_gl_probe_finds_renderer() {
+        gst::init().unwrap();
+        assert!(detect_gl_renderer().is_some());
     }
 }

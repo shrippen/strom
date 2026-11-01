@@ -67,8 +67,15 @@ pub enum DeviceCategory {
 
 impl DeviceCategory {
     /// Parse device category from GStreamer device class string.
+    /// A class may name more parts after the first two
+    /// (`Video/Source/Hardware` from DeckLink); they do not change it.
     pub fn from_device_class(class: &str) -> Self {
-        match class {
+        let mut parts = class.splitn(3, '/');
+        let head = match (parts.next(), parts.next()) {
+            (Some(kind), Some(role)) => format!("{kind}/{role}"),
+            _ => class.to_string(),
+        };
+        match head.as_str() {
             "Audio/Source" => Self::AudioSource,
             "Audio/Sink" => Self::AudioSink,
             "Video/Source" => Self::VideoSource,
@@ -105,6 +112,14 @@ pub struct DeviceResponse {
     pub provider: String,
     /// Additional properties from the device.
     pub properties: HashMap<String, String>,
+    /// Speaker position of each channel of an audio device, in the
+    /// device's channel order: PipeWire's names (`FL`, `FR`, `FC`, `LFE`,
+    /// `RL`, `SL`, ..., `AUX0`... on pro-audio profiles). A sound server
+    /// routes a stream to a device by position, not by index, so a client
+    /// that addresses one device channel needs them. Empty when the device
+    /// does not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_positions: Vec<String>,
     /// Seconds since first discovery.
     pub first_seen_secs_ago: u64,
     /// Seconds since last seen.
@@ -219,6 +234,7 @@ mod tests {
             category: DeviceCategory::AudioSource,
             provider: provider.to_string(),
             properties,
+            channel_positions: vec![],
             first_seen_secs_ago: 0,
             last_seen_secs_ago: 0,
         }

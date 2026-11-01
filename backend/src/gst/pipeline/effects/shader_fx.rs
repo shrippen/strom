@@ -253,20 +253,9 @@ impl PipelineManager {
     /// Only TAKE slots are touched — the look slots (`fx_look_{i}`,
     /// `fx_pgm`) carry persistent effects and are never reset here.
     pub(crate) fn reset_take_fx(&self, block_instance_id: &str) {
-        let Some(state) = overlay::get_overlay_state(&self.flow_id, block_instance_id) else {
-            return;
-        };
+        self.reset_input_take_fx(block_instance_id);
         if !self.vision_mixer_fx_available(block_instance_id) {
             return;
-        }
-        for i in 0..state.num_inputs {
-            if let Some(e) = self
-                .elements
-                .get(&format!("{}:fx_take_{}", block_instance_id, i))
-            {
-                e.set_property("uniforms", neutral_uniforms());
-                shaders::request_passthrough(e, true);
-            }
         }
         if let Some(e) = self
             .elements
@@ -274,6 +263,29 @@ impl PipelineManager {
         {
             e.set_property("uniforms", neutral_uniforms());
             shaders::request_passthrough(e, true);
+        }
+    }
+
+    /// The inputs' TAKE slots of [`Self::reset_take_fx`] only, not the
+    /// program's: an inverted wipe leaves the outgoing input's slot fully
+    /// transparent until the next take, and a T-bar back to that input
+    /// would show nothing of it; a master envelope on the program slot
+    /// still decays by itself.
+    pub(crate) fn reset_input_take_fx(&self, block_instance_id: &str) {
+        let Some(state) = overlay::get_overlay_state(&self.flow_id, block_instance_id) else {
+            return;
+        };
+        if !self.vision_mixer_fx_available(block_instance_id) {
+            return;
+        }
+        for i in 0..state.capacity {
+            if let Some(e) = self
+                .elements
+                .get(&format!("{}:fx_take_{}", block_instance_id, i))
+            {
+                e.set_property("uniforms", neutral_uniforms());
+                shaders::request_passthrough(e, true);
+            }
         }
     }
 

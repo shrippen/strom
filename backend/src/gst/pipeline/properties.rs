@@ -94,7 +94,10 @@ impl PipelineManager {
     ) -> Result<(), PipelineError> {
         debug!(
             "Setting property: {}.{} = {:?} (ramp_ms={:?})",
-            element_id, prop_name, prop_value, ramp_ms
+            element_id,
+            prop_name,
+            crate::redact::value(prop_name, prop_value),
+            ramp_ms
         );
 
         // Audio volume element: route through the ramp manager to avoid
@@ -185,7 +188,10 @@ impl PipelineManager {
     ) -> Result<(), PipelineError> {
         debug!(
             "Updating property {}.{} to {:?} on running pipeline (ramp_ms={:?})",
-            element_id, property_name, value, ramp_ms
+            element_id,
+            property_name,
+            crate::redact::value(property_name, value),
+            ramp_ms
         );
 
         // Get element reference
@@ -277,7 +283,9 @@ impl PipelineManager {
 
         info!(
             "Successfully updated element property {}.{} to {:?}",
-            element_id, property_name, value
+            element_id,
+            property_name,
+            crate::redact::value(property_name, value)
         );
 
         Ok(())
@@ -378,7 +386,10 @@ impl PipelineManager {
     ) -> Result<(), PipelineError> {
         debug!(
             "Updating pad property {}:{}:{} to {:?}",
-            element_id, pad_name, property_name, value
+            element_id,
+            pad_name,
+            property_name,
+            crate::redact::value(property_name, value)
         );
 
         // Get element reference
@@ -410,7 +421,10 @@ impl PipelineManager {
 
         info!(
             "Successfully updated pad property {}:{}:{} to {:?}",
-            element_id, pad_name, property_name, value
+            element_id,
+            pad_name,
+            property_name,
+            crate::redact::value(property_name, value)
         );
 
         Ok(())
@@ -515,7 +529,10 @@ impl PipelineManager {
     ) -> Result<(), PipelineError> {
         debug!(
             "Setting pad property: {}:{}:{} = {:?}",
-            element_id, pad_name, prop_name, prop_value
+            element_id,
+            pad_name,
+            prop_name,
+            crate::redact::value(prop_name, prop_value)
         );
 
         // Some pad properties are version- or backend-specific. The clearest
@@ -703,7 +720,7 @@ impl PipelineManager {
 
         // Controllable properties can generally be changed at runtime
         // They're designed for dynamic updates via GstController
-        let can_change_at_runtime = controllable;
+        let can_change_at_runtime = controllable || is_live_safe(element, property_name);
 
         match current_state {
             PipelineState::Playing => {
@@ -756,7 +773,7 @@ const MAX_LISTED_ENUM_VALUES: usize = 24;
 /// — `{"pattern": 1}` on a `videotestsrc` is enough, and the unwind crosses the
 /// axum handler and skips the flow's teardown. Nothing reaches GLib from here
 /// without having been checked against the spec first.
-fn checked_property_value(
+pub(crate) fn checked_property_value(
     pspec: &glib::ParamSpec,
     prop_value: &PropertyValue,
 ) -> Result<glib::Value, String> {
@@ -1027,7 +1044,7 @@ fn text_form(prop_value: &PropertyValue) -> String {
 /// which drops the client's connection without a response and skips the
 /// caller's teardown, leaving a half-built flow behind — so treat a panic as
 /// one more way for the value to be invalid.
-fn set_checked_value<O: IsA<glib::Object>>(
+pub(crate) fn set_checked_value<O: IsA<glib::Object>>(
     obj: &O,
     prop_name: &str,
     value: &glib::Value,
@@ -1102,6 +1119,20 @@ fn enum_choices(class: &glib::EnumClass) -> String {
         listed.push("...".to_string());
     }
     format!("valid: {}", listed.join(", "))
+}
+
+/// Properties without the MUTABLE_PLAYING flag that are still safe to
+/// change while playing, as (element type, property).
+const LIVE_SAFE_PROPERTIES: &[(&str, &str)] = &[
+    // Shifts buffer timestamps only, e.g. an audio delay for lip sync.
+    ("GstIdentity", "ts-offset"),
+];
+
+fn is_live_safe(element: &gst::Element, property_name: &str) -> bool {
+    let type_name = element.type_().name();
+    LIVE_SAFE_PROPERTIES
+        .iter()
+        .any(|(t, p)| *t == type_name && *p == property_name)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use gstreamer_controller::prelude::*;
 use gstreamer_controller::InterpolationControlSource;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use strom_types::vision_mixer::{self, aspect_fit_rect, SourceAspects};
+use strom_types::vision_mixer::{self, aspect_fit_rect, PadMap, SourceAspects};
 use tracing::debug;
 
 use super::overlay;
@@ -28,9 +28,9 @@ use crate::gst::pipeline::effects::{
 use crate::gst::underlay::UnderlayCtx;
 use strom_types::FlowId;
 
-/// Watch the caps of every input video sink pad of the dist and multiview
-/// compositors. Each caps arrival/change triggers a full geometry refresh
-/// from the current overlay state.
+/// Watch the caps of the video sink pads of `inputs` on the dist and
+/// multiview compositors. Each caps arrival/change triggers a full geometry
+/// refresh from the current overlay state.
 ///
 /// Must run after linking (request pads exist). Elements are captured as
 /// `WeakRef`s in the handlers — pads own their handlers, and a strong
@@ -40,19 +40,18 @@ pub fn install_caps_probes(
     block_id: &str,
     mixer: &gst::Element,
     mv_comp: &gst::Element,
-    num_inputs: usize,
-    num_pips: usize,
+    pm: &PadMap,
+    inputs: impl IntoIterator<Item = usize>,
 ) {
-    // All pads that carry raw input video: dist sink_0..N-1, mv thumbnails
-    // sink_0..N-1, mv PVW candidates sink_{N+1..2N}, mv PiP candidates.
+    // All pads that carry raw input video: dist inputs, mv thumbnails, mv
+    // PVW candidates, mv PiP candidates.
     let mut pads: Vec<gst::Pad> = Vec::new();
-    for i in 0..num_inputs {
-        pads.extend(find_pad(mixer, &format!("sink_{}", i)));
-        pads.extend(find_pad(mv_comp, &format!("sink_{}", i)));
-        pads.extend(find_pad(mv_comp, &format!("sink_{}", num_inputs + 1 + i)));
-        for p in 0..num_pips {
-            let idx = 2 * num_inputs + 1 + p * num_inputs + i;
-            pads.extend(find_pad(mv_comp, &format!("sink_{}", idx)));
+    for i in inputs {
+        pads.extend(find_pad(mixer, &PadMap::sink(pm.dist_input(i))));
+        pads.extend(find_pad(mv_comp, &PadMap::sink(pm.mv_thumb(i))));
+        pads.extend(find_pad(mv_comp, &PadMap::sink(pm.mv_pvw(i))));
+        for p in 0..pm.num_pips {
+            pads.extend(find_pad(mv_comp, &PadMap::sink(pm.mv_pip(p, i))));
         }
     }
 
@@ -93,6 +92,30 @@ pub fn install_caps_probes(
     );
 }
 
+/// Re-fit the multiview after the set of inputs changed (a dynamic input
+/// came or went): the thumbnails move to the new layout. The dist mixer is
+/// left alone, so a held T-bar or a running take on program is untouched. Runs on the main loop like
+/// the caps-driven refreshes, so the two never interleave.
+pub(crate) fn schedule_relayout(
+    flow_id: FlowId,
+    block_id: &str,
+    mixer: &gst::Element,
+    mv_comp: &gst::Element,
+) {
+    if let Some(state) = overlay::get_overlay_state(&flow_id, block_id) {
+        state.mv_relayout_pending.store(true, Ordering::Relaxed);
+    }
+    let block_id = block_id.to_string();
+    let mixer_weak = mixer.downgrade();
+    let mv_weak = mv_comp.downgrade();
+    gst::glib::idle_add_once(move || {
+        let (Some(mixer), Some(mv_comp)) = (mixer_weak.upgrade(), mv_weak.upgrade()) else {
+            return;
+        };
+        refresh_geometry(flow_id, &block_id, &mixer, &mv_comp);
+    });
+}
+
 /// Read the UNCROPPED source `(width, height)` feeding a sink pad. On the
 /// CPU backend the pad's own caps are post-videocrop; this walks past it.
 fn pad_caps_dims(element: &gst::Element, pad_name: &str) -> Option<(i32, i32)> {
@@ -107,7 +130,8 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     let Some(state) = overlay::get_overlay_state(&flow_id, block_id) else {
         return;
     };
-    let n = state.num_inputs;
+    let n = state.capacity;
+    let pm = state.pad_map();
 
     // Per-input UNCROPPED source dims from the dist mixer pads' negotiated
     // caps (refreshes run deferred on the main loop, so the triggering caps
@@ -115,8 +139,8 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     // mv thumbnail pad serves as fallback — same tee, same dimensions.
     let dims: Vec<Option<(i32, i32)>> = (0..n)
         .map(|i| {
-            pad_caps_dims(mixer, &format!("sink_{}", i))
-                .or_else(|| pad_caps_dims(mv_comp, &format!("sink_{}", i)))
+            pad_caps_dims(mixer, &PadMap::sink(pm.dist_input(i)))
+                .or_else(|| pad_caps_dims(mv_comp, &PadMap::sink(pm.mv_thumb(i))))
         })
         .collect();
 
@@ -125,8 +149,16 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     // refreshing on each of those events would clear control bindings and
     // kill the very animation producing them. Source dims are read upstream
     // of videocrop, so crop-induced caps events never count as changes.
-    let dims_changed = state.update_input_dims(&dims);
-    if !dims_changed && !state.layout_refit_pending.load(Ordering::Relaxed) {
+    let changed = state.update_input_dims(&dims);
+    // The dist mixer only re-fits for a size change of what program shows:
+    // takes and the T-bar fit their inputs themselves, and re-applying the
+    // layout would rest a held T-bar (an input coming, going or changing
+    // size off air must not touch program).
+    let dist_needed = state.layout_refit_pending.load(Ordering::Relaxed)
+        || changed.iter().any(|&i| state.on_program(i));
+    let mv_needed =
+        dist_needed || !changed.is_empty() || state.mv_relayout_pending.load(Ordering::Relaxed);
+    if !mv_needed {
         return;
     }
 
@@ -141,8 +173,12 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     let mv_busy = mv_animation.is_some();
     state
         .layout_refit_pending
-        .store(dist_busy || mv_busy, Ordering::Relaxed);
-    let retry = [dist_animation, mv_animation].into_iter().flatten().max();
+        .store(dist_needed && dist_busy, Ordering::Relaxed);
+    state.mv_relayout_pending.store(mv_busy, Ordering::Relaxed);
+    let retry = [dist_animation.filter(|_| dist_needed), mv_animation]
+        .into_iter()
+        .flatten()
+        .max();
     if let Some(wait) = retry {
         refit_after(flow_id, block_id, mixer, mv_comp, wait + REFIT_MARGIN);
     }
@@ -171,16 +207,16 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     });
     let pvw_underlay = state.mv_pvw_underlay_base().map(|base| UnderlayCtx {
         base,
-        scale: state.layout.pvw_rect.w / pgm_w,
+        scale: state.layout().pvw_rect.w / pgm_w,
     });
 
     // --- Dist compositor (PGM). ---
-    if !dist_busy {
+    if dist_needed && !dist_busy {
         if let Some(p) = state.pgm_pip() {
             apply_pip_layout_to_region(
                 mixer,
-                0,
-                n,
+                pm.dist_input(0),
+                pm.capacity,
                 (0, 0, cw, ch),
                 state.pip_bg_input(p),
                 &state.pip_zones(p),
@@ -194,8 +230,8 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
         } else {
             apply_input_group_to_region(
                 mixer,
-                0,
-                n,
+                pm.dist_input(0),
+                pm.capacity,
                 (0, 0, cw, ch),
                 state.pgm_input(),
                 vision_mixer::DIST_PGM_ZORDER,
@@ -208,10 +244,10 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
 
     // --- Multiview thumbnails: always visible, aspect-fitted per source. ---
     for i in 0..n {
-        let Some(pad) = find_pad(mv_comp, &format!("sink_{}", i)) else {
+        let Some(pad) = find_pad(mv_comp, &PadMap::sink(pm.mv_thumb(i))) else {
             continue;
         };
-        let (tx, ty, tw, th) = super::layout::thumbnail_pad_position(&state.layout, i);
+        let (tx, ty, tw, th) = super::layout::thumbnail_pad_position(&state.layout(), i);
         let aspect = aspects.get(&i).copied().unwrap_or(fallback);
         let (x, y, w, h) = aspect_fit_rect(tx, ty, tw, th, aspect);
         pad.set_property("xpos", x);
@@ -225,13 +261,13 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     }
 
     // --- Multiview PVW big region. ---
-    let r = &state.layout.pvw_rect;
+    let r = &state.layout().pvw_rect;
     let pvw_region = (r.x as i32, r.y as i32, r.w as i32, r.h as i32);
     if let Some(p) = state.pvw_pip() {
         apply_pip_layout_to_region(
             mv_comp,
-            n + 1,
-            n,
+            pm.mv_pvw_base(),
+            pm.capacity,
             pvw_region,
             state.pip_bg_input(p),
             &state.pip_zones(p),
@@ -245,8 +281,8 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     } else {
         apply_input_group_to_region(
             mv_comp,
-            n + 1,
-            n,
+            pm.mv_pvw_base(),
+            pm.capacity,
             pvw_region,
             state.pvw_input(),
             vision_mixer::MV_BIG_DISPLAY_ZORDER,
@@ -257,8 +293,9 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
     }
 
     // --- Multiview PiP tiles (always rendered). ---
+    let layout = state.layout();
     for p in 0..state.num_pips {
-        let Some(tile) = state.layout.pip_tile_rects.get(p) else {
+        let Some(tile) = layout.pip_tile_rects.get(p) else {
             continue;
         };
         let region = (tile.x as i32, tile.y as i32, tile.w as i32, tile.h as i32);
@@ -268,8 +305,8 @@ fn refresh_geometry(flow_id: FlowId, block_id: &str, mixer: &gst::Element, mv_co
         });
         apply_pip_layout_to_region(
             mv_comp,
-            2 * n + 1 + p * n,
-            n,
+            pm.mv_pip_base(p),
+            pm.capacity,
             region,
             state.pip_bg_input(p),
             &state.pip_zones(p),
@@ -299,10 +336,21 @@ const REFIT_MARGIN: Duration = Duration::from_millis(50);
 /// pads, or `None` when none lies ahead. Keyframes are in the compositor's
 /// stream time, which is what its position query reports.
 fn animation_remaining(compositor: &gst::Element) -> Option<Duration> {
+    pads_animation_remaining(compositor, &compositor.sink_pads())
+}
+
+/// [`animation_remaining`] of the dist mixer's input pads (not DSK, border
+/// or stinger pads): a take or the program fading back from black.
+pub(crate) fn inputs_animation_remaining(mixer: &gst::Element, pm: &PadMap) -> Option<Duration> {
+    let inputs: Vec<gst::Pad> = (0..pm.capacity)
+        .filter_map(|i| mixer.static_pad(&PadMap::sink(pm.dist_input(i))))
+        .collect();
+    pads_animation_remaining(mixer, &inputs)
+}
+
+fn pads_animation_remaining(compositor: &gst::Element, pads: &[gst::Pad]) -> Option<Duration> {
     let now = compositor.query_position::<gst::ClockTime>()?;
-    compositor
-        .sink_pads()
-        .iter()
+    pads.iter()
         .flat_map(|pad| {
             ANIMATED_PAD_PROPS
                 .iter()

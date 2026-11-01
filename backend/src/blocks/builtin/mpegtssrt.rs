@@ -289,7 +289,9 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
         //
         // Solution for transcoding (encode-as-fast-as-possible):
         // - sync=false: Don't try to maintain real-time clock synchronization
-        // - qos=true: Enable QoS events so sink can report back pressure to upstream
+        // - qos=true: the sink posts QoS bus messages (QoS statistics); its
+        //   upstream QoS events are dropped, as at every qos-enabled sink
+        //   (`drop_sink_qos_events` in pipeline construction)
         // - Buffers are pushed as fast as they're produced
         //
         // When you WOULD want sync=true:
@@ -309,12 +311,12 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
         if has_auto_reconnect {
             info!(
                 "SRT sink configured: uri={}, latency={}ms, wait={}, auto-reconnect={}, sync={}, qos=true",
-                srt_uri, latency, wait_for_connection, auto_reconnect, sync
+                crate::redact::url(&srt_uri), latency, wait_for_connection, auto_reconnect, sync
             );
         } else {
             info!(
                 "SRT sink configured: uri={}, latency={}ms, wait={}, sync={}, qos=true (auto-reconnect not available)",
-                srt_uri, latency, wait_for_connection, sync
+                crate::redact::url(&srt_uri), latency, wait_for_connection, sync
             );
         }
 

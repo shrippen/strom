@@ -10,7 +10,8 @@
 //! covers a lower zone's border like a stacked framed card.
 //!
 //! Each underlay pad is fed by a tiny `videotestsrc pattern=solid-color`
-//! (16×16, non-live so it adds no latency) that pushes a single frame and
+//! (16×16, non-live so it adds no latency, see [`make_underlay_src`]) that
+//! pushes a single frame and
 //! then EOS. A live aggregator does not wait for an EOS pad.
 //!
 //! An underlay pad holds that frame (`repeat-after-eos` on) while its zone
@@ -81,7 +82,7 @@ fn is_underlay_src(el: &gst::Element) -> bool {
 
 /// The underlay source feeding an underlay pad, found by walking upstream
 /// past the short static chain (capsfilter / glupload / videoconvert).
-fn upstream_underlay_src(pad: &gst::Pad) -> Option<gst::Element> {
+pub(crate) fn upstream_underlay_src(pad: &gst::Pad) -> Option<gst::Element> {
     let mut el = pad.peer()?.parent_element()?;
     for _ in 0..6 {
         if is_underlay_src(&el) {
@@ -93,15 +94,22 @@ fn upstream_underlay_src(pad: &gst::Pad) -> Option<gst::Element> {
     None
 }
 
-/// Create the source feeding one underlay pad: a non-live solid-color
+/// Create the source feeding one underlay pad: a solid-color
 /// `videotestsrc` that pushes one frame and then EOS. `name` must follow
 /// `<block>:underlay_<...>_src`; the pad it feeds is registered with
 /// [`watch_underlay_pad`] once linked.
-pub(crate) fn make_underlay_src(name: &str) -> Result<gst::Element, gst::glib::BoolError> {
+///
+/// Non-live unless `live`: a mixer that starts at its first buffer needs
+/// the frame stamped with running time, not 0 (see
+/// `PipelineParams::underlay_source`).
+pub(crate) fn make_underlay_src(
+    name: &str,
+    live: bool,
+) -> Result<gst::Element, gst::glib::BoolError> {
     debug_assert!(name.contains(UNDERLAY_SRC_INFIX) && name.ends_with(UNDERLAY_SRC_SUFFIX));
     let src = gst::ElementFactory::make("videotestsrc")
         .name(name)
-        .property("is-live", false)
+        .property("is-live", live)
         .property("num-buffers", 1i32)
         .build()?;
     src.set_property_from_str("pattern", "solid-color");
@@ -341,6 +349,35 @@ pub(crate) fn quiesce_underlay_restarts(pipeline: &gst::Element) {
     }
 }
 
+/// Stop restarting the underlay sources among `elements`, which are about
+/// to leave a running pipeline, and wait for restarts already under way.
+/// Call before stopping them: a restart running meanwhile would bring a
+/// stopped source back to its pipeline's state.
+pub(crate) fn quiesce_underlay_sources(elements: &[gst::Element]) {
+    {
+        let mut stopping = stopping();
+        stopping.retain(|w| w.upgrade().is_some());
+        stopping.extend(elements.iter().map(|e| e.downgrade()));
+    }
+    let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+    loop {
+        let busy = restarts()
+            .iter()
+            .any(|(w, _)| w.upgrade().is_some_and(|src| elements.contains(&src)));
+        if !busy {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                "Underlay restarts still running {}s into a removal",
+                QUIESCE_TIMEOUT.as_secs()
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Slack past the compositor's output position for a restarted frame. A held
 /// pad drops a frame that ends before its current one, and the current one
 /// may have been taken up to an output frame ahead of the position.
@@ -386,7 +423,7 @@ fn restart_underlay_src(src: &gst::Element) -> bool {
     let Some(parent) = src.parent().and_then(|p| p.downcast::<gst::Element>().ok()) else {
         return false;
     };
-    if is_stopping(&parent) {
+    if is_stopping(&parent) || is_stopping(src) {
         return false;
     }
     let (_, current, pending) = parent.state(gst::ClockTime::ZERO);

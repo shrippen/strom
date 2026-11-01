@@ -133,6 +133,14 @@ impl BlockBuilder for MediaPlayerBuilder {
             })
             .unwrap_or(timing::DEFAULT_PLAYOUT_DELAY_MS);
 
+        let system_memory = properties
+            .get("system_memory")
+            .and_then(|v| match v {
+                PropertyValue::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
         let position_update_interval_ms = properties
             .get("position_update_interval")
             .and_then(|v| match v {
@@ -207,6 +215,7 @@ impl BlockBuilder for MediaPlayerBuilder {
             decode,
             decoder,
             sync,
+            system_memory,
             playout_delay_ms,
             position_update_interval_ms,
             initial_playlist,
@@ -231,6 +240,7 @@ fn build_media_player(
     decode: bool,
     decoder: bridge::Decoder,
     sync: bool,
+    system_memory: bool,
     playout_delay_ms: u64,
     position_update_interval_ms: u64,
     initial_playlist: Vec<String>,
@@ -321,6 +331,7 @@ fn build_media_player(
         audio_slots: MediaPlayerState::free_slots(num_audio_slots),
         decode,
         sync,
+        system_memory,
         media_path: media_path.clone(),
         timing: Arc::new(if stinger_mode {
             Timing::for_stinger(timing::STINGER_RELEASE_AHEAD_MS)
@@ -329,6 +340,7 @@ fn build_media_player(
         }),
         main_pipeline: gst::glib::WeakRef::new(),
         bus_watch: std::sync::Mutex::new(None),
+        still: Default::default(),
         stinger: super::state::StingerPlayback {
             enabled: stinger_mode,
             ..Default::default()
@@ -341,7 +353,11 @@ fn build_media_player(
         .map(|f| normalize_uri(f, &media_path));
 
     if let Some(ref uri) = initial_uri {
-        info!("Media Player {}: Initial URI: {}", instance_id, uri);
+        info!(
+            "Media Player {}: Initial URI: {}",
+            instance_id,
+            crate::redact::text(uri)
+        );
     }
     *state
         .stinger

@@ -197,6 +197,27 @@ mod build_time {
         );
     }
 
+    /// `/flows/{id}/output-bytes` reads the sink's socket counter: the sink
+    /// counts as a network output, at zero before it has connected, and
+    /// nothing else in the block has a counter.
+    #[test]
+    fn the_sink_reports_its_network_byte_counter() {
+        use strom::gst::pipeline::output_bytes::output_byte_count;
+        use strom_types::api::{OutputByteCount, OutputMedium};
+        if !plugins_available() {
+            return;
+        }
+        let result = build(HashMap::new());
+        assert_eq!(
+            output_byte_count(element(&result, ":rtmp_sink")),
+            Some(OutputByteCount {
+                medium: OutputMedium::Network,
+                bytes: 0
+            })
+        );
+        assert_eq!(output_byte_count(element(&result, ":rtmp_flvmux")), None);
+    }
+
     #[test]
     fn every_mapping_names_an_element_the_block_builds() {
         if !plugins_available() {

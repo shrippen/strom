@@ -17,7 +17,7 @@
 //! - capsfilter: Sets output caps for proper codec negotiation
 
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
-use crate::gpu::{self, video_convert_mode};
+use crate::gpu::{self, video_convert_mode, VideoConvertMode};
 use crate::gst::pipeline::properties::set_property_checked;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -119,18 +119,12 @@ impl BlockBuilder for VideoEncBuilder {
         // Note: We always use "videoconvert" as the element ID for consistent external pad references,
         // even when the actual GStreamer element is "autovideoconvert"
         let convert_mode = video_convert_mode();
-        let convert_element_name = convert_mode.element_name();
+        let convert_element_name = convert_chain(convert_mode, &encoder_name).join(" ! ");
         let convert_id = format!("{}:videoconvert", instance_id);
         let encoder_id = format!("{}:encoder", instance_id);
         let capsfilter_id = format!("{}:capsfilter", instance_id);
 
-        let videoconvert = gst::ElementFactory::make(convert_element_name)
-            .name(&convert_id)
-            .build()
-            .map_err(|e| {
-                BlockBuildError::ElementCreation(format!("{}: {}", convert_element_name, e))
-            })?;
-        gpu::configure_video_convert(&videoconvert);
+        let videoconvert = build_convert(convert_mode, &encoder_name, &convert_id)?;
 
         let encoder = gst::ElementFactory::make(&encoder_name)
             .name(&encoder_id)
@@ -147,6 +141,9 @@ impl BlockBuilder for VideoEncBuilder {
             rate_control,
             keyframe_interval,
         )?;
+
+        // Encode time per frame, for the flow's block statistics.
+        crate::stats::encoder::time_encoder(&encoder);
 
         // Create parser for the codec (critical for proper MPEG-TS muxing and playback)
         let parser_name = get_parser_name(codec);
@@ -206,6 +203,74 @@ impl BlockBuilder for VideoEncBuilder {
             pad_properties: HashMap::new(),
         })
     }
+}
+
+/// Converter elements in front of `encoder_name`, in link order.
+///
+/// - NVENC: `cudaupload ! cudaconvert`. `autovideoconvert` would upload
+///   system-memory frames through OpenGL (`glupload ! glcolorconvert`)
+///   for NVENC to map via CUDA-GL interop; on that path strom grew
+///   ~30 MB/h with an ISO recording (lmix H.24). `cudaupload` passes CUDA
+///   memory through, `cudaconvert` turns e.g. I420 (which NVENC does not
+///   take from CUDA memory) into a format it does, on the GPU.
+/// - Software mode: `videoconvert` only takes system memory, but a CUDA
+///   producer such as the vision mixer's CUDA compositor hands over
+///   `memory:CUDAMemory` and the link fails with not-negotiated. The
+///   converter is therefore `cudadownload ! videoconvert` when
+///   `cudadownload` exists; it passes system memory through unchanged.
+fn convert_chain(mode: VideoConvertMode, encoder_name: &str) -> Vec<&'static str> {
+    let have = |factory: &str| gst::ElementFactory::find(factory).is_some();
+    if is_nvenc(encoder_name) && have("cudaupload") && have("cudaconvert") {
+        return vec!["cudaupload", "cudaconvert"];
+    }
+    if mode == VideoConvertMode::Software && have("cudadownload") {
+        return vec!["cudadownload", mode.element_name()];
+    }
+    vec![mode.element_name()]
+}
+
+fn is_nvenc(encoder_name: &str) -> bool {
+    encoder_name.starts_with("nv") && encoder_name.ends_with("enc")
+}
+
+/// Build the converter in front of the encoder, named `name`: one element,
+/// or a bin with ghost pads `sink`/`src` (see [`convert_chain`]).
+fn build_convert(
+    mode: VideoConvertMode,
+    encoder_name: &str,
+    name: &str,
+) -> Result<gst::Element, BlockBuildError> {
+    let make = |factory: &str, name: &str| {
+        gst::ElementFactory::make(factory)
+            .name(name)
+            .build()
+            .inspect(gpu::configure_video_convert)
+            .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", factory, e)))
+    };
+
+    let chain = convert_chain(mode, encoder_name);
+    if let [factory] = chain[..] {
+        return make(factory, name);
+    }
+
+    let elements = chain
+        .iter()
+        .map(|factory| make(factory, &format!("{}-{}", name, factory)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bin = gst::Bin::builder().name(name).build();
+    let to_err = |e: gst::glib::BoolError| BlockBuildError::ElementCreation(e.to_string());
+    bin.add_many(&elements).map_err(to_err)?;
+    gst::Element::link_many(&elements).map_err(to_err)?;
+    let ghost = |element: &gst::Element, pad: &str| {
+        let target = element.static_pad(pad).expect("static pad");
+        gst::GhostPad::builder_with_target(&target)
+            .map(|b| b.name(pad).build())
+            .map_err(to_err)
+    };
+    bin.add_pad(&ghost(&elements[0], "sink")?).map_err(to_err)?;
+    bin.add_pad(&ghost(elements.last().expect("chain"), "src")?)
+        .map_err(to_err)?;
+    Ok(bin.upcast())
 }
 
 /// Get the parser element name for the given codec.

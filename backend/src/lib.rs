@@ -44,6 +44,7 @@ pub mod osc;
 pub mod paths;
 pub mod ports;
 pub mod ptp_monitor;
+pub mod redact;
 pub mod rtsp_server;
 pub mod server_hardening;
 pub mod sharing;
@@ -181,6 +182,10 @@ pub async fn create_app_with_config(
         )
         .route("/flows/{id}/srt-stats", get(api::flows::get_srt_stats))
         .route(
+            "/flows/{id}/output-bytes",
+            get(api::flows::get_output_bytes),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/sdp",
             get(api::flows::get_block_sdp),
         )
@@ -221,12 +226,43 @@ pub async fn create_app_with_config(
             put(api::flows::select_preview),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/tbar",
+            post(api::flows::hold_transition),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/pip/{pip_idx}",
             get(api::flows::get_pip_config).put(api::flows::update_pip_config),
         )
         .route(
             "/flows/{flow_id}/blocks/{block_id}/state",
             get(api::flows::get_vision_mixer_state),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/inputs",
+            get(api::vision_mixer_inputs::list_vision_mixer_inputs)
+                .post(api::vision_mixer_inputs::add_vision_mixer_input),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/aux_buses",
+            get(api::mixer_aux_buses::list_mixer_aux_buses)
+                .post(api::mixer_aux_buses::add_mixer_aux_bus),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/aux_buses/{aux}",
+            delete(api::mixer_aux_buses::remove_mixer_aux_bus),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/channels",
+            get(api::mixer_channels::list_mixer_channels)
+                .post(api::mixer_channels::add_mixer_channel),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/channels/{channel}",
+            delete(api::mixer_channels::remove_mixer_channel),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/inputs/{index}",
+            delete(api::vision_mixer_inputs::remove_vision_mixer_input),
         )
         .route(
             "/flows/{flow_id}/blocks/{block_id}/overlay-alpha",
@@ -392,6 +428,67 @@ pub async fn create_app_with_config(
             "/flows/{flow_id}/blocks/{block_id}/player/goto",
             post(api::mediaplayer::goto_file),
         )
+        // Show Playback: sound cues in zones
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback",
+            get(api::show_playback::get_show_playback),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds",
+            post(api::show_playback::add_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/play",
+            post(api::show_playback::play_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/fade",
+            post(api::show_playback::fade_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/stop",
+            post(api::show_playback::stop_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/pause",
+            post(api::show_playback::pause_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/sounds/{sound_id}/resume",
+            post(api::show_playback::resume_sound),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/zones/{zone}",
+            post(api::show_playback::set_zone_level),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures",
+            post(api::show_playback::add_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/play",
+            post(api::show_playback::play_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/fade",
+            post(api::show_playback::fade_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/stop",
+            post(api::show_playback::stop_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/pause",
+            post(api::show_playback::pause_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/pictures/{picture_id}/resume",
+            post(api::show_playback::resume_picture),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/show_playback/stages/{stage}",
+            post(api::show_playback::set_stage_level),
+        )
         // Remote control of the Chromium browsers behind HTML sources.
         // Minting a link is authenticated; opening one is not, because the
         // key in the link is itself the credential (see api::devtools).
@@ -403,6 +500,10 @@ pub async fn create_app_with_config(
         .route(
             "/flows/{flow_id}/blocks/{block_id}/devtools/link",
             post(api::devtools::create_block_link),
+        )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/devtools/page",
+            post(api::devtools::page_command),
         )
         .route("/devtools/links", get(api::devtools::list_links))
         .route("/devtools/links", delete(api::devtools::revoke_all_links))

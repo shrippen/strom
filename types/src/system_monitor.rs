@@ -31,6 +31,9 @@ pub struct SystemStats {
     pub total_memory: u64,
     /// Used system memory in bytes
     pub used_memory: u64,
+    /// Resident memory of the strom process in bytes (if available)
+    #[serde(default)]
+    pub process_memory: Option<u64>,
     /// GPU statistics (if available)
     pub gpu_stats: Vec<GpuStats>,
     /// OpenGL renderer info from GStreamer (if available)
@@ -59,4 +62,10 @@ pub struct GpuStats {
     pub temperature: Option<f32>,
     /// Power usage in watts (if available)
     pub power_usage: Option<f32>,
+    /// Hardware video decoder (e.g. NVDEC) utilization percentage (if available)
+    #[serde(default)]
+    pub decoder_utilization: Option<f32>,
+    /// Hardware video encoder (e.g. NVENC) utilization percentage (if available)
+    #[serde(default)]
+    pub encoder_utilization: Option<f32>,
 }

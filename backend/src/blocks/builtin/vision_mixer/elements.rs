@@ -4,13 +4,33 @@ use crate::blocks::BlockBuildError;
 use crate::gpu;
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video::gst_base;
+use gstreamer_video::gst_base::prelude::*;
 use tracing::{debug, info, trace};
 
 /// Compositor backend selection result.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompositorBackend {
     OpenGL,
+    /// NVIDIA `cudacompositor`. Frames stay in CUDA memory from NVDEC to
+    /// NVENC; no shader FX (wipes fall back to fade, like the CPU backend).
+    Cuda,
     Software,
+}
+
+/// Compositor factory per backend.
+const GL_COMPOSITOR: &str = "glvideomixerelement";
+pub(crate) const CUDA_COMPOSITOR: &str = "cudacompositor";
+const CPU_COMPOSITOR: &str = "compositor";
+
+impl CompositorBackend {
+    fn compositor_factory(self) -> &'static str {
+        match self {
+            CompositorBackend::OpenGL => GL_COMPOSITOR,
+            CompositorBackend::Cuda => CUDA_COMPOSITOR,
+            CompositorBackend::Software => CPU_COMPOSITOR,
+        }
+    }
 }
 
 /// Determine which compositor backend to use.
@@ -23,6 +43,16 @@ pub fn select_backend(preference: &str) -> Result<CompositorBackend, BlockBuildE
                 Err(BlockBuildError::ElementCreation(
                     "GPU backend requested but glvideomixerelement not available".to_string(),
                 ))
+            }
+        }
+        "cuda" => {
+            if gst::ElementFactory::find(CUDA_COMPOSITOR).is_some() {
+                Ok(CompositorBackend::Cuda)
+            } else {
+                Err(BlockBuildError::ElementCreation(format!(
+                    "CUDA backend requested but {} not available",
+                    CUDA_COMPOSITOR
+                )))
             }
         }
         "cpu" => Ok(CompositorBackend::Software),
@@ -41,16 +71,16 @@ pub fn select_backend(preference: &str) -> Result<CompositorBackend, BlockBuildE
     }
 }
 
+pub use crate::blocks::builtin::start_time::StartTime;
+
 /// Create the distribution (PGM) compositor element.
 pub fn make_dist_compositor(
     backend: CompositorBackend,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) -> Result<gst::Element, BlockBuildError> {
-    let element_type = match backend {
-        CompositorBackend::OpenGL => "glvideomixerelement",
-        CompositorBackend::Software => "compositor",
-    };
+    let element_type = backend.compositor_factory();
 
     let mixer = gst::ElementFactory::make(element_type)
         .name("mixer")
@@ -58,9 +88,12 @@ pub fn make_dist_compositor(
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", element_type, e)))?;
 
-    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms);
+    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms, start);
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
+    }
+    if backend == CompositorBackend::Cuda {
+        guard_cuda_full_alpha(&mixer);
     }
     debug!(
         "Created distribution compositor: {} ({})",
@@ -75,11 +108,9 @@ pub fn make_mv_compositor(
     backend: CompositorBackend,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) -> Result<gst::Element, BlockBuildError> {
-    let element_type = match backend {
-        CompositorBackend::OpenGL => "glvideomixerelement",
-        CompositorBackend::Software => "compositor",
-    };
+    let element_type = backend.compositor_factory();
 
     let mixer = gst::ElementFactory::make(element_type)
         .name("mv_comp")
@@ -87,9 +118,12 @@ pub fn make_mv_compositor(
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", element_type, e)))?;
 
-    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms);
+    apply_post_build_properties(&mixer, latency_ms, min_upstream_latency_ms, start);
     if mixer.find_property("background").is_some() {
         mixer.set_property_from_str("background", "black");
+    }
+    if backend == CompositorBackend::Cuda {
+        guard_cuda_full_alpha(&mixer);
     }
 
     debug!(
@@ -100,12 +134,43 @@ pub fn make_mv_compositor(
     Ok(mixer)
 }
 
+/// Alpha just below 1.0 that is still exactly 1.0 as `f32`.
+const CUDA_FULL_ALPHA: f64 = 1.0 - 1e-12;
+
+/// Work around `cudaconverter` (GStreamer 1.28, also main): its `alpha`
+/// setter compares against a field it never updates (always 1.0), so a pad
+/// going from a fraction back to exactly 1.0 keeps the fraction. After a
+/// fade the new program stayed at its last in-between alpha (~0.97, Ball
+/// on grey) and the old source, cut back later, at ~0.03 (nearly black).
+/// 1.0 on a `cudacompositor` pad becomes `CUDA_FULL_ALPHA`: a change for the
+/// converter, and 1.0 again in the kernel's `f32`, so no level is lost.
+/// Known limit: the handler reads, then writes. A direct write of another
+/// value from the API thread (a cut) landing between the two while a fade
+/// binding still sets 1.0 each frame is overwritten; the window is
+/// microseconds once per frame, not seen. Goes with the upstream fix.
+fn guard_cuda_full_alpha(mixer: &gst::Element) {
+    mixer.connect_pad_added(|_, pad| {
+        if pad.direction() != gst::PadDirection::Sink || pad.find_property("alpha").is_none() {
+            return;
+        }
+        pad.connect_notify(Some("alpha"), |pad, _| {
+            if pad.property::<f64>("alpha") == 1.0 {
+                pad.set_property("alpha", CUDA_FULL_ALPHA);
+            }
+        });
+        if pad.property::<f64>("alpha") == 1.0 {
+            pad.set_property("alpha", CUDA_FULL_ALPHA);
+        }
+    });
+}
+
 /// Apply compositor properties that can be set after construction.
 /// Note: force-live is construct-only and must be set via ElementFactory::make().property().
 fn apply_post_build_properties(
     mixer: &gst::Element,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) {
     if mixer.find_property("latency").is_some() {
         let latency_ns = latency_ms * 1_000_000;
@@ -115,6 +180,14 @@ fn apply_post_build_properties(
         let latency_ns = min_upstream_latency_ms * 1_000_000;
         mixer.set_property("min-upstream-latency", latency_ns);
     }
+    // Pads that never got a buffer (a DSK layer or input nobody feeds yet)
+    // would make the live aggregator wait for its deadline on every
+    // frame, adding the whole latency budget to program (~50 ms).
+    // glvideomixerelement has no property for it, so set it through the
+    // aggregator API, which every compositor backend has.
+    if let Some(aggregator) = mixer.downcast_ref::<gst_base::Aggregator>() {
+        aggregator.set_ignore_inactive_pads(true);
+    }
     if mixer.find_property("start-time-selection").is_some() {
         // Use "zero" instead of "first" to avoid a race condition in GStreamer 1.26:
         // with "first", if the aggregator srcpad task runs before any buffer arrives,
@@ -122,9 +195,12 @@ fn apply_post_build_properties(
         // causing the compositor to wait for an impossibly far deadline (2× system uptime).
         // With "zero" and force-live=true, running time starts at 0 which is correct
         // for live pipelines using monotonic clock.
-        mixer.set_property_from_str("start-time-selection", "zero");
+        // With base time 0, running time is clock time and "zero" would make
+        // the compositor catch up from 0 forever; "first" is right there
+        // (and the race above is harmless: clock time is the start time).
+        mixer.set_property_from_str("start-time-selection", start.nick());
     }
-    crate::gst::aggregator_start::disarm_start_time_selection(mixer);
+    crate::blocks::builtin::start_time::disarm_zero_start(mixer, start);
 }
 
 /// Create a tee element for splitting input to multiple consumers.
@@ -142,6 +218,25 @@ pub fn make_queue(name: &str) -> Result<gst::Element, BlockBuildError> {
         .name(name)
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("queue: {}", e)))
+}
+
+/// Frames a multiview branch may hold before it drops its oldest.
+const MONITOR_QUEUE_BUFFERS: u32 = 2;
+
+/// Create the queue between an input's tee and a compositor that only shows
+/// the inputs (multiview, preview output, tile output).
+///
+/// The tee pushes into all its branches in turn, so a branch that blocks
+/// holds up the others, program included. When such a compositor falls
+/// behind (a busy CPU scaling every tile), it drops its own oldest frames
+/// instead.
+pub fn make_monitor_queue(name: &str) -> Result<gst::Element, BlockBuildError> {
+    let queue = make_queue(name)?;
+    queue.set_property_from_str("leaky", "downstream");
+    queue.set_property("max-size-buffers", MONITOR_QUEUE_BUFFERS);
+    queue.set_property("max-size-bytes", 0u32);
+    queue.set_property("max-size-time", 0u64);
+    Ok(queue)
 }
 
 /// Create a `level` audio-metering element configured with the standard interval.
@@ -284,6 +379,7 @@ pub fn answer_allocation_query(queue: &gst::Element) {
 fn backend_name(backend: CompositorBackend) -> &'static str {
     match backend {
         CompositorBackend::OpenGL => "OpenGL",
+        CompositorBackend::Cuda => "CUDA",
         CompositorBackend::Software => "Software",
     }
 }

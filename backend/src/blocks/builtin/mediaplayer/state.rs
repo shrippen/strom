@@ -90,6 +90,8 @@ pub struct MediaPlayerState {
     pub decode: bool,
     /// Whether clocksync pacing is enabled
     pub sync: bool,
+    /// Hand decoded video over in system memory (hardware decoders download)
+    pub system_memory: bool,
     /// Configured media files directory (for resolving relative playlist paths)
     pub media_path: std::path::PathBuf,
     /// When the bridge lets buffers go and what it stamps them with, shared
@@ -107,6 +109,8 @@ pub struct MediaPlayerState {
     /// holding its file descriptors — for the life of the process. Keeping the
     /// id is what lets [`MediaPlayerState::shutdown`] break it.
     pub bus_watch: Mutex<Option<gst::glib::SignalHandlerId>>,
+    /// Last video frame, repeated while paused or at the end of the playlist.
+    pub still: Arc<super::still::StillFrame>,
     /// Stinger clip source behaviour; off for an ordinary player.
     pub stinger: StingerPlayback,
 }
@@ -603,7 +607,7 @@ impl MediaPlayerState {
             .ok_or("Source element no longer exists")?;
 
         let uri = normalize_uri(&file_path, &self.media_path);
-        info!("Loading file: {}", uri);
+        info!("Loading file: {}", crate::redact::text(&uri));
 
         let pipeline_guard = self
             .internal_pipeline
@@ -657,6 +661,8 @@ impl MediaPlayerState {
         // file's, a clip so short it ends while starting included, and must
         // advance the playlist.
         self.switch_generation.fetch_add(1, Ordering::SeqCst);
+        // A new file ends the repeat of the old one's last frame.
+        self.still.release();
 
         if !play {
             self.is_paused.store(true, Ordering::SeqCst);
@@ -747,6 +753,7 @@ impl MediaPlayerState {
         // Reset timestamp offset so the bridge recomputes from the first buffer
         // after resume — prevents accumulated drift from pause duration.
         self.timing.reset(Some(pipeline), &self.main_pipeline);
+        self.still.release();
         self.is_paused.store(false, Ordering::SeqCst);
         self.start(pipeline, "Failed to resume playback")
     }
@@ -779,7 +786,19 @@ impl MediaPlayerState {
             "Failed to pause playback".to_string()
         })?;
         self.is_paused.store(true, Ordering::SeqCst);
+        self.hold_still();
         Ok(())
+    }
+
+    /// Repeat the last frame of the first video track until playback goes
+    /// on (see `still`). A stinger clip source parks instead.
+    pub fn hold_still(&self) {
+        if self.stinger.enabled {
+            return;
+        }
+        if let Some(appsrc) = self.video_appsrcs.first() {
+            self.still.hold(appsrc, self.main_pipeline.clone());
+        }
     }
 
     /// Stop playback: pause and seek to the beginning.
@@ -1260,6 +1279,9 @@ impl MediaPlayerState {
     /// callback — which reads the same lock — cannot be blocked by a
     /// `set_state(Null)` that is itself waiting for the callback's thread.
     pub fn shutdown(&self) {
+        // A paused player repeats its last frame into the main pipeline;
+        // that repeat must let go before the flow is dropped.
+        self.still.release();
         // Wait out a control call in progress, then for the source to finish
         // setting up: going to NULL while it does deadlocks like any other
         // state change (see `settle`).

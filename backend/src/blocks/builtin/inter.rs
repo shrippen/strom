@@ -28,7 +28,7 @@ struct BufferConfig {
 ///
 /// Creates an `intersink` element from the rsinter plugin.
 /// The rsinter plugin is format-agnostic - it works with any media type.
-fn create_intersink(
+pub(crate) fn create_intersink(
     element_id: &str,
     channel_name: &str,
     sync: bool,
@@ -214,10 +214,13 @@ impl BlockBuilder for InterInputBuilder {
             max_time_ms
         );
 
+        // Drops of its queue before GStreamer 1.28, for the block statistics.
+        let count_drops = crate::stats::inter::count_drops(&intersrc);
+
         Ok(BlockBuildResult {
             elements: vec![(element_id, intersrc)],
             internal_links: vec![],
-            bus_message_handler: None,
+            bus_message_handler: Some(count_drops),
             pad_properties: HashMap::new(),
         })
     }
@@ -306,15 +309,18 @@ fn inter_input_definition() -> BlockDefinition {
             ExposedProperty {
                 name: "channel".to_string(),
                 label: "Source".to_string(),
-                description: "Select an Inter Output block to subscribe to".to_string(),
+                description: "Select an Inter Output block to subscribe to. Live: the input moves to the other channel while the flow plays".to_string(),
                 property_type: PropertyType::String,
                 default_value: None,
+                // The intersrc unsubscribes and subscribes again when its
+                // producer name changes, so a running flow can switch (e.g.
+                // an output taking another mix's sound).
                 mapping: PropertyMapping {
-                    element_id: "_block".to_string(),
-                    property_name: "channel".to_string(),
+                    element_id: "intersrc".to_string(),
+                    property_name: "producer-name".to_string(),
                     transform: None,
                 },
-                live: false,
+                live: true,
                 persist: None,
             },
             ExposedProperty {

@@ -6,7 +6,7 @@
 //!
 //! Pipeline structure (decode=true, default):
 //! ```text
-//! srtsrc -> efpdemux -> h264parse -> nvh264dec/avdec_h264 -> video_output (identity)
+//! srtsrc -> efpdemux -> h264parse -> H.264 decoder -> video_output (identity)
 //!                    -> opusdec -> audioconvert -> audioresample -> audio_output_0 (identity)
 //! ```
 //!
@@ -272,7 +272,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 
         debug!(
             "SRT source configured: uri={}, latency={}ms, keep-listening={}, auto-reconnect={}, wait-for-connection={}",
-            srt_uri, latency, keep_listening, auto_reconnect, wait_for_connection
+            crate::redact::url(&srt_uri), latency, keep_listening, auto_reconnect, wait_for_connection
         );
 
         // Always use efpdemux directly. In decode mode, explicit decoder elements
@@ -417,7 +417,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 
                     if let Some(identity) = weak_identity.upgrade() {
                         if decode {
-                            // Decode mode: h264parse -> nvh264dec/avdec_h264 -> identity
+                            // Decode mode: h264parse -> H.264 decoder -> identity
                             // No videoconvert to preserve GPU memory from hardware decoders.
                             if let Err(e) =
                                 link_decoded_video(element, pad, &identity, &instance_id_clone)
@@ -615,7 +615,7 @@ impl BlockBuilder for EfpSrtInputBuilder {
 }
 
 /// Dynamically insert h264parse + video decoder between an efpdemux video pad and identity.
-/// efpdemux pad -> h264parse -> nvh264dec/avdec_h264 -> deinterlace -> identity
+/// efpdemux pad -> h264parse -> H.264 decoder -> [deinterlace if interlaced] -> identity
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
@@ -634,17 +634,9 @@ fn link_decoded_video(
         .build()
         .map_err(|e| format!("h264parse: {}", e))?;
 
-    // Try hardware decoder first (nvh264dec), fall back to software (avdec_h264)
+    // Hardware decoder of this host's vendor first, software otherwise.
     let decoder_name = format!("{}:video_decoder_{}", instance_id, src_pad.name());
-    let decoder = gst::ElementFactory::make("nvh264dec")
-        .name(&decoder_name)
-        .build()
-        .or_else(|_| {
-            gst::ElementFactory::make("avdec_h264")
-                .name(&decoder_name)
-                .build()
-        })
-        .map_err(|e| format!("video decoder (nvh264dec/avdec_h264): {}", e))?;
+    let decoder = super::decode_chain::make_h264_decoder(&decoder_name)?;
 
     bin.add_many([&parser, &decoder])
         .map_err(|e| format!("add video decode chain: {}", e))?;
@@ -661,9 +653,9 @@ fn link_decoded_video(
         .sync_state_with_parent()
         .map_err(|e| format!("sync decoder: {}", e))?;
 
-    // decoder -> deinterlace -> identity. Interlaced broadcast feeds (e.g.
+    // decoder -> [deinterlace] -> identity. Interlaced broadcast feeds (e.g.
     // 1080i50) must be deinterlaced before the GL vision mixer; the helper's
-    // caps probe forces deinterlacing only when the source is interlaced/mixed.
+    // caps probe inserts a deinterlacer only when the source is interlaced/mixed.
     let decoder_src = decoder.static_pad("src").ok_or("decoder has no src pad")?;
     super::decode_chain::link_raw_video_through_deinterlace(
         &bin,

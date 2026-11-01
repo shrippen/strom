@@ -147,30 +147,49 @@ pub fn live_offset_property_entry(
     read_offset_ms(element).map(|v| ("offset_ms".to_string(), v))
 }
 
-fn build_offset(
-    instance_id: &str,
-    properties: &HashMap<String, PropertyValue>,
-) -> Result<BlockBuildResult, BlockBuildError> {
-    let offset_ms = parse_offset_ms(properties);
-    let offset_ns = ms_to_ns(offset_ms);
+/// Id of the offset identity under `prefix`: an element with this id takes
+/// `offset_ms` like a Time Offset block (see `try_apply_live_offset`), so
+/// other blocks can carry one (the mixer's channel delay).
+pub(crate) fn offset_element_id(prefix: &str) -> String {
+    format!("{}:{}", prefix, OFFSET_ELEMENT_SUFFIX)
+}
 
-    info!(
-        "Building Time Offset block '{}': offset_ms={}, offset_ns={}",
-        instance_id, offset_ms, offset_ns
-    );
-
-    let element_id = format!("{}:{}", instance_id, OFFSET_ELEMENT_SUFFIX);
+/// The offset identity under `prefix` (see `offset_element_id`), its src
+/// pad shifted by `offset_ms`. Returns its id and the element.
+pub(crate) fn make_offset_identity(
+    prefix: &str,
+    offset_ms: f64,
+) -> Result<(String, gst::Element), BlockBuildError> {
+    let element_id = offset_element_id(prefix);
     let identity = gst::ElementFactory::make("identity")
         .name(&element_id)
         .property("silent", true)
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("identity: {}", e)))?;
 
+    let offset_ns = ms_to_ns(offset_ms);
     if offset_ns != 0 {
         if let Some(src_pad) = identity.static_pad("src") {
             src_pad.set_offset(offset_ns);
         }
     }
+    Ok((element_id, identity))
+}
+
+fn build_offset(
+    instance_id: &str,
+    properties: &HashMap<String, PropertyValue>,
+) -> Result<BlockBuildResult, BlockBuildError> {
+    let offset_ms = parse_offset_ms(properties);
+
+    info!(
+        "Building Time Offset block '{}': offset_ms={}, offset_ns={}",
+        instance_id,
+        offset_ms,
+        ms_to_ns(offset_ms)
+    );
+
+    let (element_id, identity) = make_offset_identity(instance_id, offset_ms)?;
 
     Ok(BlockBuildResult {
         elements: vec![(element_id, identity)],

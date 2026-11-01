@@ -229,6 +229,25 @@ async fn cpu_stingers_play_classic() {
     r.state.stop_flow(&r.flow_id).await.unwrap();
 }
 
+/// The CUDA mixer finds its stinger pad (fed by `cudaupload_stinger`, not
+/// the crop) and plays a classic take like the CPU mixer.
+/// Run with `cargo test --test stinger_test -- --ignored` on a host with
+/// NVIDIA CUDA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(stinger)]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+async fn cuda_stingers_play_classic() {
+    if !common::plugins_available(CODEC_ELEMENTS) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clips = vec![dir.path().join("classic.mov")];
+    classic_clip(&clips[0]);
+    let r = start_edited("cuda", "cuda", dir, clips, download_cuda_program).await;
+    classic_take(&r).await;
+    r.state.stop_flow(&r.flow_id).await.unwrap();
+}
+
 /// A mask-only clip on the CPU mixer plays as a classic mix across the
 /// matte's movement. It has no graphic: its grey frames never go on air.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

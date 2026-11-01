@@ -256,6 +256,179 @@ impl RtpJitterbufferStats {
     }
 }
 
+/// A statistic `id` of a counter or duration among `stats`.
+fn stat_u64(stats: &[Statistic], id: &str) -> Option<u64> {
+    match stats.iter().find(|s| s.id == id)?.value {
+        StatValue::Counter(v) | StatValue::DurationNs(v) => Some(v),
+        StatValue::Gauge(v) => u64::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// The receive queue of an Inter Input: what waits there for the flow to
+/// take it. A consumer that keeps up holds next to nothing; one that falls
+/// behind (a busy encoder, a slow network sink) fills it, and once it holds
+/// `max_time_ns` the oldest buffers are dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct InterInputStats {
+    /// Buffers waiting now (video: frames).
+    pub queued_buffers: u64,
+    /// Time waiting now, by the buffers' timestamps.
+    pub queued_time_ns: u64,
+    /// How much the queue holds before it drops (0: no limit).
+    pub max_time_ns: u64,
+    /// Buffers dropped because the queue was full, since start.
+    pub dropped_buffers: u64,
+}
+
+impl InterInputStats {
+    pub const QUEUED_BUFFERS: &'static str = "queued_buffers";
+    pub const QUEUED_TIME: &'static str = "queued_time_ns";
+    pub const MAX_TIME: &'static str = "max_time_ns";
+    pub const DROPPED: &'static str = "dropped_buffers";
+    const CATEGORY: &'static str = "Queue";
+
+    /// Convert to generic statistics.
+    pub fn to_statistics(&self) -> Vec<Statistic> {
+        let stat = |id: &str, value, name: &str, description: &str, unit: Option<&str>| Statistic {
+            id: id.to_string(),
+            value,
+            metadata: StatMetadata {
+                display_name: name.to_string(),
+                description: description.to_string(),
+                unit: unit.map(str::to_string),
+                category: Some(Self::CATEGORY.to_string()),
+            },
+        };
+        vec![
+            stat(
+                Self::QUEUED_BUFFERS,
+                StatValue::Gauge(i64::try_from(self.queued_buffers).unwrap_or(i64::MAX)),
+                "Queued",
+                "Buffers waiting for the flow to take them",
+                Some("buffers"),
+            ),
+            stat(
+                Self::QUEUED_TIME,
+                StatValue::DurationNs(self.queued_time_ns),
+                "Queued Time",
+                "Time waiting, by the buffers' timestamps",
+                None,
+            ),
+            stat(
+                Self::MAX_TIME,
+                StatValue::DurationNs(self.max_time_ns),
+                "Queue Size",
+                "How much the queue holds before it drops the oldest buffers",
+                None,
+            ),
+            stat(
+                Self::DROPPED,
+                StatValue::Counter(self.dropped_buffers),
+                "Dropped",
+                "Buffers dropped because the flow fell behind",
+                Some("buffers"),
+            ),
+        ]
+    }
+
+    /// Read back from generic statistics (a client's side of `to_statistics`).
+    pub fn from_statistics(stats: &[Statistic]) -> Option<Self> {
+        Some(Self {
+            queued_buffers: stat_u64(stats, Self::QUEUED_BUFFERS)?,
+            queued_time_ns: stat_u64(stats, Self::QUEUED_TIME)?,
+            max_time_ns: stat_u64(stats, Self::MAX_TIME)?,
+            dropped_buffers: stat_u64(stats, Self::DROPPED)?,
+        })
+    }
+}
+
+/// How long a video encoder took for its frames, since it started: from a
+/// frame entering the encoder to the encoded frame leaving it.
+///
+/// Two readings give the load: the encode time between them over the wall
+/// time between them. A software encoder in zero-latency mode works the
+/// whole time a frame is inside, so that is its busy share; a hardware
+/// encoder working on several frames at once reports its latency, which
+/// over-states its load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct VideoEncoderStats {
+    /// Frames encoded and timed.
+    pub frames: u64,
+    /// Sum of their encode times.
+    pub encode_time_ns: u64,
+    /// A hardware encoder (`Hardware` in its element klass: NVENC, VA,
+    /// QSV, ...): its encode time is latency, not busy time.
+    pub hardware: bool,
+}
+
+impl VideoEncoderStats {
+    pub const FRAMES: &'static str = "encoded_frames";
+    pub const HARDWARE: &'static str = "hardware_encoder";
+    pub const ENCODE_TIME: &'static str = "encode_time_ns";
+    pub const AVERAGE: &'static str = "avg_encode_time_ns";
+    const CATEGORY: &'static str = "Encoder";
+
+    /// Convert to generic statistics.
+    pub fn to_statistics(&self) -> Vec<Statistic> {
+        let stat = |id: &str, value, name: &str, description: &str, unit: Option<&str>| Statistic {
+            id: id.to_string(),
+            value,
+            metadata: StatMetadata {
+                display_name: name.to_string(),
+                description: description.to_string(),
+                unit: unit.map(str::to_string),
+                category: Some(Self::CATEGORY.to_string()),
+            },
+        };
+        let average = self.encode_time_ns.checked_div(self.frames).unwrap_or(0);
+        vec![
+            stat(
+                Self::FRAMES,
+                StatValue::Counter(self.frames),
+                "Encoded Frames",
+                "Frames encoded since start",
+                Some("frames"),
+            ),
+            stat(
+                Self::ENCODE_TIME,
+                StatValue::DurationNs(self.encode_time_ns),
+                "Encode Time",
+                "Time the frames spent in the encoder, summed",
+                None,
+            ),
+            stat(
+                Self::AVERAGE,
+                StatValue::DurationNs(average),
+                "Encode Time per Frame",
+                "Average time a frame spent in the encoder",
+                None,
+            ),
+            stat(
+                Self::HARDWARE,
+                StatValue::Bool(self.hardware),
+                "Hardware Encoder",
+                "Encodes on dedicated hardware; its encode time is latency",
+                None,
+            ),
+        ]
+    }
+
+    /// Read back from generic statistics (a client's side of `to_statistics`).
+    pub fn from_statistics(stats: &[Statistic]) -> Option<Self> {
+        Some(Self {
+            frames: stat_u64(stats, Self::FRAMES)?,
+            encode_time_ns: stat_u64(stats, Self::ENCODE_TIME)?,
+            hardware: match stats.iter().find(|s| s.id == Self::HARDWARE)?.value {
+                StatValue::Bool(v) => v,
+                _ => return None,
+            },
+        })
+    }
+}
+
 /// RTP session statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
@@ -353,6 +526,38 @@ mod tests {
     fn missing_or_empty_unit_shows_bare_value() {
         assert_eq!(stat(StatValue::Counter(7), None).format_value(), "7");
         assert_eq!(stat(StatValue::Counter(7), Some("")).format_value(), "7");
+    }
+
+    #[test]
+    fn inter_input_stats_read_back() {
+        let stats = InterInputStats {
+            queued_buffers: 3,
+            queued_time_ns: 100_000_000,
+            max_time_ns: 200_000_000,
+            dropped_buffers: 7,
+        };
+        let generic = stats.to_statistics();
+        assert_eq!(InterInputStats::from_statistics(&generic), Some(stats));
+        assert_eq!(InterInputStats::from_statistics(&generic[1..]), None);
+    }
+
+    #[test]
+    fn video_encoder_stats_read_back_with_average() {
+        let stats = VideoEncoderStats {
+            frames: 50,
+            encode_time_ns: 400_000_000,
+            hardware: true,
+        };
+        let generic = stats.to_statistics();
+        assert_eq!(VideoEncoderStats::from_statistics(&generic), Some(stats));
+        let average = generic
+            .iter()
+            .find(|s| s.id == VideoEncoderStats::AVERAGE)
+            .unwrap();
+        assert_eq!(average.format_value(), "8.00 ms");
+        // No frame yet: no division by zero.
+        let none = VideoEncoderStats::default().to_statistics();
+        assert!(matches!(none[2].value, StatValue::DurationNs(0)));
     }
 
     #[test]
