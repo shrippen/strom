@@ -94,6 +94,15 @@ impl EncodeTiming {
         self.frames.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Forget the frames inside: after a flush or a new segment the running
+    /// time may start again lower, and an old slot would pair with a new
+    /// frame of the same running time (one huge encode time in the sum).
+    fn clear(&self) {
+        for slot in &self.slots {
+            slot.running.store(EMPTY, Ordering::Release);
+        }
+    }
+
     fn stats(&self) -> VideoEncoderStats {
         VideoEncoderStats {
             frames: self.frames.load(Ordering::Relaxed),
@@ -177,11 +186,28 @@ pub fn time_encoder(encoder: &gst::Element) {
 
     let entering = timing.clone();
     watch_pad(&sink, move |running| entering.entered(running));
+    let clearing = timing.clone();
+    sink.add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH,
+        move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if matches!(
+                    event.type_(),
+                    gst::EventType::Segment | gst::EventType::FlushStop
+                ) {
+                    clearing.clear();
+                }
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
     let leaving = timing.clone();
     watch_pad(&src, move |running| leaving.left(running));
 
     // SAFETY: KEY is private to this module and only ever holds an
-    // `Arc<EncodeTiming>`; `encoder_stats` reads it as that type.
+    // `Arc<EncodeTiming>`; `encoder_stats` reads it as that type. Call this
+    // only once per element: a second call would replace (and free) the data
+    // while a reader in `encoder_stats` may still hold the old pointer.
     unsafe { encoder.set_data(KEY, timing) };
 }
 
@@ -218,6 +244,18 @@ mod tests {
         }
         timing.left(0);
         timing.left(SLOTS as u64);
+        assert_eq!(timing.stats().frames, 1);
+    }
+
+    #[test]
+    fn a_cleared_ring_pairs_nothing_old() {
+        let timing = EncodeTiming::new();
+        timing.entered(1_000);
+        timing.clear();
+        timing.left(1_000);
+        assert_eq!(timing.stats().frames, 0);
+        timing.entered(1_000);
+        timing.left(1_000);
         assert_eq!(timing.stats().frames, 1);
     }
 
