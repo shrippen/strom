@@ -530,6 +530,10 @@ impl MediaPlayerState {
     /// `Ok(false)` without touching anything when a file switch has happened
     /// since (that EOS ended a file that is no longer playing), when the user
     /// has paused or stopped since, or when the player has been shut down.
+    /// At the end of the playlist (`Err`) it holds the last frame, under the
+    /// same lock: a play or file switch that comes in meanwhile runs after
+    /// and ends the hold, rather than racing it and leaving a repeat running
+    /// next to the playback.
     pub fn advance_after_eos(&self, generation: u64) -> Result<bool, String> {
         // A stinger clip plays once per take; the take re-cues it.
         if self.stinger.enabled {
@@ -545,7 +549,9 @@ impl MediaPlayerState {
         {
             return Ok(false);
         }
-        self.next_locked().map(|()| true)
+        self.next_locked()
+            .map(|()| true)
+            .inspect_err(|_| self.hold_still())
     }
 
     /// Go to the previous file.
@@ -661,7 +667,8 @@ impl MediaPlayerState {
         // file's, a clip so short it ends while starting included, and must
         // advance the playlist.
         self.switch_generation.fetch_add(1, Ordering::SeqCst);
-        // A new file ends the repeat of the old one's last frame.
+        // A new file ends the repeat of the old one's last frame, and
+        // forgets it.
         self.still.release();
 
         if !play {
@@ -792,7 +799,7 @@ impl MediaPlayerState {
 
     /// Repeat the last frame of the first video track until playback goes
     /// on (see `still`). A stinger clip source parks instead.
-    pub fn hold_still(&self) {
+    fn hold_still(&self) {
         if self.stinger.enabled {
             return;
         }
@@ -1189,6 +1196,14 @@ impl MediaPlayerState {
         if let Ok(guard) = self.internal_pipeline.read() {
             self.settle();
             self.timing.reset(guard.as_ref(), &self.main_pipeline);
+        }
+
+        // A player that is not paused plays on from the new position: one
+        // that held its last frame at the end of the playlist ends the hold,
+        // or the repeat runs next to the playback. A paused one (stop
+        // included) keeps holding.
+        if !self.is_paused.load(Ordering::SeqCst) {
+            self.still.release();
         }
 
         let seek_result = source.seek_simple(

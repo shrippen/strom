@@ -1036,7 +1036,6 @@ fn watch_for_eos(
                 ),
                 Err(e) => {
                     info!("Media Player {}: End of playlist: {}", block_id, e);
-                    player.hold_still();
                     events.broadcast(StromEvent::MediaPlayerStateChanged {
                         flow_id,
                         block_id,

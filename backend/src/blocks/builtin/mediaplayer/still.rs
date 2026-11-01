@@ -31,10 +31,18 @@ pub struct StillFrame {
 }
 
 impl StillFrame {
-    /// Remember `sample` as the frame to hold.
+    /// Remember `sample` as the frame to hold. Only raw video is held: an
+    /// encoded frame (a player that passes its file's streams through) is
+    /// mostly a delta frame, and repeating it with fresh timestamps would
+    /// break a decoder or muxer downstream. Such a player sends nothing while
+    /// paused, as before.
     pub fn store(&self, sample: &gst::Sample) {
+        let raw = sample
+            .caps()
+            .and_then(|caps| caps.structure(0))
+            .is_some_and(|s| s.name() == "video/x-raw");
         if let Ok(mut last) = self.last.lock() {
-            *last = Some(sample.clone());
+            *last = raw.then(|| sample.clone());
         }
     }
 
@@ -84,11 +92,17 @@ impl StillFrame {
         }
     }
 
-    /// Stop repeating (play, file switch, teardown). Returns once no
-    /// repeat holds the appsrc or the main pipeline any more.
+    /// Stop repeating (play, file switch, teardown) and forget the frame:
+    /// a later hold before the next frame arrives (a new file paused before
+    /// its first frame) has nothing to show, rather than the old file's, and
+    /// the buffer's memory goes back to its pool. Returns once no repeat
+    /// holds the appsrc or the main pipeline any more.
     pub fn release(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         drop(self.busy.lock());
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
     }
 }
 
@@ -242,5 +256,86 @@ mod tests {
         let weak = pipeline.downgrade();
         drop((pipeline, appsrc, sink));
         assert!(weak.upgrade().is_none(), "pipeline still referenced");
+    }
+
+    /// A live appsrc into an appsink, playing.
+    fn appsrc_into_appsink() -> (gst::Pipeline, gst_app::AppSrc, gst_app::AppSink) {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                sink.upcast_ref::<gst::Element>(),
+            ])
+            .unwrap();
+        appsrc.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        (pipeline, appsrc, sink)
+    }
+
+    fn sample(caps: gst::Caps) -> gst::Sample {
+        gst::Sample::builder()
+            .buffer(&gst::Buffer::from_slice([0u8; 4]))
+            .caps(&caps)
+            .build()
+    }
+
+    fn gray_frame() -> gst::Sample {
+        sample(
+            gst::Caps::builder("video/x-raw")
+                .field("format", "GRAY8")
+                .field("width", 2)
+                .field("height", 2)
+                .field("framerate", gst::Fraction::new(50, 1))
+                .build(),
+        )
+    }
+
+    /// A player that passes its file through stores encoded frames; holding
+    /// one (mostly a delta frame, restamped without DTS) would break the
+    /// decoder or muxer behind it, so it sends nothing.
+    #[test]
+    fn encoded_frames_are_not_held() {
+        let (pipeline, appsrc, sink) = appsrc_into_appsink();
+        let still = Arc::new(StillFrame::default());
+        still.store(&gray_frame());
+        still.store(&sample(
+            gst::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .field("framerate", gst::Fraction::new(50, 1))
+                .build(),
+        ));
+        still.hold(&appsrc, pipeline.downgrade());
+        let got = sink.try_pull_sample(gst::ClockTime::from_mseconds(300));
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(got.is_none(), "an encoded frame was repeated: {:?}", got);
+    }
+
+    /// A release forgets the frame: holding again before a new one arrives
+    /// (a new file paused before its first frame) shows nothing rather than
+    /// the old file's last frame.
+    #[test]
+    fn release_forgets_the_frame() {
+        let (pipeline, appsrc, sink) = appsrc_into_appsink();
+        let still = Arc::new(StillFrame::default());
+        still.store(&gray_frame());
+        still.hold(&appsrc, pipeline.downgrade());
+        sink.try_pull_sample(gst::ClockTime::from_seconds(2))
+            .expect("held frame repeats");
+
+        still.release();
+        while sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+        still.hold(&appsrc, pipeline.downgrade());
+        let got = sink.try_pull_sample(gst::ClockTime::from_mseconds(300));
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(got.is_none(), "the released frame came back");
     }
 }
