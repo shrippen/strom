@@ -9,7 +9,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use strom_types::block::BlockInstance;
-use strom_types::stats::{BlockStats, FlowStats, InterInputStats, Statistic};
+use strom_types::stats::{BlockStats, FlowStats, Statistic};
 use strom_types::Flow;
 use strom_types::PropertyValue;
 use tracing::{debug, trace, warn};
@@ -137,7 +137,7 @@ impl StatsCollector {
     fn collect_inter_input_stats(pipeline: &gst::Pipeline, instance_id: &str) -> Vec<Statistic> {
         pipeline
             .by_name(&format!("{}:intersrc", instance_id))
-            .and_then(|intersrc| inter_input_stats(&intersrc))
+            .and_then(|intersrc| crate::stats::inter::inter_input_stats(&intersrc))
             .map(|stats| stats.to_statistics())
             .unwrap_or_default()
     }
@@ -204,23 +204,6 @@ impl StatsCollector {
 
         all_stats
     }
-}
-
-/// The receive queue of `intersrc`: the `appsrc` inside it, which drops
-/// the oldest buffers once it holds `max-time` (leaky downstream). `None`
-/// without the queue or before GStreamer 1.20 (no `dropped` counter).
-pub fn inter_input_stats(intersrc: &gst::Element) -> Option<InterInputStats> {
-    let appsrc = intersrc
-        .downcast_ref::<gst::Bin>()?
-        .iterate_elements()
-        .find(|e| e.is::<gstreamer_app::AppSrc>())?;
-    appsrc.find_property("dropped")?;
-    Some(InterInputStats {
-        queued_buffers: appsrc.property("current-level-buffers"),
-        queued_time_ns: appsrc.property("current-level-time"),
-        max_time_ns: appsrc.property::<u64>("max-time"),
-        dropped_buffers: appsrc.property("dropped"),
-    })
 }
 
 /// The endpoint a WHIP Input block is actually serving.
