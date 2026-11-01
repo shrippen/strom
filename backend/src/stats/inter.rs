@@ -24,6 +24,11 @@ const DROPPED_MESSAGE: &str = "dropped-buffer";
 /// Count the drops of `intersrc`'s queue from the bus, readable with
 /// [`inter_input_stats`]. Call once per element, at build.
 pub fn count_drops(intersrc: &gst::Element) -> BusMessageConnectFn {
+    // SAFETY: as below; only checks whether the key is set.
+    debug_assert!(
+        unsafe { intersrc.data::<Arc<AtomicU64>>(KEY) }.is_none(),
+        "count_drops runs once per element"
+    );
     let drops = Arc::new(AtomicU64::new(0));
     // SAFETY: KEY is private to this module and only ever holds an
     // `Arc<AtomicU64>`; `inter_input_stats` reads it as that type. Called
