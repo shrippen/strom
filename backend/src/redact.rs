@@ -47,13 +47,20 @@ pub fn is_secret_name(name: &str) -> bool {
 
 /// Mask the secrets in one URL.
 ///
-/// - userinfo: see [`userinfo_at`].
-/// - query: each value whose key is secret (`passphrase=***`).
+/// - userinfo: everything up to the last `@` before the query. A password with
+///   an unencoded `/` or `@` must not end it early.
+/// - authority: anything that is not plain `host[:port]` or `[v6][:port]` is
+///   masked up to the first `/` or `?`.
+/// - query: each value whose key is secret (`passphrase=***`); pairs end at
+///   `&` or `?`.
+/// - an `@` behind the first `?` can be a password with a raw `?` as well as a
+///   query value; the two cannot be told apart, so all after the scheme goes.
 /// - `rtmp*` schemes: as [`rtmp_url`].
 ///
 /// ```text
 /// srt://h:9000?mode=caller&passphrase=abc -> srt://h:9000?mode=caller&passphrase=***
 /// https://u:p@h/a.mp4?token=abc           -> https://***@h/a.mp4?token=***
+/// srt://u:p?w=x@h:9000                    -> srt://***
 /// ```
 pub fn url(raw: &str) -> String {
     let scheme = raw.split(':').next().unwrap_or("").to_ascii_lowercase();
@@ -61,126 +68,179 @@ pub fn url(raw: &str) -> String {
         return rtmp_url(raw);
     }
 
-    let Some(at) = userinfo_at(raw) else {
-        return masked_query(raw);
+    let Some(parts) = Parts::of(raw) else {
+        return format!("{}{}", scheme_of(raw), MASK);
     };
-    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
-    if at < after_scheme {
-        // An '@' inside the scheme: nothing of that string is worth echoing.
-        return MASK.to_string();
+    let mut out = parts.head();
+    out.push_str(parts.path);
+    if let Some(query) = parts.query {
+        out.push('?');
+        out.push_str(&mask_params(query));
     }
-    let rest = &raw[at + 1..];
-    let prefix = format!("{}{}@", &raw[..after_scheme], MASK);
-    if in_query(raw, at) {
-        // The cut took the `?`: all that follows may be parameters.
-        return format!("{}{}", prefix, mask_params(rest));
-    }
-    format!("{}{}", prefix, masked_query(rest))
-}
-
-/// `s` with [`mask_params`] over its query, if it has one.
-fn masked_query(s: &str) -> String {
-    match s.split_once('?') {
-        Some((head, query)) => format!("{}?{}", head, mask_params(query)),
-        None => s.to_string(),
-    }
+    out
 }
 
 /// Mask the secrets in an RTMP URL, scheme or not.
 ///
-/// Besides userinfo, the last path segment, the stream key, which for most
-/// servers is the whole authorisation, and the whole query, which servers use
-/// for tokens under any name. Host and application stay, so a line still names
-/// its output.
+/// As [`url`], and besides the last path segment, the stream key, which for
+/// most servers is the whole authorisation, and the whole query, which servers
+/// use for tokens under any name. Host and application stay, so a line still
+/// names its output.
 ///
 /// ```text
 /// rtmp://u:p@h/live/key?t=1 -> rtmp://***@h/live/***?***
 /// ```
 pub fn rtmp_url(raw: &str) -> String {
-    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
-    let plain = match userinfo_at(raw) {
-        None => raw.to_string(),
-        Some(at) if at < after_scheme => return MASK.to_string(),
-        // Host, path and query can no longer be told apart.
-        Some(at) if in_query(raw, at) => {
-            return format!("{}{}@{}", &raw[..after_scheme], MASK, MASK)
-        }
-        Some(at) => format!("{}{}{}", &raw[..after_scheme], MASK, &raw[at..]),
+    let Some(parts) = Parts::of(raw) else {
+        return format!("{}{}", scheme_of(raw), MASK);
     };
-    let (head, query) = match plain.split_once('?') {
-        Some((head, _)) => (head, true),
-        None => (plain.as_str(), false),
-    };
+    let mut out = parts.head();
 
     // Only with a path, so a bare host is left alone.
-    let head = match head[after_scheme..].rfind('/') {
-        Some(rel) if rel > 0 => format!("{}{}", &head[..after_scheme + rel + 1], MASK),
-        _ => head.to_string(),
-    };
-
-    if query {
-        return format!("{}?{}", head, MASK);
+    match parts.path.rfind('/') {
+        Some(slash) if !parts.path.is_empty() => {
+            out.push_str(&parts.path[..=slash]);
+            out.push_str(MASK);
+        }
+        _ => out.push_str(parts.path),
     }
-    head
+    if parts.query.is_some() {
+        out.push('?');
+        out.push_str(MASK);
+    }
+    out
 }
 
-/// The `@` that ends userinfo, if any. Fails closed.
-///
-/// - Without a query, the **last** `@`: a password with an unencoded `/` or
-///   `@` must not end the authority early.
-/// - With a query, the last `@` before the first `?`.
-/// - An `@` after the first `?` ends userinfo when what precedes the `?`
-///   cannot be `host[:port]` (`user:pw?x=1@host`: the last `@`), or when
-///   the text up to the `@` is no parameter (`?ss@host`: the first `@`).
-///   Otherwise (`?streamid=u=a@b`) it is a value for [`mask_params`].
-///
-/// A cut behind the `?` takes the query mark with it, so the callers mask
-/// everything after such an `@` as parameters, whatever it was.
-fn userinfo_at(raw: &str) -> Option<usize> {
-    let Some(q) = raw.find('?') else {
-        return raw.rfind('@');
-    };
-    if let Some(at) = raw[..q].rfind('@') {
-        return Some(at);
-    }
-
-    let tail = &raw[q + 1..];
-    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0).min(q);
-    let authority = raw[after_scheme..q].split('/').next().unwrap_or("");
-    let not_a_port = !authority.ends_with(']')
-        && authority
-            .rsplit_once(':')
-            .is_some_and(|(_, port)| !port.chars().all(|c| c.is_ascii_digit()));
-    if not_a_port {
-        return tail.rfind('@').map(|i| q + 1 + i);
-    }
-    tail.find('@')
-        .filter(|&i| !tail[..i].contains(['=', '&']))
-        .map(|i| q + 1 + i)
+/// A URL cut at the places that matter for masking.
+struct Parts<'a> {
+    /// `srt://`, or empty when there is no scheme before any `/`, `?` or `@`.
+    scheme: &'a str,
+    /// Whether there was userinfo before the host.
+    userinfo: bool,
+    /// The host and port, or `None` when it is no plain `host[:port]`.
+    authority: Option<&'a str>,
+    /// From the first `/` after the authority up to the query.
+    path: &'a str,
+    /// After the first `?`.
+    query: Option<&'a str>,
 }
 
-/// Whether the `@` at `at` lies behind the first `?`.
-fn in_query(raw: &str, at: usize) -> bool {
-    raw.find('?').is_some_and(|q| q < at)
-}
-
-/// Mask the value of each secret `key=value` pair in a query string.
-fn mask_params(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some((key, _)) if is_secret_name(key) => format!("{}={}", key, MASK),
-            _ => pair.to_string(),
+impl<'a> Parts<'a> {
+    /// `None` when an `@` follows the first `?` (see [`url`]).
+    fn of(raw: &'a str) -> Option<Self> {
+        let scheme = scheme_of(raw);
+        let rest = &raw[scheme.len()..];
+        let (before, query) = match rest.split_once('?') {
+            Some((before, query)) => (before, Some(query)),
+            None => (rest, None),
+        };
+        if query.is_some_and(|q| q.contains('@')) {
+            return None;
+        }
+        let (userinfo, after) = match before.rfind('@') {
+            Some(at) => (true, &before[at + 1..]),
+            None => (false, before),
+        };
+        let (authority, path) = match after.find('/') {
+            Some(slash) => after.split_at(slash),
+            None => (after, ""),
+        };
+        Some(Parts {
+            scheme,
+            userinfo,
+            authority: plain_host(authority).then_some(authority),
+            path,
+            query,
         })
-        .collect::<Vec<_>>()
-        .join("&")
+    }
+
+    /// Scheme, masked userinfo and the authority, masked when not plain.
+    fn head(&self) -> String {
+        let mut out = self.scheme.to_string();
+        if self.userinfo {
+            out.push_str(MASK);
+            out.push('@');
+        }
+        out.push_str(self.authority.unwrap_or(MASK));
+        out
+    }
+}
+
+/// `srt://` of `srt://h`: a run of scheme characters and `://`, or empty.
+fn scheme_of(raw: &str) -> &str {
+    let Some(sep) = raw.find("://") else {
+        return "";
+    };
+    let name = &raw[..sep];
+    if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return &raw[..sep + 3];
+    }
+    ""
+}
+
+/// Whether `authority` is `host[:port]` or `[v6][:port]`, port digits only.
+/// Anything else may be (part of) a credential.
+fn plain_host(authority: &str) -> bool {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((addr, after)) => {
+                let plain_addr = addr
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.' | '%'));
+                if !plain_addr {
+                    return false;
+                }
+                match after.strip_prefix(':') {
+                    Some(port) => ("", port),
+                    None if after.is_empty() => ("", ""),
+                    None => return false,
+                }
+            }
+            None => return false,
+        },
+        None => authority.split_once(':').unwrap_or((authority, "")),
+    };
+    let host_ok = host
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    host_ok && port.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Mask the value of each secret `key=value` pair in a query string. Pairs
+/// end at `&`, and at `?` (a second query mark).
+fn mask_params(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for pair in query.split_inclusive(['&', '?']) {
+        let (body, sep) = match pair.strip_suffix(['&', '?']) {
+            Some(body) => (body, &pair[body.len()..]),
+            None => (pair, ""),
+        };
+        match body.split_once('=') {
+            Some((key, _)) if is_secret_name(key) => {
+                out.push_str(key);
+                out.push('=');
+                out.push_str(MASK);
+            }
+            _ => out.push_str(body),
+        }
+        out.push_str(sep);
+    }
+    out
 }
 
 /// Mask every URL and every secret `name=value` pair in free text: a log line,
 /// a GStreamer error, a gst-launch string, a `{:?}` dump.
 ///
-/// Tokens end at whitespace and quotes only, not at `,` or `)`, because an SRT
-/// stream id such as `#!::r=live/feed,m=publish` contains both.
+/// Words end at blanks, quotes, backslashes and angle brackets, not at `,` or
+/// `)`, because an SRT stream id such as `#!::r=live/feed,m=publish` holds
+/// both. A secret value is never cut at such a mark, though (fail closed): one
+/// that opens with a quote, also an escaped `\"`, runs to the matching quote
+/// not preceded by a backslash, or to the end; any other runs to the next
+/// blank. `{:?}` escapes every quote inside a value, so this is what keeps
+/// `passphrase=ab\"cd` whole.
 pub fn text(s: &str) -> Cow<'_, str> {
     if !s.contains("://") && !s.contains('=') {
         return Cow::Borrowed(s);
@@ -195,31 +255,26 @@ pub fn text(s: &str) -> Cow<'_, str> {
             continue;
         }
         let end = rest.find(is_boundary).unwrap_or(rest.len());
-        let word = &rest[..end];
-        out.push_str(&token(word));
+        let (masked, open) = token(&rest[..end]);
         rest = &rest[end..];
 
-        // `passphrase="two words"`: the value is the quoted run that follows.
-        let Some(name) = word.strip_suffix('=') else {
-            continue;
-        };
-        if !is_secret_name(name) {
-            continue;
+        match (open, opening_quote(rest)) {
+            (Open::No, _) => out.push_str(&masked),
+            // `passphrase="two words"`: the quoted run is the value.
+            (Open::Empty, Some(quote)) => {
+                out.push_str(masked.strip_suffix(MASK).unwrap_or(&masked));
+                out.push_str(quote);
+                out.push_str(MASK);
+                out.push_str(quote);
+                rest = &rest[quoted_end(rest, quote)..];
+            }
+            // The value goes on behind a quote or backslash: up to a blank.
+            _ => {
+                out.push_str(&masked);
+                let blank = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                rest = &rest[blank..];
+            }
         }
-        let Some(quote) = ["\\\"", "\"", "'"]
-            .into_iter()
-            .find(|q| rest.starts_with(q))
-        else {
-            continue;
-        };
-        let close = rest[quote.len()..]
-            .find(quote)
-            .map(|i| quote.len() + i + quote.len())
-            .unwrap_or(rest.len());
-        out.push_str(quote);
-        out.push_str(MASK);
-        out.push_str(quote);
-        rest = &rest[close..];
     }
 
     if out == s {
@@ -228,28 +283,90 @@ pub fn text(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Where a token in free text ends.
+/// Where a word in free text ends.
 fn is_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '`' | '<' | '>')
 }
 
-/// Mask one whitespace-free token: a URL, possibly behind `uri=`, or a pair.
-fn token(t: &str) -> Cow<'_, str> {
+/// Whether a masked word leaves a secret value open at its end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Open {
+    /// Nothing open.
+    No,
+    /// `passphrase=`: the value has not started yet.
+    Empty,
+    /// `passphrase=ab`: the value may go on.
+    Started,
+}
+
+/// Mask one word: a URL, possibly behind `uri=`, or a pair.
+fn token(t: &str) -> (Cow<'_, str>, Open) {
     if let Some(sep) = t.find("://") {
         // Walk back over the scheme, so `uri=srt://…` keeps its `uri=`.
         let start = t[..sep]
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
             .map(|i| i + 1)
             .unwrap_or(0);
-        return Cow::Owned(format!("{}{}", &t[..start], url(&t[start..])));
+        // Only a plain `name=` is kept in front; `rtmp?://…` or
+        // `rtmp:/h/key?r=http://…` is one odd URL.
+        let plain_name = t[..start].strip_suffix('=').is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        });
+        let start = match plain_name {
+            true => start,
+            false => 0,
+        };
+        let masked = format!("{}{}", &t[..start], url(&t[start..]));
+        let open = match masked.ends_with(MASK) && masked != t {
+            false => Open::No,
+            true if t.ends_with('=') => Open::Empty,
+            true => Open::Started,
+        };
+        return (Cow::Owned(masked), open);
     }
 
     match t.split_once('=') {
-        Some((name, value)) if !value.is_empty() && is_secret_name(name) => {
-            Cow::Owned(format!("{}={}", name, MASK))
+        Some((name, value)) if is_secret_name(name) => {
+            let open = match value.is_empty() {
+                true => Open::Empty,
+                false => Open::Started,
+            };
+            (Cow::Owned(format!("{}={}", name, MASK)), open)
         }
-        _ => Cow::Borrowed(t),
+        _ => (Cow::Borrowed(t), Open::No),
     }
+}
+
+/// The quote that opens `rest`, with the backslashes escaping it: `"`, `'`,
+/// `\"` in a `{:?}` dump, `\\\"` in a dump of a dump.
+fn opening_quote(rest: &str) -> Option<&str> {
+    let escapes = rest.len() - rest.trim_start_matches('\\').len();
+    match rest[escapes..].chars().next() {
+        Some(q @ ('"' | '\'')) => Some(&rest[..escapes + q.len_utf8()]),
+        _ => None,
+    }
+}
+
+/// The end of a value that opens with `quote` at the start of `rest`: behind
+/// the same quote with exactly as many backslashes before it (an inner quote
+/// is escaped once more), or the end of `rest`.
+fn quoted_end(rest: &str, quote: &str) -> usize {
+    let escapes = quote.len() - 1;
+    let mark = &quote[escapes..];
+    let mut from = quote.len();
+    while let Some(i) = rest[from..].find(mark) {
+        let at = from + i;
+        let before = &rest[quote.len()..at];
+        let run = before.len() - before.trim_end_matches('\\').len();
+        if run == escapes {
+            return at + 1;
+        }
+        from = at + 1;
+    }
+    rest.len()
 }
 
 /// A property value as it may be logged: masked whole when its name is secret
@@ -364,60 +481,175 @@ mod tests {
         );
     }
 
-    /// An `@` in the query (a stream id `u=user@domain`, a passphrase) used to
-    /// count as the end of userinfo, which swallowed the `?` and left every
-    /// parameter after it unmasked.
+    /// An `@` behind the `?` can be a password with a raw `?` or a query
+    /// value (a stream id `u=user@domain`); everything after the scheme goes.
     #[test]
-    fn an_at_sign_in_the_query_does_not_unmask_it() {
-        assert_eq!(
-            url("srt://192.0.2.1:9000?streamid=#!::u=a@b,r=x&passphrase=topsecret1"),
-            "srt://192.0.2.1:9000?streamid=***&passphrase=***"
-        );
-        assert_eq!(
-            url("srt://192.0.2.1:9000?passphrase=top@secret1&latency=120"),
-            "srt://192.0.2.1:9000?passphrase=***&latency=120"
-        );
-        assert_eq!(
-            url("https://example.com/a.mp4?token=abc123&mail=x@y.z"),
-            "https://example.com/a.mp4?token=***&mail=x@y.z"
-        );
-        // A password with an unencoded `?` still loses everything up to its `@`.
-        let masked = url("rtmp://user:p?ss@example.com/live/key");
-        assert!(!masked.contains("p?ss"), "{}", masked);
+    fn an_at_sign_in_the_query_masks_all_after_the_scheme() {
+        for raw in [
+            "srt://192.0.2.1:9000?streamid=#!::u=a@b,r=x&passphrase=topsecret1",
+            "srt://192.0.2.1:9000?passphrase=top@secret1&latency=120",
+            "srt://user:pa?ss=x@h:9000",
+        ] {
+            assert_eq!(url(raw), "srt://***", "{}", raw);
+        }
+        assert_eq!(url("https://h/a?foo@bar&token=abc"), "https://***");
+        assert_eq!(url("rtmp://user:pw?x=1@host/app/key"), "rtmp://***");
     }
 
-    /// Whatever `@` ends userinfo, nothing after it escapes masking: a
-    /// parameter or key with an `@` before any `=`, and a password with an
-    /// unencoded `?` followed by `=`.
+    /// Anything but plain `host[:port]` in the authority may be a credential.
     #[test]
-    fn an_at_sign_after_the_query_mark_fails_closed() {
+    fn an_odd_authority_is_masked() {
+        assert_eq!(url("srt://u:[x]@h:1?a=1"), "srt://***@h:1?a=1");
+        assert_eq!(url("srt://us(er)x:9000?a=1"), "srt://***?a=1");
+        assert_eq!(url("srt://[::1]:9000?a=1"), "srt://[::1]:9000?a=1");
         assert_eq!(
-            url("https://h/a?foo@bar&token=abc"),
-            "https://***@bar&token=***"
+            url("srt://kamera-büro.local:9000"),
+            "srt://kamera-büro.local:9000"
         );
-        assert_eq!(
-            url("https://h/a?mail@x.de=1&token=abc"),
-            "https://***@x.de=1&token=***"
-        );
-        assert_eq!(url("srt://user:pa?ss=x@h:9000"), "srt://***@h:9000");
-        let masked = url("rtmp://user:pw?x=1@host/app/key");
-        assert!(!masked.contains("pw"), "{}", masked);
-        assert!(!masked.contains("key"), "{}", masked);
-        let masked = url("rtmp://h/live/key?foo@bar&token=abc");
-        assert!(!masked.contains("abc"), "{}", masked);
-        assert!(!masked.contains("key"), "{}", masked);
     }
 
-    /// gst-launch quotes a value with blanks: `passphrase="two words"`.
+    /// The reviewers' adversarial inputs: no secret survives, nothing panics.
+    /// URL-shaped ones go through `url` and `text`, the rest through one of them.
     #[test]
-    fn a_quoted_secret_value_is_masked_whole() {
-        assert_eq!(
-            text("srtsink passphrase=\"two secret words\" latency=120"),
-            "srtsink passphrase=\"***\" latency=120"
-        );
-        assert_eq!(text("auth-token='a b'"), "auth-token='***'");
-        let dump = format!("{:?}", "passphrase=\"a b\" x");
-        assert_eq!(text(&dump), "\"passphrase=\\\"***\\\" x\"");
+    fn adversarial_inputs_leak_nothing() {
+        let urls: &[(&str, &[&str])] = &[
+            ("https://h/a?foo@bar&token=SEKRET", &["SEKRET"]),
+            ("https://h/a?mail@x.de=1&token=SEKRET", &["SEKRET"]),
+            ("https://h?my@token=SEKRET", &["SEKRET"]),
+            ("?a@b", &[]),
+            ("?@", &[]),
+            ("@", &[]),
+            ("@?", &[]),
+            ("?", &[]),
+            ("", &[]),
+            ("://", &[]),
+            ("?://@", &[]),
+            (
+                "https://user:p@ss@h?x@y&passphrase=SEKRET",
+                &["SEKRET", "p@ss"],
+            ),
+            ("srt://h?passphrase=SEKRET&x=@", &["SEKRET"]),
+            ("rtmp://u:SEKRET@h/app/KEYX?x@y", &["SEKRET", "KEYX"]),
+            ("rtmp://h?a@b/KEYX", &["KEYX"]),
+            ("http://h/@/x?token=SEKRET", &["SEKRET"]),
+            (
+                "srt://user:pa?ss=SEKA@h:9000?passphrase=SEKB",
+                &["SEKA", "SEKB"],
+            ),
+            ("srt://user:SEKRET?R@h:9000", &["SEKRET"]),
+            ("https://h/x?token=SEKA%40SEKB", &["SEKA", "SEKB"]),
+            ("https://u%3ASEKRET@h/x", &["SEKRET"]),
+            ("srt://ü:SEKA@hö?passphrase=SEKB", &["SEKA", "SEKB"]),
+            ("srt://ü?ä@ö&token=SEKRET", &["SEKRET"]),
+            ("rtmp://ü/ä/KEYX?ö@ü", &["KEYX"]),
+            ("srt://h:9000?mode=caller&passphrase=SEKRET", &["SEKRET"]),
+            ("srt://[::1]:9000?passphrase=SEKRET", &["SEKRET"]),
+            ("srt://u:SEKRET@[::1]:9000?x@y", &["SEKRET"]),
+            ("srt://[::1]?passphrase=p@SEKRET", &["SEKRET"]),
+            ("srt://h:9000?streamid=#!::u=a@b,r=SEKRET", &["SEKRET"]),
+            ("srt://user:1234?x=SEKRET@h:9000", &["SEKRET"]),
+            ("srt://user:?x=SEKRET@h:9000", &["SEKRET"]),
+            ("srt://:12?x=SEKRET@h", &["SEKRET"]),
+            ("srt://user:12/w?x=SEKRET@h", &["SEKRET"]),
+            ("srt://u:[x]?a=SEKRET@h", &["SEKRET"]),
+            ("srt://u:[SEKRET]@h", &["SEKRET"]),
+            ("srt://us(SEKRET)er:9000", &["SEKRET"]),
+            ("rtmp://user:1234?x=SEKRET@h/app/KEYX", &["SEKRET", "KEYX"]),
+            ("srt://u:p@ss?w=SEKRET@h", &["SEKRET"]),
+            ("srt://h:9000?a=1?passphrase=SEKRET", &["SEKRET"]),
+            ("https://h/a#x?token=SEKRET", &["SEKRET"]),
+            ("rtmp?://h/app/KEYX", &["KEYX"]),
+            ("rtmp:/h/KEYX?r=http://x", &["KEYX"]),
+            ("h/live/KEYX?cb=http://x", &[]),
+            ("rtmp://user:p/ss@host/live/KEYX", &["p/ss", "KEYX"]),
+            ("us@er://x", &["us@"]),
+            ("turn://user:SEKRET@turn.example.com:3478", &["SEKRET"]),
+        ];
+        // No `://`: text cannot tell these from prose, the callers use `url`.
+        let url_only: &[(&str, &[&str])] = &[
+            ("rtmp:/user:SEKRET@host/live/KEYX", &["SEKRET", "KEYX"]),
+            ("turn:user:SEKRET@turn.example.com", &["SEKRET"]),
+        ];
+        let texts: &[(&str, &[&str])] = &[
+            ("passphrase=ab\\SEKRET x", &["SEKRET"]),
+            ("passphrase=ab'SEKRET x", &["SEKRET"]),
+            ("uri=srt://h?passphrase=ab'SEKRET x", &["SEKRET"]),
+            ("e: \"passphrase=ab\\\"SEKRET\" x\"", &["SEKRET"]),
+            ("passphrase='SEKA\\'SEKB' x", &["SEKA", "SEKB"]),
+            ("token=\"SEKA\\\"SEKB\" x", &["SEKA", "SEKB"]),
+            ("passphrase=\\SEKRET", &["SEKRET"]),
+            ("passphrase=\\\\\"SEKA SEKB\\\\\"", &["SEKA", "SEKB"]),
+            ("uri=srt://h?passphrase=\"SEKA SEKB\"", &["SEKA", "SEKB"]),
+            (
+                "srtsink passphrase=\"two SEKA words\" latency=120",
+                &["SEKA"],
+            ),
+            (
+                "{\"e\":\"passphrase=\\\"a\\\\\\\"SEKA\\\" SEKB\"}",
+                &["SEKA"],
+            ),
+            ("passphrase=\"SEKRET", &["SEKRET"]),
+            ("x passphrase=\"ü SEKRET ö\" y", &["SEKRET"]),
+            ("PassPhrase='SEKA SEKB'", &["SEKA", "SEKB"]),
+            ("token=\"", &[]),
+            ("token=\\\"", &[]),
+            ("a=\"ü", &[]),
+            ("ü=\"ä", &[]),
+            ("name=\"v\" passphrase=\"SEKRET\" after \"q\"", &["SEKRET"]),
+            ("a passphrase='SEKRET' b 'c' d", &["SEKRET"]),
+            (
+                "Could not open srt://192.0.2.1:9000?passphrase=SEKRET: refused",
+                &["SEKRET"],
+            ),
+            (
+                "srtsink uri=srt://h:1?streamid=SEKA passphrase=SEKB latency=120",
+                &["SEKA", "SEKB"],
+            ),
+            ("String(\"rtmp://h/live/KEYX\")", &["KEYX"]),
+            ("auth-token='SEKA SEKB'", &["SEKA", "SEKB"]),
+        ];
+
+        for (raw, secrets) in urls {
+            for shown in [url(raw), text(raw).into_owned()] {
+                for secret in *secrets {
+                    assert!(!shown.contains(secret), "{:?} -> {:?}", raw, shown);
+                }
+            }
+        }
+        for (raw, secrets) in url_only {
+            let shown = url(raw);
+            for secret in *secrets {
+                assert!(!shown.contains(secret), "{:?} -> {:?}", raw, shown);
+            }
+        }
+        for (raw, secrets) in texts {
+            let _ = url(raw);
+            let shown = text(raw);
+            for secret in *secrets {
+                assert!(!shown.contains(secret), "{:?} -> {:?}", raw, shown);
+            }
+        }
+        // Each text also as a `{:?}` dump, which escapes its quotes once more.
+        for (raw, secrets) in texts {
+            let dump = format!("{:?}", raw);
+            let shown = text(&dump);
+            for secret in *secrets {
+                assert!(!shown.contains(secret), "{:?} -> {:?}", dump, shown);
+            }
+        }
+    }
+
+    /// `rtmp_url` cut a slice with an offset taken from another string.
+    #[test]
+    fn a_query_mark_before_the_scheme_does_not_panic() {
+        for raw in [
+            "rtmp?://h/app/key",
+            "rtmp:/h/key?r=http://x",
+            "h/live/key?cb=http://x",
+        ] {
+            assert!(!rtmp_url(raw).contains("key"), "{}", raw);
+            let _ = url(raw);
+        }
     }
 
     #[test]
@@ -432,7 +664,7 @@ mod tests {
             url("https://user:p@ss/word@example.com/a.mp4"),
             "https://***@example.com/a.mp4"
         );
-        assert_eq!(url("us@er://x"), MASK);
+        assert_eq!(url("us@er://x"), "***@er://x");
     }
 
     #[test]
@@ -491,7 +723,8 @@ mod tests {
         );
 
         let dump = format!("{:?}", PropertyValue::String("rtmp://h/live/key".into()));
-        assert_eq!(text(&dump), "String(\"rtmp://h/live/***\")");
+        // The stream key may hold a quote, so the mask runs to the blank.
+        assert_eq!(text(&dump), "String(\"rtmp://h/live/***");
     }
 
     #[test]
