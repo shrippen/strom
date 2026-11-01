@@ -102,14 +102,26 @@ pub fn rtmp_url(raw: &str) -> String {
     head
 }
 
-/// Mask userinfo: everything before the **last** `@`, wherever it sits.
+/// Mask userinfo: everything before the `@` that ends it.
 ///
 /// Fails closed. A password with an unencoded `/` or `@` must not end the
-/// authority early, and a string that cannot be parsed may be unparseable
-/// because of the credential itself. `None` when the `@` sits inside the scheme:
-/// nothing of that string is worth echoing.
+/// authority early, so that is the **last** `@` before the query. A password
+/// with an unencoded `?` must not hide behind the query either, so an `@`
+/// after the first `?` ends userinfo too, unless the text up to it is a
+/// parameter (holds `=` or `&`): `?streamid=u=a@b` stays a query for
+/// [`mask_params`]. `None` when the `@` sits inside the scheme: nothing of
+/// that string is worth echoing.
 fn without_userinfo(raw: &str) -> Option<String> {
-    let Some(at) = raw.rfind('@') else {
+    let at = match raw.find('?') {
+        Some(q) => raw[..q].rfind('@').or_else(|| {
+            let tail = &raw[q + 1..];
+            tail.find('@')
+                .filter(|&i| !tail[..i].contains(['=', '&']))
+                .map(|i| q + 1 + i)
+        }),
+        None => raw.rfind('@'),
+    };
+    let Some(at) = at else {
         return Some(raw.to_string());
     };
     let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
@@ -150,8 +162,31 @@ pub fn text(s: &str) -> Cow<'_, str> {
             continue;
         }
         let end = rest.find(is_boundary).unwrap_or(rest.len());
-        out.push_str(&token(&rest[..end]));
+        let word = &rest[..end];
+        out.push_str(&token(word));
         rest = &rest[end..];
+
+        // `passphrase="two words"`: the value is the quoted run that follows.
+        let Some(name) = word.strip_suffix('=') else {
+            continue;
+        };
+        if !is_secret_name(name) {
+            continue;
+        }
+        let Some(quote) = ["\\\"", "\"", "'"]
+            .into_iter()
+            .find(|q| rest.starts_with(q))
+        else {
+            continue;
+        };
+        let close = rest[quote.len()..]
+            .find(quote)
+            .map(|i| quote.len() + i + quote.len())
+            .unwrap_or(rest.len());
+        out.push_str(quote);
+        out.push_str(MASK);
+        out.push_str(quote);
+        rest = &rest[close..];
     }
 
     if out == s {
@@ -294,6 +329,41 @@ mod tests {
             masked,
             "srt://192.0.2.1:9000?mode=caller&passphrase=***&streamid=***&latency=120"
         );
+    }
+
+    /// An `@` in the query (a stream id `u=user@domain`, a passphrase) used to
+    /// count as the end of userinfo, which swallowed the `?` and left every
+    /// parameter after it unmasked.
+    #[test]
+    fn an_at_sign_in_the_query_does_not_unmask_it() {
+        assert_eq!(
+            url("srt://192.0.2.1:9000?streamid=#!::u=a@b,r=x&passphrase=topsecret1"),
+            "srt://192.0.2.1:9000?streamid=***&passphrase=***"
+        );
+        assert_eq!(
+            url("srt://192.0.2.1:9000?passphrase=top@secret1&latency=120"),
+            "srt://192.0.2.1:9000?passphrase=***&latency=120"
+        );
+        assert_eq!(
+            url("https://example.com/a.mp4?token=abc123&mail=x@y.z"),
+            "https://example.com/a.mp4?token=***&mail=x@y.z"
+        );
+        // A password with an unencoded `?` still loses everything up to its `@`.
+        let masked = url("rtmp://user:p?ss@example.com/live/key");
+        assert!(!masked.contains("p?ss"), "{}", masked);
+        assert!(masked.contains("example.com/live/"), "{}", masked);
+    }
+
+    /// gst-launch quotes a value with blanks: `passphrase="two words"`.
+    #[test]
+    fn a_quoted_secret_value_is_masked_whole() {
+        assert_eq!(
+            text("srtsink passphrase=\"two secret words\" latency=120"),
+            "srtsink passphrase=\"***\" latency=120"
+        );
+        assert_eq!(text("auth-token='a b'"), "auth-token='***'");
+        let dump = format!("{:?}", "passphrase=\"a b\" x");
+        assert_eq!(text(&dump), "\"passphrase=\\\"***\\\" x\"");
     }
 
     #[test]

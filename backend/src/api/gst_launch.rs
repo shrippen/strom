@@ -433,7 +433,7 @@ fn extract_non_default_properties(gst_elem: &gst::Element) -> HashMap<String, Pr
                     "Element {}: Property '{}' differs from default -> {:?}",
                     gst_elem.name(),
                     prop_name,
-                    prop_value
+                    crate::redact::value(prop_name, &prop_value)
                 );
                 properties.insert(prop_name.to_string(), prop_value);
             } else {

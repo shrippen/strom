@@ -258,7 +258,10 @@ pub(super) fn build_whepsrc(
 
     debug!(
         "WHEP Input (whepsrc stable) configured: endpoint={}, stun={:?}, turn={:?}, ice_transport_policy={}",
-        whep_endpoint, stun_server, turn_server, ice_transport_policy
+        crate::redact::url(&whep_endpoint),
+        stun_server,
+        turn_server.as_deref().map(crate::redact::url),
+        ice_transport_policy
     );
 
     // Internal links: liveadder -> capsfilter -> audioconvert -> audioresample
