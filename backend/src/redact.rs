@@ -347,9 +347,10 @@ fn plain_host(authority: &str) -> bool {
 /// - A word with `://` is a URL behind a plain prefix (`uri=`, `String("`,
 ///   `<`): the URL goes through [`url`] (so HTTP shows only its origin), and
 ///   a trailing `:`, `,`, `)`, quote or the like stays outside it
-///   (`srt://h:9000: refused` keeps its host). A URL behind a quote is the
-///   whole quoted run, blanks included, up to the partner of that quote (or
-///   to the end of the text when there is none). Any other prefix masks the
+///   (`srt://h:9000: refused` keeps its host). A URL behind an open quote
+///   in its word (`uri="srt://…`, `"uri=srt://…`) is the whole quoted run,
+///   blanks included, up to the partner of that quote (or to the end of the
+///   text when there is none). Any other prefix masks the
 ///   whole word.
 /// - At each `=` or `:` of a word (quotes around the name allowed), a name
 ///   that ends in a secret ending ([`is_secret_name`]) masks the value: up to
@@ -464,15 +465,15 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
     let sep = sep - start;
     let rules = Rules::of(scheme);
 
-    // A URL in quotes is the quoted run up to the partner of the quote
-    // (`"srt://h?a=1","b":2`), or to the end of the partner's word when an
+    // A URL in quotes (`uri="srt://…"`, `"uri=srt://…"`) is the quoted run
+    // up to the partner of the quote (`"srt://h?a=1","b":2`), or to the end of the partner's word when an
     // `@` follows it there (a password with a quote). Behind a blank the run
     // counts when the URL in this word is masked (`"srt://h?passphrase=a b"`)
     // or an `@` follows before the partner (`"srt://u:1 2@h"`); otherwise a
     // clean URL ends with its word, so a quoted message that starts with one
     // stays readable. A quote without a partner masks all to the end.
     let mut stop = end;
-    let mut quoted = false;
+    let mut closing = None;
     if let Some((open, escapes)) = quote_before(s, at, url_at) {
         let Some(close) = partner(s.as_bytes(), open, escapes, s.len()) else {
             out.push_str(&s[url_at..url_at + sep + 3]);
@@ -500,15 +501,12 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
             .is_some();
         if take {
             stop = if at_after { close_end } else { close - escapes };
-            quoted = !at_after;
+            closing = (!at_after).then_some((close, escapes));
         }
     }
 
     let part = &s[url_at..stop];
-    let url_end = match quoted {
-        true => part.len(),
-        false => url_len(part, sep),
-    };
+    let url_end = url_len(part, sep);
     let m = mask_url(&part[..url_end], sep, rules);
     out.push_str(&m.shown);
     let Some(from) = m.from else {
@@ -519,6 +517,17 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
     let next = masked_end(s, url_at + from, url_at, url_stop);
     if next > url_stop {
         return (next, false);
+    }
+    // `'srt://h?passphrase=it's a'`: a masked end glued to a letter behind
+    // the partner was a quote inside the value; mask on through the next.
+    if let Some((close, escapes)) = closing {
+        let glued = s[close + 1..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        if m.tail && glued {
+            return (masked_end(s, close, close - escapes, close + 1), false);
+        }
     }
     // A masked end may go on behind the punctuation: drop it.
     if !m.tail {
@@ -585,15 +594,28 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%')
 }
 
-/// The quote right before a URL at `url_at`, in the word from `word_at`,
-/// and how many backslashes escape it.
+/// The quote that opens before a URL at `url_at`, in the word from
+/// `word_at`, and how many backslashes escape it: the last `"`, `'` or `` ` ``
+/// in the prefix whose partner is not in the prefix too (the innermost one),
+/// right before the URL
+/// (`uri="srt://…`) or before the whole argument (`"uri=srt://…`).
 fn quote_before(s: &str, word_at: usize, url_at: usize) -> Option<(usize, usize)> {
     let b = s.as_bytes();
-    let open = url_at.checked_sub(1).filter(|&o| o >= word_at)?;
-    if b[open] != b'"' && b[open] != b'\'' {
-        return None;
+    // Quotes nest in dumps (`"\"srt://`): the innermost open one counts.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    for i in word_at..url_at {
+        if !matches!(b[i], b'"' | b'\'' | b'`') {
+            continue;
+        }
+        let escapes = backslashes_before(b, word_at, i);
+        match open.last() {
+            Some(&(o, e)) if b[o] == b[i] && e == escapes => {
+                open.pop();
+            }
+            _ => open.push((i, escapes)),
+        }
     }
-    Some((open, backslashes_before(b, word_at, open)))
+    open.pop()
 }
 
 /// The end of a masked run from `from` to at least `end`: a quote that opens
@@ -879,6 +901,14 @@ mod tests {
             &["SEKA", "SEKB"],
         ),
         ("x \"srt://h:9000?passphrase=SEKA SEKB", &["SEKA", "SEKB"]),
+        (
+            "gst-launch-1.0 srtsink \"uri=srt://h:9000?mode=caller&passphrase=SEKA SEKB\"",
+            &["SEKA", "SEKB"],
+        ),
+        ("\"uri=srt://h:9000?passphrase=SEKA SEKB\"", &["SEKA", "SEKB"]),
+        ("'location=rtmp://h/live/SEKA SEKB' x", &["SEKA", "SEKB"]),
+        ("uri=`srt://h?passphrase=SEKA SEKB`", &["SEKA", "SEKB"]),
+        ("uri='srt://h?passphrase=SEKA's SEKB'", &["SEKA", "SEKB"]),
         // A key in the path of an HTTP endpoint (Cloudflare Stream WHIP).
         (
             "whipclientsink0: Unexpected status 401 for https://customer-abc.cloudflarestream.com/SEKRETKEY0123/webRTC/publish",
@@ -977,6 +1007,8 @@ mod tests {
         "Failed to open srt://h:9000?mode=caller&latency=120: Connection refused",
         "rtmp://a.rtmp.youtube.com/live2: Connection refused",
         "srtsink uri=\"srt://h:9000?mode=caller\" sync=false",
+        "srtsink \"uri=srt://h:9000?mode=caller\" sync=false",
+        "name=\"a\" uri=srt://h:9000 sync=false",
         "https://example.com/ refused",
         "rtmps://example.com/live",
         "Loading file: file:///home/user/My%20Video.mp4",
