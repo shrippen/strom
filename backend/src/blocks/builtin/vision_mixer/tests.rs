@@ -23,7 +23,7 @@ fn overlay_timer_test_guard() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn test_parse_num_inputs_default() {
     let props = HashMap::new();
-    assert_eq!(properties::parse_num_inputs(&props), 4);
+    assert_eq!(properties::parse_num_inputs(&props), Ok(4));
 }
 
 #[test]
@@ -33,20 +33,60 @@ fn test_parse_num_inputs_valid() {
         "num_inputs".to_string(),
         PropertyValue::String("8".to_string()),
     );
-    assert_eq!(properties::parse_num_inputs(&props), 8);
+    assert_eq!(properties::parse_num_inputs(&props), Ok(8));
 }
 
 #[test]
-fn test_parse_num_inputs_clamped_to_max() {
+fn test_parse_num_inputs_above_max_is_rejected() {
+    use strom_types::vision_mixer::MAX_NUM_INPUTS;
     let mut props = HashMap::new();
     props.insert(
         "num_inputs".to_string(),
+        PropertyValue::UInt(MAX_NUM_INPUTS as u64),
+    );
+    assert_eq!(properties::parse_num_inputs(&props), Ok(MAX_NUM_INPUTS));
+    for too_many in [
+        PropertyValue::UInt(MAX_NUM_INPUTS as u64 + 1),
         PropertyValue::String("9999".to_string()),
+    ] {
+        props.insert("num_inputs".to_string(), too_many);
+        let err = properties::parse_num_inputs(&props).expect_err("above the maximum");
+        assert!(err.contains(&format!("at most {MAX_NUM_INPUTS}")), "{err}");
+        assert_eq!(properties::num_inputs_or_max(&props), MAX_NUM_INPUTS);
+    }
+}
+
+/// A flow asking for more inputs than the mixer has fails to build, with the
+/// reason, instead of building 32 inputs and leaving the links to the rest
+/// without a target.
+#[test]
+fn test_build_rejects_num_inputs_above_max() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext, BlockBuildError};
+    gstreamer::init().unwrap();
+    let mut props = HashMap::new();
+    props.insert(
+        "compositor_preference".to_string(),
+        PropertyValue::String("cpu".to_string()),
     );
-    assert_eq!(
-        properties::parse_num_inputs(&props),
-        strom_types::vision_mixer::MAX_NUM_INPUTS
+    props.insert(
+        "num_inputs".to_string(),
+        PropertyValue::UInt(strom_types::vision_mixer::MAX_NUM_INPUTS as u64 + 1),
     );
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let result = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx);
+    match result {
+        Err(BlockBuildError::InvalidProperty(msg)) => {
+            let want = format!(
+                "num_inputs is {}",
+                strom_types::vision_mixer::MAX_NUM_INPUTS + 1
+            );
+            assert!(msg.contains(&want), "{msg}")
+        }
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("more inputs than the maximum built"),
+    }
 }
 
 #[test]
@@ -56,7 +96,7 @@ fn test_parse_num_inputs_clamped_min() {
         "num_inputs".to_string(),
         PropertyValue::String("1".to_string()),
     );
-    assert_eq!(properties::parse_num_inputs(&props), 2); // MIN
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2)); // MIN
 }
 
 #[test]
@@ -590,6 +630,204 @@ fn overlay_timer_exits_when_its_appsrc_is_orphaned() {
     unregister_flow(&flow_id);
 }
 
+/// Idle DSK layers must not hold program back: the compositors ignore pads
+/// that never got a buffer.
+#[test]
+fn test_compositors_ignore_inactive_pads() {
+    use super::elements::{make_dist_compositor, make_mv_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_video::gst_base::prelude::*;
+    use gstreamer_video::gst_base::Aggregator;
+
+    gst::init().unwrap();
+    // GL and CUDA only where their plugins exist; glvideomixerelement has
+    // no ignore-inactive-pads property, the aggregator API still applies.
+    let backends = [
+        (CompositorBackend::Software, "compositor"),
+        (CompositorBackend::OpenGL, "glvideomixerelement"),
+        (CompositorBackend::Cuda, "cudacompositor"),
+    ];
+    for (backend, factory) in backends {
+        if gst::ElementFactory::find(factory).is_none() {
+            continue;
+        }
+        let dist = make_dist_compositor(backend, 20, 20, StartTime::First).unwrap();
+        let mv = make_mv_compositor(backend, 20, 20, StartTime::First).unwrap();
+        for mixer in [dist, mv] {
+            let aggregator = mixer.downcast_ref::<Aggregator>().unwrap();
+            assert!(aggregator.ignores_inactive_pads(), "{}", factory);
+        }
+    }
+}
+
+/// A CUDA mixer pad back at alpha 1.0 after a fraction (the end of a fade)
+/// is fully opaque again: `cudaconverter` drops a change back to exactly
+/// 1.0, so without the guard white stays at half.
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_pad_alpha_back_to_one() {
+    use super::elements::{make_dist_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+
+    gst::init().unwrap();
+    let mixer = make_dist_compositor(CompositorBackend::Cuda, 20, 20, StartTime::First).unwrap();
+    let pipeline = gst::parse::launch(
+        "videotestsrc is-live=true pattern=white ! video/x-raw,width=320,height=180,framerate=30/1 \
+         ! cudaupload name=up cudadownload name=down ! videoconvert ! video/x-raw,format=GRAY8 \
+         ! appsink name=sink sync=false max-buffers=1 drop=true",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline.add(&mixer).unwrap();
+    pipeline.by_name("up").unwrap().link(&mixer).unwrap();
+    mixer.link(&pipeline.by_name("down").unwrap()).unwrap();
+    let pad = mixer.static_pad("sink_0").unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<AppSink>()
+        .unwrap();
+    let mean = || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let sample = sink.pull_sample().unwrap();
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        map.iter().map(|&v| v as u64).sum::<u64>() / map.len() as u64
+    };
+    pipeline.set_state(gst::State::Playing).unwrap();
+    // White as the mixer's output format carries it (235 in limited range).
+    let full = mean();
+    assert!(full > 200, "white at alpha 1.0: {}", full);
+    pad.set_property("alpha", 0.5f64);
+    let half = mean();
+    assert!(
+        half < full * 3 / 4,
+        "white at alpha 0.5: {} of {}",
+        half,
+        full
+    );
+    pad.set_property("alpha", 1.0f64);
+    let back = mean();
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(back, full, "white back at alpha 1.0 after 0.5");
+}
+
+/// The same on air: a take animates alpha through keyframes, and the last
+/// one lands on exactly 1.0. The guard must catch each value the control
+/// binding sets, not only direct writes.
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_pad_alpha_keyframes_back_to_one() {
+    use super::elements::{make_dist_compositor, CompositorBackend};
+    use crate::blocks::builtin::start_time::StartTime;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+    use gstreamer_app::AppSink;
+    use gstreamer_controller::prelude::*;
+    use gstreamer_controller::InterpolationMode;
+
+    gst::init().unwrap();
+    let mixer = make_dist_compositor(CompositorBackend::Cuda, 20, 20, StartTime::First).unwrap();
+    let pipeline = gst::parse::launch(
+        "videotestsrc is-live=true pattern=white ! video/x-raw,width=320,height=180,framerate=30/1 \
+         ! cudaupload name=up cudadownload name=down ! videoconvert ! video/x-raw,format=GRAY8 \
+         ! appsink name=sink sync=false max-buffers=1 drop=true",
+    )
+    .unwrap()
+    .downcast::<gst::Pipeline>()
+    .unwrap();
+    pipeline.add(&mixer).unwrap();
+    pipeline.by_name("up").unwrap().link(&mixer).unwrap();
+    mixer.link(&pipeline.by_name("down").unwrap()).unwrap();
+    let pad = mixer.static_pad("sink_0").unwrap();
+    let sink = pipeline
+        .by_name("sink")
+        .unwrap()
+        .downcast::<AppSink>()
+        .unwrap();
+    let mean = |wait_ms| {
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        let sample = sink.pull_sample().unwrap();
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        map.iter().map(|&v| v as u64).sum::<u64>() / map.len() as u64
+    };
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let full = mean(400);
+    assert!(full > 200, "white at alpha 1.0: {}", full);
+
+    // Hold at 0.5 for 600 ms, then up to exactly 1.0 over 300 ms, in the
+    // mixer's stream time as the transitions program it.
+    let now = mixer.query_position::<gst::ClockTime>().unwrap();
+    let cs = crate::gst::control_bindings::fresh_control_source(
+        pad.upcast_ref(),
+        "alpha",
+        InterpolationMode::Linear,
+    )
+    .unwrap();
+    let ms = gst::ClockTime::from_mseconds;
+    assert!(cs.set(now, 0.5) && cs.set(now + ms(600), 0.5) && cs.set(now + ms(900), 1.0));
+    let half = mean(300);
+    assert!(
+        half < full * 3 / 4,
+        "white at keyframe alpha 0.5: {} of {}",
+        half,
+        full
+    );
+    let back = mean(1000);
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(back, full, "white back after keyframes 0.5 -> 1.0");
+}
+
+/// CUDA inputs take formats `cudaupload` has no caps for: ProRes 4444
+/// decodes to A444_10LE, VP9 with alpha to A420 (stingers with alpha).
+/// Run with `cargo test -- --ignored` on a host with NVIDIA CUDA.
+#[test]
+#[ignore = "needs NVIDIA CUDA (cudaupload, cudacompositor)"]
+fn test_cuda_input_takes_alpha_formats() {
+    use super::builder::pipeline_cpu::{make_input_convert, CUDA_UPLOAD};
+    use super::elements::CompositorBackend;
+    use gstreamer as gst;
+    use gstreamer::prelude::*;
+
+    gst::init().unwrap();
+    for format in ["A444_10LE", "A420"] {
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=3 ! video/x-raw,format={} ! identity name=from \
+             cudacompositor name=mix ! fakesink",
+            format
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let convert = make_input_convert(CompositorBackend::Cuda, CUDA_UPLOAD, "convert").unwrap();
+        pipeline.add(&convert).unwrap();
+        let from = pipeline.by_name("from").unwrap();
+        let mix = pipeline.by_name("mix").unwrap();
+        gst::Element::link_many([&from, &convert, &mix]).expect(format);
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let msg = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .expect("EOS or error within 10 s");
+        pipeline.set_state(gst::State::Null).unwrap();
+        if let gst::MessageView::Error(err) = msg.view() {
+            panic!("{} into the CUDA mixer: {}", format, err.error());
+        }
+    }
+}
+
 /// With `output_format` Auto, every CPU input's tee feeds branches that run
 /// through `videocrop`. The input must be held to formats `videocrop` takes:
 /// left open it can settle on one only the compositors accept (A444_16LE on
@@ -645,7 +883,13 @@ fn dist_compositor_late_first_input_does_not_rewind() {
     use gstreamer as gst;
 
     gst::init().unwrap();
-    let mixer = make_dist_compositor(CompositorBackend::Software, 100, 30).unwrap();
+    let mixer = make_dist_compositor(
+        CompositorBackend::Software,
+        100,
+        30,
+        crate::blocks::builtin::start_time::StartTime::Zero,
+    )
+    .unwrap();
     let caps = gst::Caps::builder("video/x-raw")
         .field("format", "I420")
         .field("width", 64i32)
@@ -1084,6 +1328,366 @@ fn flows_sharing_a_block_id_keep_their_own_overlay() {
         "tearing down flow A must leave flow B's overlay registered"
     );
     unregister_flow(&flow_b);
+}
+
+/// The compositor sink pads the CPU builder links and gives properties to,
+/// with every pad kind present (DSKs, PiPs and their border underlays,
+/// stinger, preview output), are exactly the pads of the inline formulas
+/// the builders used before `PadMap`: existing flows keep their pad names.
+#[test]
+fn test_cpu_build_links_the_same_sink_pads_as_before_pad_map() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+    use std::collections::BTreeSet;
+
+    gstreamer::init().unwrap();
+    crate::gpu::detect_gpu_capabilities();
+    let (n, d, p) = (3usize, 2usize, 2usize);
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("cpu".into())),
+        ("num_inputs", PropertyValue::UInt(n as u64)),
+        ("num_dsk_inputs", PropertyValue::String(d.to_string())),
+        ("num_pips", PropertyValue::String(p.to_string())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("CPU vision mixer builds");
+
+    let linked = |element: &str| -> BTreeSet<usize> {
+        built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect()
+    };
+    let with_props = |element: &str| -> BTreeSet<usize> {
+        built
+            .pad_properties
+            .get(&format!("vm:{element}"))
+            .map(|pads| {
+                pads.keys()
+                    .filter_map(|k| k.strip_prefix("sink_")?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Dist: inputs, DSKs (N+d), underlays (N+D+i), stinger (N+D+N).
+    let mut dist: BTreeSet<usize> = (0..n).collect();
+    dist.extend((0..d).map(|k| n + k));
+    dist.extend((0..n).map(|i| n + d + i));
+    dist.insert(n + d + n);
+    // Multiview: thumbnails, PGM (N), PVW (N+1+i), PiP (2N+1+p*N+i),
+    // overlay (2N+1+P*N), PVW underlays (2N+2+P*N+i), tile underlays.
+    let overlay = 2 * n + 1 + p * n;
+    let mut mv: BTreeSet<usize> = (0..n).collect();
+    mv.insert(n);
+    mv.extend((0..n).map(|i| n + 1 + i));
+    mv.extend((0..p).flat_map(|pip| (0..n).map(move |i| 2 * n + 1 + pip * n + i)));
+    mv.insert(overlay);
+    mv.extend((0..n).map(|i| overlay + 1 + i));
+    mv.extend((0..p).flat_map(|pip| (0..n).map(move |i| overlay + 1 + n * (1 + pip) + i)));
+    // Preview output: inputs, underlays (N+i).
+    let pvw: BTreeSet<usize> = (0..2 * n).collect();
+
+    assert_eq!(linked("mixer"), dist);
+    assert_eq!(linked("mv_comp"), mv);
+    assert_eq!(linked("pvw_comp"), pvw);
+    // Every pad with properties is one of the linked ones (the PGM big pad
+    // and the dist pads all get properties; the GPU stinger matte does not
+    // exist on CPU).
+    assert!(with_props("mixer").is_subset(&dist));
+    assert_eq!(with_props("mv_comp"), mv);
+}
+
+/// The GL mixer names its auto-created pads in link order, so the GPU
+/// builder must link every compositor's sink pads in index order, with no
+/// gap: otherwise a pad named `sink_k` in the pad properties and the
+/// runtime operations is a different pad than the one linked for it.
+#[test]
+fn test_gpu_build_links_sink_pads_in_index_order() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+
+    gstreamer::init().unwrap();
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("gpu".into())),
+        ("num_inputs", PropertyValue::UInt(3)),
+        ("num_dsk_inputs", PropertyValue::String("2".into())),
+        ("num_pips", PropertyValue::String("2".into())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("GPU vision mixer builds (needs the GL plugins, not a GL context)");
+
+    for element in ["mixer", "mv_comp", "pvw_comp"] {
+        let order: Vec<usize> = built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect();
+        let expected: Vec<usize> = (0..order.len()).collect();
+        assert!(!order.is_empty(), "{element} has no sink links");
+        assert_eq!(order, expected, "{element} sink pads out of link order");
+    }
+}
+
+/// `num_inputs` given as a negative number counts as the minimum (it was
+/// the maximum through an unsigned wrap), and a string is read trimmed.
+#[test]
+fn test_parse_num_inputs_negative_and_padded() {
+    let mut props = HashMap::new();
+    props.insert("num_inputs".to_string(), PropertyValue::Int(-1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert(
+        "num_inputs".to_string(),
+        PropertyValue::String(" 8 ".to_string()),
+    );
+    assert_eq!(properties::parse_num_inputs(&props), Ok(8));
+}
+
+/// Two inputs at least, one when free slots let the others come at
+/// runtime.
+#[test]
+fn test_parse_num_inputs_one_with_free_slots() {
+    let mut props = HashMap::new();
+    props.insert("num_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(8));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(1));
+    props.insert("num_inputs".to_string(), PropertyValue::UInt(0));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(1));
+    // One built input and a capacity of one leave no free place: the
+    // minimum stays two (review of #57).
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(1));
+    assert_eq!(properties::parse_num_inputs(&props), Ok(2));
+}
+
+/// The tile cells: 0 means one per slot from the first input on; more
+/// than the slots there are would only add black cells (and a picture a
+/// typo makes huge), so they are cut to that.
+#[test]
+fn test_tile_cells_stay_within_the_slots() {
+    use strom_types::vision_mixer::{TILES_CELLS_PROPERTY, TILES_FIRST_INPUT_PROPERTY};
+    let mut props = HashMap::new();
+    assert_eq!(properties::parse_tile_cells(&props, 16), (0, 16));
+    props.insert(
+        TILES_FIRST_INPUT_PROPERTY.to_string(),
+        PropertyValue::UInt(1),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 16), (1, 15));
+    props.insert(TILES_CELLS_PROPERTY.to_string(), PropertyValue::UInt(10));
+    assert_eq!(properties::parse_tile_cells(&props, 16), (1, 10));
+    props.insert(
+        TILES_CELLS_PROPERTY.to_string(),
+        PropertyValue::UInt(10_000),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 128), (1, 127));
+    props.insert(
+        TILES_FIRST_INPUT_PROPERTY.to_string(),
+        PropertyValue::UInt(200),
+    );
+    assert_eq!(properties::parse_tile_cells(&props, 128), (200, 0));
+}
+
+#[test]
+fn test_parse_max_inputs() {
+    use strom_types::vision_mixer::MAX_INPUT_CAPACITY;
+    let mut props = HashMap::new();
+    // Missing or 0: no free slots.
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(4));
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(0));
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(4));
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::String(" 16 ".into()),
+    );
+    assert_eq!(properties::parse_max_inputs(&props, 4), Ok(16));
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::UInt(MAX_INPUT_CAPACITY as u64),
+    );
+    assert_eq!(
+        properties::parse_max_inputs(&props, 4),
+        Ok(MAX_INPUT_CAPACITY)
+    );
+    props.insert(
+        "max_inputs".to_string(),
+        PropertyValue::UInt(MAX_INPUT_CAPACITY as u64 + 1),
+    );
+    let err = properties::parse_max_inputs(&props, 4).expect_err("above the cap");
+    assert!(err.contains("at most"), "{err}");
+    props.insert("max_inputs".to_string(), PropertyValue::UInt(3));
+    let err = properties::parse_max_inputs(&props, 4).expect_err("below num_inputs");
+    assert!(err.contains("below num_inputs 4"), "{err}");
+    // The fallback for callers that cannot fail.
+    assert_eq!(properties::capacity_or_num_inputs(&props), 4);
+}
+
+/// Free slots take tiles only once filled: the present inputs get the tiles
+/// a mixer with just them would give them, in index order.
+#[test]
+fn test_layout_with_free_slots() {
+    let full = layout::compute_layout(1280, 720, 3, 1, ASPECT_16_9, false);
+    let sparse = layout::compute_layout_for(1280, 720, &[0, 1, 5], 8, 1, ASPECT_16_9, false);
+    assert_eq!(sparse.num_inputs, 8);
+    assert_eq!(
+        sparse.visible,
+        vec![true, true, false, false, false, true, false, false]
+    );
+    for (input, tile) in [(0, 0), (1, 1), (5, 2)] {
+        assert_eq!(
+            sparse.thumbnail_rects[input].as_ints(),
+            full.thumbnail_rects[tile].as_ints(),
+            "input {input}"
+        );
+    }
+    assert_eq!(
+        sparse.pip_tile_rects[0].as_ints(),
+        full.pip_tile_rects[0].as_ints()
+    );
+    // A free slot's pad position is the off-screen placeholder.
+    assert_eq!(layout::thumbnail_pad_position(&sparse, 3), (0, 0, 1, 1));
+}
+
+/// With free slots, the static inputs keep their indices and every other
+/// pad (DSK, stinger, multiview, preview) moves up by the slot count, as the
+/// pad map says. No pad is linked for a free slot.
+#[test]
+fn test_cpu_build_with_free_slots_links_by_capacity() {
+    use crate::blocks::{builtin::get_builder, BlockBuildContext};
+    use std::collections::BTreeSet;
+    use strom_types::vision_mixer::PadMap;
+
+    gstreamer::init().unwrap();
+    crate::gpu::detect_gpu_capabilities();
+    let (n, cap, d, p) = (3usize, 8usize, 2usize, 1usize);
+    let mut props = HashMap::new();
+    for (k, v) in [
+        ("compositor_preference", PropertyValue::String("cpu".into())),
+        ("num_inputs", PropertyValue::UInt(n as u64)),
+        ("max_inputs", PropertyValue::UInt(cap as u64)),
+        ("num_dsk_inputs", PropertyValue::String(d.to_string())),
+        ("num_pips", PropertyValue::String(p.to_string())),
+        ("enable_stinger", PropertyValue::Bool(true)),
+        ("enable_preview_out", PropertyValue::Bool(true)),
+    ] {
+        props.insert(k.to_string(), v);
+    }
+    let ctx = BlockBuildContext::new(vec![], "all".to_string());
+    let built = get_builder("builtin.vision_mixer")
+        .expect("vision mixer has a builder")
+        .build("vm", &props, &ctx)
+        .expect("CPU vision mixer with free slots builds");
+    let linked = |element: &str| -> BTreeSet<usize> {
+        built
+            .internal_links
+            .iter()
+            .filter(|(_, to)| to.element_id == format!("vm:{element}"))
+            .filter_map(|(_, to)| to.pad_name.as_deref()?.strip_prefix("sink_")?.parse().ok())
+            .collect()
+    };
+    let pm = PadMap::new(cap, d, p);
+    let mut dist: BTreeSet<usize> = (0..n).map(|i| pm.dist_input(i)).collect();
+    dist.extend((0..d).map(|k| pm.dist_dsk(k)));
+    let ub = pm.dist_underlay_base().unwrap();
+    dist.extend((0..n).map(|i| ub + i));
+    dist.insert(pm.dist_stinger());
+    assert_eq!(linked("mixer"), dist);
+
+    let mut mv: BTreeSet<usize> = (0..n).map(|i| pm.mv_thumb(i)).collect();
+    mv.insert(pm.mv_pgm());
+    mv.extend((0..n).map(|i| pm.mv_pvw(i)));
+    mv.extend((0..n).map(|i| pm.mv_pip(0, i)));
+    mv.insert(pm.mv_overlay());
+    let pvu = pm.mv_pvw_underlay_base().unwrap();
+    mv.extend((0..n).map(|i| pvu + i));
+    let tu = pm.mv_pip_underlay_base(0).unwrap();
+    mv.extend((0..n).map(|i| tu + i));
+    assert_eq!(linked("mv_comp"), mv);
+
+    let mut pvw: BTreeSet<usize> = (0..n).map(|i| pm.pvw_out_input(i)).collect();
+    let ou = pm.pvw_out_underlay_base().unwrap();
+    pvw.extend((0..n).map(|i| ou + i));
+    assert_eq!(linked("pvw_comp"), pvw);
+
+    // No element of a free slot is built.
+    assert!(!built
+        .elements
+        .iter()
+        .any(|(id, _)| id == "vm:queue_3" || id == "vm:tee_3"));
+}
+
+/// A dynamic input joins hidden on every pad but its thumbnail.
+#[test]
+fn test_dynamic_input_pad_properties_start_hidden() {
+    use super::builder::{pad_layout, InputSpec};
+    use super::elements::CompositorBackend;
+    use strom_types::vision_mixer::PadMap;
+
+    let spec = InputSpec {
+        instance_id: "vm".into(),
+        backend: CompositorBackend::Software,
+        output_format: None,
+        num_pips: 1,
+        pm: PadMap::new(6, 1, 1),
+        underlay: Some((false, String::new())),
+        preview_out: true,
+        tiles: None,
+        pgm_w: 1920,
+        pgm_h: 1080,
+        mv_w: 1280,
+        mv_h: 720,
+        source_aspect: ASPECT_16_9,
+        swap_pvw_pgm: false,
+    };
+    let layout = spec.mv_layout(&[0, 1, 4]);
+    let pads = pad_layout::dynamic_input_pad_properties(&spec, &layout, 4);
+    let alpha = |comp: &str, idx: usize| -> f64 {
+        let (_, _, props) = pads
+            .iter()
+            .find(|(c, p, _)| c == &format!("vm:{comp}") && p == &PadMap::sink(idx))
+            .unwrap_or_else(|| panic!("no props for {comp} sink_{idx}"));
+        match props["alpha"] {
+            PropertyValue::Float(a) => a,
+            ref v => panic!("alpha {v:?}"),
+        }
+    };
+    let pm = spec.pm;
+    assert_eq!(alpha("mixer", pm.dist_input(4)), 0.0);
+    assert_eq!(alpha("mv_comp", pm.mv_thumb(4)), 1.0);
+    assert_eq!(alpha("mv_comp", pm.mv_pvw(4)), 0.0);
+    assert_eq!(alpha("mv_comp", pm.mv_pip(0, 4)), 0.0);
+    assert_eq!(alpha("pvw_comp", pm.pvw_out_input(4)), 0.0);
+    assert_eq!(alpha("mixer", pm.dist_underlay_base().unwrap() + 4), 0.0);
+    assert_eq!(
+        alpha("pvw_comp", pm.pvw_out_underlay_base().unwrap() + 4),
+        0.0
+    );
+    // The thumbnail sits in the input's tile.
+    let (_, _, thumb) = pads
+        .iter()
+        .find(|(c, p, _)| c == "vm:mv_comp" && p == &PadMap::sink(pm.mv_thumb(4)))
+        .unwrap();
+    let (x, _, w, _) = layout.thumbnail_rects[4].as_ints();
+    assert!(matches!(thumb["xpos"], PropertyValue::Int(v) if v == x as i64));
+    assert!(matches!(thumb["width"], PropertyValue::Int(v) if v == w as i64));
 }
 
 /// The multiview only shows the inputs: when it falls behind (a busy CPU

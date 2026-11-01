@@ -6,6 +6,7 @@
 //! Sub-modules:
 //!   - [`plan`] — pure `plan_transition` decision function (no GStreamer deps).
 //!   - [`controller`] — `TransitionController` impl that drives compositor pads.
+//!   - [`tbar`] — pure pad values of a transition held at a position (T-bar).
 
 use crate::gst::shaders::{MasterFxKind, WipeKind};
 use gstreamer as gst;
@@ -15,7 +16,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 mod controller;
-mod plan;
+pub(crate) mod plan;
+pub mod tbar;
 
 pub use plan::plan_transition;
 pub(crate) use plan::rect_contains;

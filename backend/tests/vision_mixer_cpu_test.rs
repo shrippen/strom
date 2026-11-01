@@ -354,7 +354,7 @@ mod keyed_alpha {
 
         // DSK pads are built hidden (alpha=0) — key the graphic in.
         manager
-            .set_dsk_enabled(block_id, 0, 2, true)
+            .set_dsk_enabled(block_id, 0, 2, true, 0)
             .expect("enable DSK 0");
 
         // Pull PGM frames until the keyed graphic is actually on screen (the pad

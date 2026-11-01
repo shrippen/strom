@@ -6,6 +6,7 @@ use tracing::{error, warn};
 
 use super::properties::db_to_linear;
 use super::EQ_BAND_TYPE_BELL;
+use crate::blocks::builtin::start_time::{disarm_zero_start, StartTime};
 
 /// Cached result of checking whether audiomixer supports the force-live property.
 static AUDIOMIXER_HAS_FORCE_LIVE: OnceLock<bool> = OnceLock::new();
@@ -20,6 +21,7 @@ pub(crate) fn make_audiomixer(
     force_live: bool,
     latency_ms: u64,
     min_upstream_latency_ms: u64,
+    start: StartTime,
 ) -> Result<gst::Element, BlockBuildError> {
     // Check if force-live is available (construct-only, must be set at build time)
     let has_force_live = *AUDIOMIXER_HAS_FORCE_LIVE.get_or_init(|| {
@@ -42,9 +44,10 @@ pub(crate) fn make_audiomixer(
     // GStreamer 1.26 race where the srcpad task can run before any buffer arrives,
     // causing the aggregator to pick the absolute monotonic clock time as start
     // time and wait for an impossibly far deadline.
-    mixer.set_property_from_str("start-time-selection", "zero");
+    // With base time 0 (see `start_time`) "first" is right instead.
+    mixer.set_property_from_str("start-time-selection", start.nick());
     // Selected once, at startup: a late first input must not rewind a running bus.
-    crate::gst::aggregator_start::disarm_start_time_selection(&mixer);
+    disarm_zero_start(&mixer, start);
 
     // latency: aggregator timeout in nanoseconds
     let latency_ns = latency_ms * 1_000_000;

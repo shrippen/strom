@@ -55,6 +55,11 @@ pub const BLOCK_ID: &str = "builtin.html_input";
 /// therefore the whole write, which is why it can change on a running flow.
 pub const REMOTE_CONTROL_PROPERTY: &str = "remote_control";
 
+/// The property that lets the API run JavaScript and set CSS in the page
+/// (`POST .../devtools/page`). Read from the stored block like
+/// [`REMOTE_CONTROL_PROPERTY`], so it can change on a running flow.
+pub const PAGE_SCRIPTING_PROPERTY: &str = "page_scripting";
+
 /// The property holding the page to render.
 pub const URL_PROPERTY: &str = "url";
 
@@ -476,6 +481,13 @@ pub fn try_apply_live_url(
 }
 
 /// Whether this block's operator has allowed a remote control link for it.
+pub fn page_scripting_enabled(properties: &HashMap<String, PropertyValue>) -> bool {
+    matches!(
+        properties.get(PAGE_SCRIPTING_PROPERTY),
+        Some(PropertyValue::Bool(true))
+    )
+}
+
 pub fn remote_control_enabled(properties: &HashMap<String, PropertyValue>) -> bool {
     matches!(
         properties.get(REMOTE_CONTROL_PROPERTY),
@@ -868,6 +880,26 @@ fn html_input_definition() -> BlockDefinition {
                 mapping: PropertyMapping {
                     element_id: "_block".to_string(),
                     property_name: REMOTE_CONTROL_PROPERTY.to_string(),
+                    transform: None,
+                },
+                live: true,
+                persist: None,
+            },
+            ExposedProperty {
+                name: PAGE_SCRIPTING_PROPERTY.to_string(),
+                label: "Page Scripting".to_string(),
+                description: "Allow API callers to run JavaScript in this page, add CSS to \
+                              it, and freeze and resume it (POST \
+                              /api/flows/{flow}/blocks/{block}/devtools/page) - for a \
+                              control system that calls the page's own functions. Whoever \
+                              may call the API can then read and change everything the page \
+                              holds, its logins included."
+                    .to_string(),
+                property_type: PropertyType::Bool,
+                default_value: Some(PropertyValue::Bool(false)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: PAGE_SCRIPTING_PROPERTY.to_string(),
                     transform: None,
                 },
                 live: true,

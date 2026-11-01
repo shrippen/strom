@@ -46,6 +46,7 @@ impl SystemMonitor {
             num_cores,
             total_memory: 0,
             used_memory: 0,
+            process_memory: None,
             gpu_stats: Vec::new(),
             gl_renderer: None,
             timestamp: 0,
@@ -120,6 +121,11 @@ impl SystemMonitor {
             let cpu_usage = system.global_cpu_usage();
             let total_memory = system.total_memory();
             let used_memory = system.used_memory();
+            // Own resident memory, to spot leaks over long runs.
+            let process_memory = sysinfo::get_current_pid().ok().and_then(|pid| {
+                system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), false);
+                system.process(pid).map(|p| p.memory())
+            });
 
             // Collect GPU stats
             #[allow(unused_mut)]
@@ -149,6 +155,7 @@ impl SystemMonitor {
                     num_cores,
                     total_memory,
                     used_memory,
+                    process_memory,
                     gpu_stats,
                     gl_renderer: gl_renderer.clone(),
                     timestamp,
@@ -199,6 +206,14 @@ impl SystemMonitor {
                                 .map(|t| t as f32);
 
                             let power_usage = device.power_usage().ok().map(|p| p as f32 / 1000.0);
+                            let decoder_utilization = device
+                                .decoder_utilization()
+                                .ok()
+                                .map(|u| u.utilization as f32);
+                            let encoder_utilization = device
+                                .encoder_utilization()
+                                .ok()
+                                .map(|u| u.utilization as f32);
 
                             gpu_stats.push(GpuStats {
                                 index: i,
@@ -209,6 +224,8 @@ impl SystemMonitor {
                                 used_memory,
                                 temperature,
                                 power_usage,
+                                decoder_utilization,
+                                encoder_utilization,
                             });
                         }
                         Err(e) => {
@@ -282,6 +299,9 @@ impl SystemMonitor {
                     used_memory,
                     temperature,
                     power_usage,
+                    // Not queried in the nvidia-smi fallback.
+                    decoder_utilization: None,
+                    encoder_utilization: None,
                 });
             }
         }

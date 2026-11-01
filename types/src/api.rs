@@ -96,6 +96,24 @@ pub struct UpdatePropertyRequest {
     pub ramp_ms: Option<u32>,
 }
 
+/// Request to hold the take from program to preview at a T-bar position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[cfg_attr(feature = "validation", derive(garde::Validate))]
+pub struct HoldTransitionRequest {
+    /// How far the take is: 0 = program as it is, 1 = preview fully in.
+    /// The take itself is a transition request: a cut at 1 goes on from
+    /// the held picture, a take with a duration (or a stinger) starts from
+    /// program as it rests.
+    #[cfg_attr(feature = "validation", garde(range(min = 0.0, max = 1.0)))]
+    pub position: f64,
+    /// The transition the bar runs, as for a take ("fade", "slide_left",
+    /// "push_up", "dip_to_black", ...). Wipes and master FX show as a fade.
+    #[serde(default = "default_transition_type")]
+    #[cfg_attr(feature = "validation", garde(length(min = 1, max = 50)))]
+    pub transition_type: String,
+}
+
 /// Request to trigger a transition on a compositor block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
@@ -648,6 +666,46 @@ pub struct SrtStatsResponse {
     #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
     pub flow_id: FlowId,
     pub stats: SrtStats,
+}
+
+/// Where an output's bytes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMedium {
+    /// Sent on the network (`rtmp2sink`): the bytes written to the socket,
+    /// protocol framing included.
+    Network,
+    /// Written to disk (Live Recorder): the bytes written to its files.
+    File,
+}
+
+/// Bytes one output element has sent or written since the flow started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputByteCount {
+    pub medium: OutputMedium,
+    /// Total since the element started. A reconnecting network sink may
+    /// start again from zero; a client taking a rate from two readings
+    /// treats a smaller value as a new start.
+    pub bytes: u64,
+}
+
+/// Byte counters of a flow's output elements, keyed by element name
+/// (e.g. `block_id:rtmp_sink`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputBytes {
+    pub outputs: HashMap<String, OutputByteCount>,
+}
+
+/// Response containing a flow's output byte counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct OutputBytesResponse {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = Uuid))]
+    pub flow_id: FlowId,
+    pub stats: OutputBytes,
 }
 
 // ============================================================================
@@ -1307,6 +1365,11 @@ pub struct VisionMixerState {
     /// Current master (PGM) video effect.
     #[serde(default)]
     pub master_effect: crate::effects::VideoEffect,
+    /// The inputs the mixer has, by index, ascending: the static ones and
+    /// the dynamic ones added at runtime. Per-input lists above are indexed
+    /// by input index and cover every slot (`max_inputs`).
+    #[serde(default)]
+    pub active_inputs: Vec<usize>,
 }
 
 /// Request to set the multiview overlay alpha on a vision mixer block.
@@ -1333,6 +1396,9 @@ pub struct DskToggleRequest {
     pub dsk: usize,
     /// Enable or disable the DSK layer
     pub enabled: bool,
+    /// Fade duration in milliseconds (0 = instant, the default)
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 /// Response after toggling a DSK layer.

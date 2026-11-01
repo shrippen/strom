@@ -2,7 +2,8 @@
 //!
 //! Sub-modules:
 //!   - [`pipeline_gpu`] — `build_gpu_pipeline` (glvideomixer-based)
-//!   - [`pipeline_cpu`] — `build_cpu_pipeline` (compositor-based, no GL)
+//!   - [`pipeline_cpu`] — `build_cpu_pipeline` (compositor-based, no GL; also
+//!     the CUDA backend, which has the same topology in CUDA memory)
 //!   - [`audio_meter`] — per-input + PGM `level` element chains and bus handler
 //!   - [`pad_layout`]  — compositor sink-pad initial geometry/zorder/alpha
 
@@ -24,16 +25,21 @@ use strom_types::{
 use tracing::info;
 
 mod audio_meter;
-mod pad_layout;
-mod pipeline_cpu;
+pub(crate) mod pad_layout;
+pub(crate) mod pipeline_cpu;
 mod pipeline_gpu;
+pub(crate) mod preview_out;
+pub(crate) mod tiles_out;
+
+/// Caps feature of CUDA device memory (NVIDIA `nvcodec` elements).
+pub(crate) const CUDA_MEMORY_FEATURE: &str = "memory:CUDAMemory";
 
 /// Vision Mixer block builder.
 pub struct VisionMixerBuilder;
 
 impl BlockBuilder for VisionMixerBuilder {
     fn get_external_pads(&self, props: &HashMap<String, PropertyValue>) -> Option<ExternalPads> {
-        let num_inputs = properties::parse_num_inputs(props);
+        let num_inputs = properties::num_inputs_or_max(props);
         let num_dsk = properties::parse_num_dsk_inputs(props);
 
         // Internal element IDs are bare names — block expansion adds the instance_id prefix
@@ -90,7 +96,7 @@ impl BlockBuilder for VisionMixerBuilder {
             "sink",
         ));
 
-        let outputs = vec![
+        let mut outputs = vec![
             ExternalPad::with_label("pgm_out", "PGM", MediaType::Video, "queue_dist_out", "src"),
             ExternalPad::with_label(
                 "multiview_out",
@@ -100,6 +106,24 @@ impl BlockBuilder for VisionMixerBuilder {
                 "src",
             ),
         ];
+        if properties::parse_bool(props, vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY, false) {
+            outputs.push(ExternalPad::with_label(
+                vision_mixer::PREVIEW_OUTPUT_PAD,
+                "PVW",
+                MediaType::Video,
+                "queue_pvw_out",
+                "src",
+            ));
+        }
+        if properties::parse_bool(props, vision_mixer::ENABLE_TILES_OUT_PROPERTY, false) {
+            outputs.push(ExternalPad::with_label(
+                vision_mixer::TILES_OUTPUT_PAD,
+                "Tiles",
+                MediaType::Video,
+                "queue_tiles_out",
+                "src",
+            ));
+        }
 
         Some(ExternalPads { inputs, outputs })
     }
@@ -110,7 +134,14 @@ impl BlockBuilder for VisionMixerBuilder {
         props: &HashMap<String, PropertyValue>,
         ctx: &BlockBuildContext,
     ) -> Result<BlockBuildResult, BlockBuildError> {
-        let num_inputs = properties::parse_num_inputs(props);
+        let num_inputs =
+            properties::parse_num_inputs(props).map_err(BlockBuildError::InvalidProperty)?;
+        let capacity = properties::parse_max_inputs(props, num_inputs)
+            .map_err(BlockBuildError::InvalidProperty)?;
+        // Checked here so a bad list fails the build; the inputs themselves
+        // are added once the pipeline runs (see `vision_mixer::dynamic`).
+        properties::parse_dynamic_inputs(props, num_inputs, capacity)
+            .map_err(BlockBuildError::InvalidProperty)?;
         let num_pips = properties::parse_num_pips(props);
         let pgm_input = properties::parse_initial_pgm(props, num_inputs);
         let pvw_input = properties::parse_initial_pvw(props, num_inputs);
@@ -163,6 +194,27 @@ impl BlockBuilder for VisionMixerBuilder {
             properties::parse_bool(props, "swap_pvw_pgm", vision_mixer::DEFAULT_SWAP_PVW_PGM);
         let enable_stinger =
             properties::parse_bool(props, strom_types::stinger::ENABLE_STINGER_PROPERTY, false);
+        let enable_preview_out =
+            properties::parse_bool(props, vision_mixer::ENABLE_PREVIEW_OUT_PROPERTY, false);
+
+        let tiles = properties::parse_bool(props, vision_mixer::ENABLE_TILES_OUT_PROPERTY, false)
+            .then(|| {
+                tiles_out::TilesGrid::new(
+                    properties::parse_tile_cells(props, capacity),
+                    properties::parse_resolution(
+                        props,
+                        vision_mixer::TILES_CELL_PROPERTY,
+                        vision_mixer::DEFAULT_TILES_CELL,
+                    ),
+                    properties::parse_u64(props, vision_mixer::TILES_COLUMNS_PROPERTY, 0) as usize,
+                    properties::parse_framerate(
+                        props,
+                        vision_mixer::TILES_FRAMERATE_PROPERTY,
+                        &format!("{}/{}", mv_framerate.0, mv_framerate.1),
+                    ),
+                    properties::parse_format(props, vision_mixer::TILES_FORMAT_PROPERTY),
+                )
+            });
 
         let pref = props
             .get("compositor_preference")
@@ -171,11 +223,40 @@ impl BlockBuilder for VisionMixerBuilder {
                 _ => None,
             })
             .unwrap_or("auto");
-        let backend = super::elements::select_backend(pref)?;
+        let mut backend = super::elements::select_backend(pref)?;
+        // Free slots need runtime inputs, which the OpenGL mixer has not
+        // got yet: "auto" picks CUDA or the CPU instead, unless that would
+        // lose the shader FX (OpenGL only), which fails below like "gpu".
+        if backend == CompositorBackend::OpenGL
+            && capacity > num_inputs
+            && pref != "gpu"
+            && !enable_fx
+        {
+            backend = if gst::ElementFactory::find(super::elements::CUDA_COMPOSITOR).is_some() {
+                CompositorBackend::Cuda
+            } else {
+                CompositorBackend::Software
+            };
+            info!(
+                "Vision mixer: max_inputs {} needs dynamic inputs, using the {:?} backend \
+                 instead of OpenGL",
+                capacity, backend
+            );
+        }
+        if backend == CompositorBackend::OpenGL && capacity > num_inputs {
+            return Err(BlockBuildError::InvalidProperty(format!(
+                "max_inputs {} needs the CPU or CUDA backend: the OpenGL mixer has no \
+                 dynamic inputs yet, and the CPU and CUDA ones have no shader FX \
+                 (set max_inputs to 0 or num_inputs {}, or turn off shader FX, or \
+                 choose the cpu or cuda backend)",
+                capacity, num_inputs
+            )));
+        }
+        let start_time = properties::parse_start_time(props);
 
         info!(
-            "Building vision mixer: {} inputs, PGM={}x{}@{}/{}, MV={}x{}@{}/{}, backend={:?}, pgm={}, pvw={}",
-            num_inputs, pgm_w, pgm_h, pgm_framerate.0, pgm_framerate.1,
+            "Building vision mixer: {} inputs ({} slots), PGM={}x{}@{}/{}, MV={}x{}@{}/{}, backend={:?}, pgm={}, pvw={}",
+            num_inputs, capacity, pgm_w, pgm_h, pgm_framerate.0, pgm_framerate.1,
             mv_w, mv_h, mv_framerate.0, mv_framerate.1,
             backend, pgm_input, pvw_input
         );
@@ -184,6 +265,7 @@ impl BlockBuilder for VisionMixerBuilder {
             instance_id,
             flow_id: properties::parse_flow_id(props),
             num_inputs,
+            capacity,
             num_dsk_inputs,
             num_pips,
             pgm_input,
@@ -195,6 +277,7 @@ impl BlockBuilder for VisionMixerBuilder {
             labels: &labels,
             latency_ms,
             min_upstream_ms,
+            start_time,
             pgm_w,
             pgm_h,
             mv_w,
@@ -208,11 +291,15 @@ impl BlockBuilder for VisionMixerBuilder {
             enable_fx,
             swap_pvw_pgm,
             enable_stinger,
+            enable_preview_out,
+            tiles,
         };
 
         match backend {
             CompositorBackend::OpenGL => pipeline_gpu::build_gpu_pipeline(&p, ctx),
-            CompositorBackend::Software => pipeline_cpu::build_cpu_pipeline(&p, ctx),
+            CompositorBackend::Software | CompositorBackend::Cuda => {
+                pipeline_cpu::build_cpu_pipeline(&p, ctx)
+            }
         }
     }
 }
@@ -223,7 +310,11 @@ pub(super) struct PipelineParams<'a> {
     /// Owning flow, used to key the overlay registries so flow teardown can
     /// clear them — see `overlay::unregister_flow`.
     pub(super) flow_id: strom_types::FlowId,
+    /// Static inputs, fed by flow links: `0..num_inputs`.
     pub(super) num_inputs: usize,
+    /// Input slots (`max_inputs`): the pad indices reserved for inputs. The
+    /// slots above `num_inputs` take dynamic inputs at runtime.
+    pub(super) capacity: usize,
     pub(super) num_dsk_inputs: usize,
     pub(super) num_pips: usize,
     pub(super) pgm_input: usize,
@@ -235,6 +326,7 @@ pub(super) struct PipelineParams<'a> {
     pub(super) labels: &'a [String],
     pub(super) latency_ms: u64,
     pub(super) min_upstream_ms: u64,
+    pub(super) start_time: super::elements::StartTime,
     pub(super) pgm_w: u32,
     pub(super) pgm_h: u32,
     pub(super) mv_w: u32,
@@ -251,12 +343,131 @@ pub(super) struct PipelineParams<'a> {
     pub(super) swap_pvw_pgm: bool,
     /// Build the stinger input: a graphic pad, and on the GPU a matte pad.
     pub(super) enable_stinger: bool,
+    /// Build the preview output (`preview_out`).
+    pub(super) enable_preview_out: bool,
+    /// Build the tile output (`tiles_out`) on this grid.
+    pub(super) tiles: Option<tiles_out::TilesGrid>,
 }
 
 impl PipelineParams<'_> {
-    /// Sink index of the stinger graphic on the dist mixer (matte: + 1).
-    pub(super) fn stinger_pad_base(&self) -> usize {
-        vision_mixer::dist_stinger_pad_base(self.num_inputs, self.num_dsk_inputs, self.num_pips)
+    /// Sink pad indices of the compositors this mixer builds.
+    pub(super) fn pad_map(&self) -> vision_mixer::PadMap {
+        vision_mixer::PadMap::new(self.capacity, self.num_dsk_inputs, self.num_pips)
+    }
+
+    /// Aspect the multiview layout fits its tiles to (the program's).
+    pub(super) fn source_aspect(&self) -> f64 {
+        if self.pgm_h > 0 {
+            self.pgm_w as f64 / self.pgm_h as f64
+        } else {
+            16.0 / 9.0
+        }
+    }
+
+    /// The multiview layout of the static inputs.
+    pub(super) fn mv_layout(&self) -> layout::OverlayLayout {
+        let inputs: Vec<usize> = (0..self.num_inputs).collect();
+        layout::compute_layout_for(
+            self.mv_w,
+            self.mv_h,
+            &inputs,
+            self.capacity,
+            self.num_pips,
+            self.source_aspect(),
+            self.swap_pvw_pgm,
+        )
+    }
+
+    /// What building one input chain needs, owned, so that a dynamic input
+    /// can be built while the mixer runs.
+    pub(super) fn input_spec(&self) -> InputSpec {
+        InputSpec {
+            instance_id: self.instance_id.to_string(),
+            backend: self.backend,
+            output_format: self.output_format.clone(),
+            num_pips: self.num_pips,
+            pm: self.pad_map(),
+            underlay: (self.num_pips > 0).then(|| self.underlay_source()),
+            preview_out: self.enable_preview_out,
+            tiles: self.tiles.clone(),
+            pgm_w: self.pgm_w,
+            pgm_h: self.pgm_h,
+            mv_w: self.mv_w,
+            mv_h: self.mv_h,
+            source_aspect: self.source_aspect(),
+            swap_pvw_pgm: self.swap_pvw_pgm,
+        }
+    }
+}
+
+/// The parameters of a mixer that one input chain depends on (see
+/// [`PipelineParams::input_spec`]).
+#[derive(Debug, Clone)]
+pub(crate) struct InputSpec {
+    pub(crate) instance_id: String,
+    pub(crate) backend: CompositorBackend,
+    pub(crate) output_format: Option<String>,
+    pub(crate) num_pips: usize,
+    pub(crate) pm: vision_mixer::PadMap,
+    /// Border underlay sources (live, caps), when the mixer has PiPs.
+    pub(crate) underlay: Option<(bool, String)>,
+    /// The mixer has the preview output (one more tee branch per input).
+    pub(crate) preview_out: bool,
+    /// The mixer has the tile output on this grid (one more tee branch).
+    pub(crate) tiles: Option<tiles_out::TilesGrid>,
+    pub(crate) pgm_w: u32,
+    pub(crate) pgm_h: u32,
+    pub(crate) mv_w: u32,
+    pub(crate) mv_h: u32,
+    pub(crate) source_aspect: f64,
+    pub(crate) swap_pvw_pgm: bool,
+}
+
+impl InputSpec {
+    /// Create a namespaced element ID.
+    pub(crate) fn id(&self, name: &str) -> String {
+        format!("{}:{}", self.instance_id, name)
+    }
+
+    /// Tee source pad of the preview output branch (after the dist, thumb,
+    /// PVW and PiP branches).
+    pub(crate) fn pvw_out_tee_src(&self) -> usize {
+        3 + self.num_pips
+    }
+
+    /// Tee source pad of the tile output branch (after the preview's).
+    pub(crate) fn tiles_out_tee_src(&self) -> usize {
+        self.pvw_out_tee_src() + usize::from(self.preview_out)
+    }
+
+    /// Multiview layout with tiles for `inputs` (ascending).
+    pub(crate) fn mv_layout(&self, inputs: &[usize]) -> layout::OverlayLayout {
+        layout::compute_layout_for(
+            self.mv_w,
+            self.mv_h,
+            inputs,
+            self.pm.capacity,
+            self.num_pips,
+            self.source_aspect,
+            self.swap_pvw_pgm,
+        )
+    }
+
+    fn finish_caps(&self, builder: gst::caps::Builder<gst::caps::NoFeature>) -> gst::Caps {
+        match self.backend {
+            CompositorBackend::Cuda => builder.features([CUDA_MEMORY_FEATURE]).build(),
+            CompositorBackend::OpenGL | CompositorBackend::Software => builder.build(),
+        }
+    }
+
+    /// Caps pinning only the pixel format.
+    pub(crate) fn format_caps(&self, format: &str) -> gst::Caps {
+        self.finish_caps(gst::Caps::builder("video/x-raw").field("format", format))
+    }
+
+    /// Raw video caps in the compositor's native memory, any format.
+    pub(crate) fn memory_caps(&self) -> gst::Caps {
+        self.finish_caps(gst::Caps::builder("video/x-raw"))
     }
 }
 
@@ -264,6 +475,47 @@ impl<'a> PipelineParams<'a> {
     /// Create a namespaced element ID.
     pub(super) fn id(&self, name: &str) -> String {
         format!("{}:{}", self.instance_id, name)
+    }
+
+    /// Border underlay sources: live or not, and their caps.
+    ///
+    /// Non-live (the default) adds no latency, but a non-live
+    /// `videotestsrc` stamps its buffers from 0 and pushes them while the
+    /// pipeline prerolls. With `start_time_selection=first` (base time 0,
+    /// inputs carry clock time) the compositors take the earliest first
+    /// buffer as output start, so the underlays would start the output at
+    /// running time 0 — far behind the live inputs, whose frames then wait
+    /// as "future" buffers (content pads show nothing) until the
+    /// compositor has caught up with clock time. Live underlays stamp
+    /// running time instead; at the program frame rate they add at most
+    /// one output frame of latency.
+    pub(super) fn underlay_source(&self) -> (bool, String) {
+        let live = self.start_time == super::elements::StartTime::First;
+        let (n, d) = if live { self.pgm_framerate } else { (5, 1) };
+        (
+            live,
+            format!(
+                "video/x-raw,format=RGBA,width=16,height=16,framerate={n}/{d},pixel-aspect-ratio=1/1"
+            ),
+        )
+    }
+
+    /// Caps feature of the compositor's native memory, if not system memory.
+    /// Only the CUDA backend needs one here: the GL builder spells out its
+    /// GL-memory caps itself.
+    fn memory_feature(&self) -> Option<&'static str> {
+        match self.backend {
+            CompositorBackend::Cuda => Some(CUDA_MEMORY_FEATURE),
+            CompositorBackend::OpenGL | CompositorBackend::Software => None,
+        }
+    }
+
+    /// Finish a caps builder, tagging it with the backend's memory feature.
+    fn finish_caps(&self, builder: gst::caps::Builder<gst::caps::NoFeature>) -> gst::Caps {
+        match self.memory_feature() {
+            Some(feature) => builder.features([feature]).build(),
+            None => builder.build(),
+        }
     }
 
     /// Raw video caps with resolution, framerate and an optional pixel format.
@@ -276,7 +528,7 @@ impl<'a> PipelineParams<'a> {
         if let Some(fmt) = format {
             builder = builder.field("format", fmt);
         }
-        builder.build()
+        self.finish_caps(builder)
     }
 
     /// Build PGM output caps with resolution, framerate, and optional pixel format.
@@ -322,6 +574,10 @@ impl<'a> PipelineParams<'a> {
     /// once on the way out keeps the key and still hands `output_format`
     /// downstream. Alpha-carrying and unknown formats are left alone.
     pub(super) fn alpha_blend_format(&self) -> Option<&'static str> {
+        // `cudacompositor` gets CUDA memory, which no CPU convert takes.
+        if self.backend != CompositorBackend::Software {
+            return None;
+        }
         let fmt = self.output_format.as_deref()?;
         let format = fmt.parse::<gst_video::VideoFormat>().ok()?;
         let info = gst_video::VideoFormatInfo::from_format(format);
@@ -397,8 +653,9 @@ pub(super) fn setup_overlay_renderer(
         .and_then(|p_idx| pip_initial.pip_bgs.get(p_idx).copied().flatten())
         .unwrap_or(p.pvw_input);
 
-    let overlay_state = Arc::new(VisionMixerOverlayState::new(
+    let overlay_state = Arc::new(VisionMixerOverlayState::with_slots(
         p.num_inputs,
+        p.capacity,
         p.num_dsk_inputs,
         initial_pgm_input,
         initial_pvw_input,
@@ -409,6 +666,14 @@ pub(super) fn setup_overlay_renderer(
         p.show_vu_meters,
         pip_initial,
     ));
+
+    // Dynamic inputs are built like static ones, from the same spec; the
+    // GL mixer has none yet (rejected above when `max_inputs` asks).
+    if p.backend != CompositorBackend::OpenGL {
+        if let Ok(mut dynamic) = overlay_state.dynamic.lock() {
+            dynamic.spec = Some(p.input_spec());
+        }
+    }
 
     // Register the overlay state so the API layer can access it
     overlay::register_overlay_state(p.flow_id, p.instance_id, Arc::clone(&overlay_state));

@@ -4,9 +4,10 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use strom_types::element::ElementPadRef;
+use strom_types::vision_mixer::PadMap;
 use tracing::info;
 
-use super::super::{elements, layout};
+use super::super::elements;
 use super::{audio_meter, pad_layout, setup_overlay_renderer, PipelineParams};
 use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult};
 
@@ -18,8 +19,10 @@ pub(super) fn build_gpu_pipeline(
     let mut links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
 
     // --- Create compositors (no pre-requested pads — the linker auto-creates them) ---
-    let dist_comp = elements::make_dist_compositor(p.backend, p.latency_ms, p.min_upstream_ms)?;
-    let mv_comp = elements::make_mv_compositor(p.backend, p.latency_ms, p.min_upstream_ms)?;
+    let dist_comp =
+        elements::make_dist_compositor(p.backend, p.latency_ms, p.min_upstream_ms, p.start_time)?;
+    let mv_comp =
+        elements::make_mv_compositor(p.backend, p.latency_ms, p.min_upstream_ms, p.start_time)?;
 
     dist_comp.set_property("name", p.id("mixer"));
     mv_comp.set_property("name", p.id("mv_comp"));
@@ -35,19 +38,7 @@ pub(super) fn build_gpu_pipeline(
     elems.push((mv_comp_id.clone(), mv_comp));
 
     // Compute multiview layout
-    let source_aspect = if p.pgm_h > 0 {
-        p.pgm_w as f64 / p.pgm_h as f64
-    } else {
-        16.0 / 9.0
-    };
-    let mv_layout = layout::compute_layout(
-        p.mv_w,
-        p.mv_h,
-        p.num_inputs,
-        p.num_pips,
-        source_aspect,
-        p.swap_pvw_pgm,
-    );
+    let mv_layout = p.mv_layout();
 
     // --- Distribution output chain ---
     // queue_post_dist decouples the compositor from downstream processing.
@@ -389,21 +380,26 @@ pub(super) fn build_gpu_pipeline(
             .collect();
         // Each source pushes a single frame; the mixer pad repeats it
         // (`repeat-after-eos`) while the border is configured or visible.
-        let underlay_caps: gst::Caps =
-            "video/x-raw,format=RGBA,width=16,height=16,framerate=5/1,pixel-aspect-ratio=1/1"
-                .parse()
-                .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
+        let (underlay_live, underlay_caps_str) = p.underlay_source();
+        let underlay_caps: gst::Caps = underlay_caps_str
+            .parse()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("underlay caps: {}", e)))?;
         for name in &underlay_chains {
             let src_id = p.id(&format!("{}_src", name));
             let cf_id = p.id(&format!("{}_caps", name));
             let up_id = p.id(&format!("{}_upload", name));
-            let src = crate::gst::underlay::make_underlay_src(&src_id)
+            let src = crate::gst::underlay::make_underlay_src(&src_id, underlay_live)
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", src_id, e)))?;
             let cf = gst::ElementFactory::make("capsfilter")
                 .name(&cf_id)
                 .property("caps", &underlay_caps)
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", cf_id, e)))?;
+            // The underlay feeds glupload without a queue in between: without
+            // this, borders are empty textures on NVIDIA (no frame around boxes).
+            if let Some(src_pad) = cf.static_pad("src") {
+                crate::gst::gl_input_front::keep_own_memory(&src_pad);
+            }
             elems.push((src_id.clone(), src));
             elems.push((cf_id.clone(), cf));
             elems.push((up_id.clone(), elements::make_element("glupload", &up_id)?));
@@ -490,7 +486,10 @@ pub(super) fn build_gpu_pipeline(
     }
 
     // --- Compositor links (order matters: linker auto-creates sink pads sequentially) ---
-    // Distribution compositor: video inputs first (sink_0..N-1), then DSK (sink_N..N+dsk-1)
+    // Sink pad indices come from the pad map (see `PadMap`); the links are
+    // made in index order so the GL mixer's auto-created pads match them.
+    let pm = p.pad_map();
+    // Distribution compositor: video inputs first, then DSK
     for i in 0..p.num_inputs {
         let tee_id = p.id(&format!("tee_{}", i));
         let q_dist_id = p.id(&format!("queue_to_dist_{}", i));
@@ -512,12 +511,12 @@ pub(super) fn build_gpu_pipeline(
             ));
             links.push((
                 ElementPadRef::pad(&fx_take_id, "src"),
-                ElementPadRef::pad(&mixer_id, format!("sink_{}", i)),
+                ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_input(i))),
             ));
         } else {
             links.push((
                 ElementPadRef::pad(&q_dist_id, "src"),
-                ElementPadRef::pad(&mixer_id, format!("sink_{}", i)),
+                ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_input(i))),
             ));
         }
     }
@@ -526,22 +525,18 @@ pub(super) fn build_gpu_pipeline(
         let cc_id = p.id(&format!("glcolorconvert_dsk_{}", i));
         links.push((
             ElementPadRef::pad(&cc_id, "src"),
-            ElementPadRef::pad(&mixer_id, format!("sink_{}", p.num_inputs + i)),
+            ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_dsk(i))),
         ));
     }
 
-    // Dist border underlays — after the DSK links so input i's underlay
-    // lands at sink_{num_inputs + num_dsk_inputs + i} (glvideomixer pads are
+    // Dist border underlays — after the DSK links (glvideomixer pads are
     // auto-created in link order).
-    if p.num_pips > 0 {
+    if let Some(base) = pm.dist_underlay_base() {
         for i in 0..p.num_inputs {
             let up_id = p.id(&format!("underlay_dist_{}_upload", i));
             links.push((
                 ElementPadRef::pad(&up_id, "src"),
-                ElementPadRef::pad(
-                    &mixer_id,
-                    format!("sink_{}", p.num_inputs + p.num_dsk_inputs + i),
-                ),
+                ElementPadRef::pad(&mixer_id, PadMap::sink(base + i)),
             ));
         }
     }
@@ -549,14 +544,13 @@ pub(super) fn build_gpu_pipeline(
     // Stinger pads — after the underlays: graphic at the base index, matte
     // at the next.
     if p.enable_stinger {
-        let base = p.stinger_pad_base();
         links.push((
             ElementPadRef::pad(p.id("queue_stinger_fill"), "src"),
-            ElementPadRef::pad(&mixer_id, format!("sink_{}", base)),
+            ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_stinger())),
         ));
         links.push((
             ElementPadRef::pad(p.id("stinger_matte"), "src"),
-            ElementPadRef::pad(&mixer_id, format!("sink_{}", base + 1)),
+            ElementPadRef::pad(&mixer_id, PadMap::sink(pm.dist_stinger_matte())),
         ));
     }
 
@@ -570,21 +564,21 @@ pub(super) fn build_gpu_pipeline(
         ));
         links.push((
             ElementPadRef::pad(&q_thumb_id, "src"),
-            ElementPadRef::pad(&mv_comp_id, format!("sink_{}", i)),
+            ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_thumb(i))),
         ));
     }
 
-    // Multiview PGM big display: tee_pgm.src_1 → queue_pgm_mv → mv_comp.sink_N
+    // Multiview PGM big display: tee_pgm.src_1 → queue_pgm_mv → mv_comp
     links.push((
         ElementPadRef::pad(&tee_pgm_id, "src_1"),
         ElementPadRef::pad(&q_pgm_mv_id, "sink"),
     ));
     links.push((
         ElementPadRef::pad(&q_pgm_mv_id, "src"),
-        ElementPadRef::pad(&mv_comp_id, format!("sink_{}", p.num_inputs)),
+        ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_pgm())),
     ));
 
-    // Multiview PVW big candidates: tee_i.src_2 → queue → mv_comp.sink_{N+1+i}
+    // Multiview PVW big candidates: tee_i.src_2 → queue → mv_comp
     for i in 0..p.num_inputs {
         let tee_id = p.id(&format!("tee_{}", i));
         let q_pvw_id = p.id(&format!("queue_to_mv_pvw_{}", i));
@@ -594,62 +588,77 @@ pub(super) fn build_gpu_pipeline(
         ));
         links.push((
             ElementPadRef::pad(&q_pvw_id, "src"),
-            ElementPadRef::pad(&mv_comp_id, format!("sink_{}", p.num_inputs + 1 + i)),
+            ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_pvw(i))),
         ));
     }
 
-    // PiP candidates: for each PiP tile p_idx, each input i gets one mv_comp pad
-    // at sink_{2N+1 + p_idx*N + i}. Pad role (bg/insert/hidden) is decided by
+    // PiP candidates: for each PiP tile p_idx, each input i gets one mv_comp
+    // pad. Pad role (bg/insert/hidden) is decided by
     // alpha+geometry in build_pad_properties.
     for pip_idx in 0..p.num_pips {
         for i in 0..p.num_inputs {
             let tee_id = p.id(&format!("tee_{}", i));
             let q_pip_id = p.id(&format!("queue_to_mv_pip_{}_{}", pip_idx, i));
             let tee_src = format!("src_{}", 3 + pip_idx);
-            let sink_idx = 2 * p.num_inputs + 1 + pip_idx * p.num_inputs + i;
+            let sink_idx = pm.mv_pip(pip_idx, i);
             links.push((
                 ElementPadRef::pad(&tee_id, &tee_src),
                 ElementPadRef::pad(&q_pip_id, "sink"),
             ));
             links.push((
                 ElementPadRef::pad(&q_pip_id, "src"),
-                ElementPadRef::pad(&mv_comp_id, format!("sink_{}", sink_idx)),
+                ElementPadRef::pad(&mv_comp_id, PadMap::sink(sink_idx)),
             ));
         }
     }
 
     // Overlay pad: glupload_overlay → mv_comp (pad order matters on the GL
     // mixer — this must precede the underlay links below).
-    let overlay_pad_idx = 2 * p.num_inputs + 1 + p.num_pips * p.num_inputs;
     links.push((
         ElementPadRef::pad(&up_overlay_id, "src"),
-        ElementPadRef::pad(&mv_comp_id, format!("sink_{}", overlay_pad_idx)),
+        ElementPadRef::pad(&mv_comp_id, PadMap::sink(pm.mv_overlay())),
     ));
 
-    // Multiview border underlays — after the overlay pad: PVW underlays at
-    // sink_{2N+2+P+i}, then tile underlays at sink_{2N+2+P+N+pip*N+i}.
-    if p.num_pips > 0 {
-        let mv_underlay_base = overlay_pad_idx + 1;
+    // Multiview border underlays — after the overlay pad: PVW underlays,
+    // then the PiP tile underlays.
+    if let Some(mv_underlay_base) = pm.mv_pvw_underlay_base() {
         for i in 0..p.num_inputs {
             let up_id = p.id(&format!("underlay_pvw_{}_upload", i));
             links.push((
                 ElementPadRef::pad(&up_id, "src"),
-                ElementPadRef::pad(&mv_comp_id, format!("sink_{}", mv_underlay_base + i)),
+                ElementPadRef::pad(&mv_comp_id, PadMap::sink(mv_underlay_base + i)),
             ));
         }
         for pip_idx in 0..p.num_pips {
+            let Some(base) = pm.mv_pip_underlay_base(pip_idx) else {
+                continue;
+            };
             for i in 0..p.num_inputs {
                 let up_id = p.id(&format!("underlay_pip_{}_{}_upload", pip_idx, i));
-                let sink_idx = mv_underlay_base + p.num_inputs * (1 + pip_idx) + i;
                 links.push((
                     ElementPadRef::pad(&up_id, "src"),
-                    ElementPadRef::pad(&mv_comp_id, format!("sink_{}", sink_idx)),
+                    ElementPadRef::pad(&mv_comp_id, PadMap::sink(base + i)),
                 ));
             }
         }
     }
 
     // --- Pad properties (applied after linking when auto-created pads exist) ---
+    // Preview output: one more tee branch per input, after the PiP ones.
+    let pvw_weak = if p.enable_preview_out {
+        let pvw_comp = super::preview_out::append(p, 3 + p.num_pips, &mut elems, &mut links)?;
+        Some(pvw_comp.downgrade())
+    } else {
+        None
+    };
+    // Tile output: one more tee branch per input, after the preview's.
+    if let Some(grid) = &p.tiles {
+        let tee_src = p.input_spec().tiles_out_tee_src();
+        super::tiles_out::append(p, grid, tee_src, &mut elems, &mut links)?;
+    }
+    let pvw_rect = mv_layout.pvw_rect;
+    let (pgm_w, pgm_h) = (p.pgm_w, p.pgm_h);
+
     let pad_properties = pad_layout::build_pad_properties(p, &mv_layout);
 
     // --- Audio metering branches (per-input + PGM) ---
@@ -673,12 +682,28 @@ pub(super) fn build_gpu_pipeline(
                 return;
             };
             super::super::geometry::install_caps_probes(
-                flow_id, &block_id, &mixer, &mv_comp, num_inputs, num_pips,
+                flow_id,
+                &block_id,
+                &mixer,
+                &mv_comp,
+                &pm,
+                0..num_inputs,
             );
+            if let Some(pvw_comp) = pvw_weak.as_ref().and_then(|w| w.upgrade()) {
+                super::preview_out::mirror(
+                    &mv_comp,
+                    &pvw_comp,
+                    &pm,
+                    0..num_inputs,
+                    &pvw_rect,
+                    pgm_w,
+                    pgm_h,
+                );
+            }
             // Border underlays hold a frame only while their border is
             // configured or still visible.
             if num_pips > 0 {
-                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp);
+                super::super::underlays::watch(&underlay_state, &mixer, &mv_comp, 0..num_inputs);
             }
         }));
     }
@@ -706,7 +731,15 @@ pub(super) fn build_gpu_pipeline(
 /// input's `queue` is where upstream's caps queries land, `glupload` is what
 /// they are answered by. `label` names the input in logs and errors, after its
 /// external pad. See [`crate::gst::gl_input_front`].
+///
+/// Where `glupload`'s udmabuf path is broken (see
+/// `gpu::udmabuf_upload_broken`), the queue also stops upstream from
+/// seeing its allocation proposal, so sources keep their own memory and
+/// `glupload` does a plain texture upload.
 fn install_input_front(queue: &gst::Element, glupload: &gst::Element, label: &str) {
+    if let Some(src) = queue.static_pad("src") {
+        crate::gst::gl_input_front::keep_own_memory(&src);
+    }
     if let Some(sink) = queue.static_pad("sink") {
         crate::gst::gl_input_front::install(&sink, glupload, label);
     }

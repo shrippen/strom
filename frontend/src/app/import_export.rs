@@ -279,6 +279,12 @@ impl StromApp {
         // Generate new flow ID
         flow.id = uuid::Uuid::new_v4();
 
+        // A mixer's dynamic aux buses publish on their inter channels; a copy
+        // or an import would take the same ones next to the original.
+        for block in &mut flow.blocks {
+            strom_types::mixer::drop_dynamic_aux_buses(&mut block.properties);
+        }
+
         // Reset state to Null
         flow.set_gst_state(Some(PipelineState::Null));
 

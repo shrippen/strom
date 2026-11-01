@@ -12,6 +12,7 @@ mod bridge;
 mod builder;
 mod definition;
 mod state;
+mod still;
 mod timing;
 
 #[doc(hidden)]
@@ -147,10 +148,12 @@ mod tests {
             audio_slots: MediaPlayerState::free_slots(0),
             decode: false,
             sync: true,
+            system_memory: false,
             media_path: std::path::PathBuf::from("/media"),
             timing: Arc::new(super::timing::Timing::new(0)),
             main_pipeline: gst::glib::WeakRef::new(),
             bus_watch: std::sync::Mutex::new(None),
+            still: Default::default(),
             stinger: Default::default(),
         }
     }

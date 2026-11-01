@@ -100,6 +100,47 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             live: false,
             persist: None,
         },
+        // Bus numbers for buses added while the flow runs — construction-time only.
+        ExposedProperty {
+            name: strom_types::mixer::MAX_AUX_BUSES_PROPERTY.to_string(),
+            label: "Aux Bus Capacity".to_string(),
+            description: format!(
+                "Highest aux bus number, for buses added while the flow runs (the \
+                 API's aux_buses endpoint adds them; their output goes to an inter \
+                 channel). 0 = no free buses, else at least Aux Buses, at most {}.",
+                MAX_AUX_BUSES
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::mixer::MAX_AUX_BUSES_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        // Channel numbers for channels added while the flow runs —
+        // construction-time only.
+        ExposedProperty {
+            name: strom_types::mixer::MAX_CHANNELS_PROPERTY.to_string(),
+            label: "Channel Capacity".to_string(),
+            description: format!(
+                "Highest channel number, for channels added while the flow runs (the \
+                 API's channels endpoint adds them; their sound comes from an inter \
+                 channel). 0 = no free channels, else at least Channels, at most {}.",
+                MAX_CHANNELS
+            ),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: strom_types::mixer::MAX_CHANNELS_PROPERTY.to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
         // Number of groups — construction-time only.
         ExposedProperty {
             name: "num_groups".to_string(),
@@ -110,6 +151,21 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             mapping: PropertyMapping {
                 element_id: "_block".to_string(),
                 property_name: "num_groups".to_string(),
+                transform: None,
+            },
+            live: false,
+            persist: None,
+        },
+        // What the monitor hears while nothing is soloed — construction-time only.
+        ExposedProperty {
+            name: "monitor_source".to_string(),
+            label: "Monitor Source".to_string(),
+            description: "Bus the Monitor follows while no PFL/AFL is on: 0 = Main, 1 to num_aux_buses = that aux bus (a headphone mix). Construction-time only.".to_string(),
+            property_type: PropertyType::UInt,
+            default_value: Some(PropertyValue::UInt(0)),
+            mapping: PropertyMapping {
+                element_id: "_block".to_string(),
+                property_name: "monitor_source".to_string(),
                 transform: None,
             },
             live: false,
@@ -151,6 +207,7 @@ pub(super) fn mixer_definition() -> BlockDefinition {
         live: false,
         persist: None,
     });
+    exposed_properties.push(crate::blocks::builtin::start_time::start_time_property());
     exposed_properties.push(ExposedProperty {
         name: "latency".to_string(),
         label: "Latency".to_string(),
@@ -201,6 +258,21 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             values: common_audio_sample_rate_enum_values(false),
         },
         default_value: Some(PropertyValue::String(DEFAULT_AUDIO_SAMPLE_RATE.to_string())),
+        mapping: PropertyMapping {
+            element_id: "_block".to_string(),
+            property_name: "sample_rate".to_string(),
+            transform: None,
+        },
+        live: false,
+        persist: None,
+    });
+
+    exposed_properties.push(ExposedProperty {
+        name: "sample_rate".to_string(),
+        label: "Sample Rate".to_string(),
+        description: "Sample rate of all buses in Hz; inputs at other rates are resampled. 0 lets the mixer take the rate it negotiates first (44.1 kHz if it starts before any input). Construction-time only.".to_string(),
+        property_type: PropertyType::UInt,
+        default_value: Some(PropertyValue::UInt(0)),
         mapping: PropertyMapping {
             element_id: "_block".to_string(),
             property_name: "sample_rate".to_string(),
@@ -523,6 +595,27 @@ pub(super) fn mixer_definition() -> BlockDefinition {
             persist: None,
         });
 
+        // Delay (lip sync): a Time Offset identity in front of the strip.
+        exposed_properties.push(ExposedProperty {
+            name: format!("ch{}_delay", ch),
+            label: format!("Ch {} Delay", ch),
+            description: format!(
+                "Channel {} delay in ms: its sound reaches every bus that much later \
+                 (lip sync). The source must buffer that long.",
+                ch
+            ),
+            property_type: PropertyType::Float,
+            default_value: Some(PropertyValue::Float(0.0)),
+            mapping: PropertyMapping {
+                element_id: super::channels::delay_id(ch - 1),
+                property_name: "offset_ms".to_string(),
+                // A sound cannot come before its source.
+                transform: Some("non_negative".to_string()),
+            },
+            live: true,
+            persist: None,
+        });
+
         exposed_properties.push(ExposedProperty {
             name: format!("ch{}_pan", ch),
             label: format!("Ch {} Pan", ch),
@@ -659,12 +752,14 @@ pub(super) fn mixer_definition() -> BlockDefinition {
                 ),
                 property_type: PropertyType::Bool,
                 default_value: Some(PropertyValue::Bool(false)), // all aux sends default post-fader
+                // Live: the state layer moves the send to the other tee
+                // (`dynamic::set_send_tap`).
                 mapping: PropertyMapping {
                     element_id: "_block".to_string(),
                     property_name: format!("ch{}_aux{}_pre", ch, aux),
                     transform: None,
                 },
-                live: false,
+                live: true,
                 persist: None,
             });
         }
@@ -970,7 +1065,7 @@ pub(super) fn mixer_definition() -> BlockDefinition {
                     name: format!("input_{}", i + 1),
                     label: Some(format!("A{}", i)),
                     media_type: MediaType::Audio,
-                    internal_element_id: format!("convert_{}", i),
+                    internal_element_id: super::channels::delay_id(i),
                     internal_pad_name: "sink".to_string(),
                 })
                 .collect(),
