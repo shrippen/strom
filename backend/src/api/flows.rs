@@ -1654,9 +1654,10 @@ pub async fn get_flow_latency(
 
 /// Get runtime statistics for a flow's pipeline.
 ///
-/// Returns RTP statistics from running pipeline elements, such as jitterbuffer
-/// statistics for AES67 input blocks. The flow must be started and running
-/// for statistics to be available.
+/// Returns statistics from running pipeline elements: jitterbuffer statistics
+/// for AES67 and WHIP input blocks, the receive queue of Inter Input blocks
+/// and the encode time of Video Encoder blocks. The flow must be started and
+/// running for statistics to be available.
 #[utoipa::path(
     get,
     path = "/api/flows/{id}/rtp-stats",

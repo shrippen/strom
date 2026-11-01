@@ -156,6 +156,9 @@ impl BlockBuilder for VideoEncBuilder {
             keyframe_interval,
         )?;
 
+        // Encode time per frame, for the flow's block statistics.
+        crate::stats::encoder::time_encoder(&encoder);
+
         // Create parser for the codec (critical for proper MPEG-TS muxing and playback)
         let parser_name = get_parser_name(codec);
         let parser_id = format!("{}:parser", instance_id);
