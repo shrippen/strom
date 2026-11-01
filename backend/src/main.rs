@@ -205,6 +205,10 @@ struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
 
+    /// Address to listen on (default: all interfaces, 0.0.0.0)
+    #[arg(long, env = "STROM_HOST")]
+    host: Option<std::net::IpAddr>,
+
     /// Port to listen on
     #[arg(short, long, env = "STROM_PORT")]
     port: Option<u16>,
@@ -389,6 +393,10 @@ fn main() -> anyhow::Result<()> {
         eprintln!("Failed to load configuration: {}", e);
         std::process::exit(1);
     });
+    // CLI and STROM_HOST win over the config file's server.host, as for the port.
+    if let Some(host) = args.host {
+        config.host = host;
+    }
 
     // Initialize logging with optional file output, log level, and stdout format
     let (log_reload_handle, default_log_filter) = init_logging(
@@ -640,8 +648,8 @@ fn run_with_gui(
         )
         .await;
 
-        // Start server - bind to 0.0.0.0 to be accessible from all interfaces
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        // Bind to the configured host: all interfaces (Docker, network) by default.
+        let addr = SocketAddr::new(config.host, config.port);
 
         let tls_config = setup_tls(&config).await;
 
@@ -907,8 +915,8 @@ async fn run_headless(
     )
     .await;
 
-    // Start server - bind to 0.0.0.0 to be accessible from all interfaces (Docker, network, etc.)
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    // Bind to the configured host: all interfaces (Docker, network) by default.
+    let addr = SocketAddr::new(config.host, config.port);
 
     let tls_config = setup_tls(&config).await;
 

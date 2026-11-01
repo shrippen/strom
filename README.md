@@ -112,6 +112,7 @@ Quick links: [Open Live setup](docs/OPEN_LIVE_SETUP.md) · [Docker](docs/DOCKER.
 Configure via CLI arguments, environment variables, or a config file (highest priority first):
 
 ```bash
+--host 127.0.0.1                 # or STROM_HOST=127.0.0.1 (default: all interfaces)
 --port 8080                      # or STROM_PORT=8080
 --data-dir /path/to/data         # or STROM_DATA_DIR=...
 --database-url postgresql://...   # or STROM_DATABASE_URL=... (production)

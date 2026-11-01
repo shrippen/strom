@@ -6,6 +6,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 /// Configuration structure that matches the TOML file format.
@@ -69,6 +70,9 @@ enum PortConfigEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ServerConfig {
+    /// Address to bind the HTTP(S) listener to. Default: all interfaces.
+    #[serde(default)]
+    host: Option<IpAddr>,
     #[serde(default = "default_port")]
     port: u16,
     #[serde(default = "default_ice_servers")]
@@ -214,6 +218,7 @@ fn default_sap_multicast_addresses() -> Vec<String> {
 /// becomes `server.ice.transport.policy`, which no field matches, so the
 /// variable is silently ignored.
 const SCALAR_ENV_VARS: &[(&str, &str)] = &[
+    ("STROM_SERVER_HOST", "server.host"),
     (
         "STROM_SERVER_ICE_TRANSPORT_POLICY",
         "server.ice_transport_policy",
@@ -255,9 +260,16 @@ fn default_port() -> u16 {
     strom_types::DEFAULT_PORT
 }
 
+/// All interfaces, so Docker and network access keep working unless a host is set.
+fn default_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+}
+
 /// Application configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Address to bind the HTTP(S) listener to
+    pub host: IpAddr,
     /// Port to listen on
     pub port: u16,
     /// Data directory the storage paths default to
@@ -417,6 +429,7 @@ impl Config {
         // 1. Start with defaults
         figment = figment.merge(Serialized::defaults(ConfigFile {
             server: ServerConfig {
+                host: None,
                 port: strom_types::DEFAULT_PORT,
                 ice_servers: default_ice_servers(),
                 ice_transport_policy: default_ice_transport_policy(),
@@ -605,6 +618,7 @@ impl Config {
         let data_paths = DataPaths::resolve(path_config)?;
 
         Ok(Self {
+            host: config_file.server.host.unwrap_or_else(default_host),
             port: config_file.server.port,
             data_dir: data_paths.data_dir,
             flows_path: data_paths.flows_path,
@@ -678,6 +692,7 @@ mod tests {
     fn test_from_figment_defaults() {
         // Clear any env vars that might have been set by other tests
         std::env::remove_var("STROM_SERVER_PORT");
+        std::env::remove_var("STROM_SERVER_HOST");
         std::env::remove_var("STROM_PORT");
         std::env::remove_var("STROM_STORAGE_DATABASE_URL");
         std::env::remove_var("STROM_STORAGE_DATA_DIR");
@@ -694,10 +709,30 @@ mod tests {
         let _ = std::env::set_current_dir(original_dir);
 
         assert_eq!(config.port, strom_types::DEFAULT_PORT);
+        assert_eq!(config.host, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(config.database_url.is_none());
         assert_eq!(config.stdout_log_format, LogFormat::Compact);
         assert!(!config.structured_events);
         assert!(!config.include_high_frequency_events);
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_figment_host_from_env() {
+        let temp_dir = TempDir::new().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_dir).unwrap();
+        std::env::set_var("STROM_SERVER_HOST", "::1");
+
+        let config = Config::from_figment(None, None, None, None, None, None, None, None, None);
+
+        std::env::remove_var("STROM_SERVER_HOST");
+        let _ = std::env::set_current_dir(original_dir);
+
+        assert_eq!(
+            config.unwrap().host,
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        );
     }
 
     #[test]
@@ -817,6 +852,7 @@ mod tests {
     fn test_from_figment_config_file() {
         // Clear any env vars that might interfere
         std::env::remove_var("STROM_SERVER_PORT");
+        std::env::remove_var("STROM_SERVER_HOST");
         std::env::remove_var("STROM_STORAGE_DATABASE_URL");
 
         let temp_dir = TempDir::new().unwrap();
@@ -825,6 +861,7 @@ mod tests {
         // Create a test config file
         let config_content = r#"
 [server]
+host = "127.0.0.1"
 port = 7777
 
 [storage]
@@ -843,6 +880,7 @@ database_url = "postgresql://localhost/test"
         let _ = std::env::set_current_dir(original_dir);
 
         assert_eq!(config.port, 7777);
+        assert_eq!(config.host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(
             config.database_url,
             Some("postgresql://localhost/test".to_string())
