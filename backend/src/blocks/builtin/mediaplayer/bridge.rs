@@ -855,6 +855,8 @@ fn link_pad_through_clocksync(
     let mut dropped_unstamped: u64 = 0;
     // The main pipeline's clock and base time, read once instead of per buffer.
     let mut main_clock: Option<(gst::Clock, gst::ClockTime)> = None;
+    // The still repeats the first video track only (see `hold_still`).
+    let still = (state.video_appsrcs.first() == Some(appsrc)).then(|| Arc::clone(&state.still));
 
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
@@ -942,7 +944,11 @@ fn link_pad_through_clocksync(
                 if let Some(caps) = caps.as_ref() {
                     builder = builder.caps(caps);
                 }
-                let push_result = appsrc.push_sample(&builder.build());
+                let sample = builder.build();
+                if let Some(still) = &still {
+                    still.store(&sample);
+                }
+                let push_result = appsrc.push_sample(&sample);
 
                 // Don't kill the appsink on transient errors (e.g. FLUSHING while
                 // the main pipeline is still starting). Drop the sample and retry
@@ -1209,6 +1215,7 @@ mod tests {
             timing: Arc::new(super::super::timing::Timing::new(0)),
             main_pipeline: gst::glib::WeakRef::new(),
             bus_watch: Mutex::new(None),
+            still: Default::default(),
             stinger: Default::default(),
         })
     }

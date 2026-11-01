@@ -324,6 +324,7 @@ fn build_media_player(
         }),
         main_pipeline: gst::glib::WeakRef::new(),
         bus_watch: std::sync::Mutex::new(None),
+        still: Default::default(),
         stinger: super::state::StingerPlayback {
             enabled: stinger_mode,
             ..Default::default()

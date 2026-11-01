@@ -1,0 +1,341 @@
+//! Still frame while the player is paused or at the end of its playlist.
+//!
+//! Pausing stops the internal pipeline, so the main pipeline's video appsrc
+//! gets no more buffers. A live aggregator further down (a vision mixer
+//! input, also across `inter`) then counts the pad as active but starving
+//! and waits for its deadline on every output frame: a paused clip anywhere
+//! on the mixer added ~30 ms to program (86 instead of 56 ms on a GPU
+//! mixer). Holding repeats the last video frame at its frame rate with the
+//! main pipeline's running time, like a paused player in a hardware mixer.
+
+use gstreamer as gst;
+use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::debug;
+
+/// Frame interval when the caps carry no frame rate.
+const DEFAULT_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Last video sample the bridge pushed, and the repeat that holds it.
+#[derive(Default)]
+pub struct StillFrame {
+    last: Mutex<Option<gst::Sample>>,
+    /// Bumped by every hold and release; a repeat runs while it matches.
+    generation: AtomicU64,
+    /// Held by a repeat while it has the appsrc and the main pipeline in
+    /// hand, so [`release`](Self::release) can wait until it lets go.
+    busy: Mutex<()>,
+}
+
+impl StillFrame {
+    /// Remember `sample` as the frame to hold. Only raw video is held: an
+    /// encoded frame (a player that passes its file's streams through) is
+    /// mostly a delta frame, and repeating it with fresh timestamps would
+    /// break a decoder or muxer downstream. Such a player sends nothing while
+    /// paused, as before.
+    pub fn store(&self, sample: &gst::Sample) {
+        let raw = sample
+            .caps()
+            .and_then(|caps| caps.structure(0))
+            .is_some_and(|s| s.name() == "video/x-raw");
+        if let Ok(mut last) = self.last.lock() {
+            *last = raw.then(|| sample.clone());
+        }
+    }
+
+    /// Repeat the last frame into `appsrc` until [`release`](Self::release).
+    pub fn hold(
+        self: &Arc<Self>,
+        appsrc: &gst_app::AppSrc,
+        main: gst::glib::WeakRef<gst::Pipeline>,
+    ) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let this = Arc::downgrade(self);
+        let appsrc = appsrc.downgrade();
+        let spawned = std::thread::Builder::new()
+            .name("player-still".into())
+            .spawn(move || loop {
+                let Some(this) = this.upgrade() else { break };
+                let interval = {
+                    // The strong references live only inside this block: one
+                    // held across the sleep keeps a torn-down main pipeline
+                    // alive, and strom reports its elements as leaked.
+                    let _busy = this.busy.lock().unwrap_or_else(|e| e.into_inner());
+                    if this.generation.load(Ordering::SeqCst) != generation {
+                        break;
+                    }
+                    let (Some(appsrc), Some(main)) = (appsrc.upgrade(), main.upgrade()) else {
+                        break;
+                    };
+                    let sample = this.last.lock().ok().and_then(|last| last.clone());
+                    let interval = sample
+                        .as_ref()
+                        .and_then(|s| s.caps().and_then(frame_interval))
+                        .unwrap_or(DEFAULT_INTERVAL);
+                    if let (Some(sample), Some(now)) = (sample, running_time(&main)) {
+                        if let Some(repeat) = restamp(&sample, now, interval) {
+                            // FLUSHING while the main pipeline (re)starts is
+                            // transient; the next round tries again.
+                            let _ = appsrc.push_sample(&repeat);
+                        }
+                    }
+                    interval
+                };
+                drop(this);
+                std::thread::sleep(interval);
+            });
+        if let Err(e) = spawned {
+            debug!("Media Player: no still-frame thread: {}", e);
+        }
+    }
+
+    /// Stop repeating (play, file switch, teardown) and forget the frame:
+    /// a later hold before the next frame arrives (a new file paused before
+    /// its first frame) has nothing to show, rather than the old file's, and
+    /// the buffer's memory goes back to its pool. Returns once no repeat
+    /// holds the appsrc or the main pipeline any more.
+    pub fn release(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        drop(self.busy.lock());
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
+    }
+}
+
+fn running_time(pipeline: &gst::Pipeline) -> Option<gst::ClockTime> {
+    let clock = pipeline.clock()?;
+    let base_time = pipeline.base_time()?;
+    Some(clock.time().saturating_sub(base_time))
+}
+
+fn frame_interval(caps: &gst::CapsRef) -> Option<Duration> {
+    let fps = caps.structure(0)?.get::<gst::Fraction>("framerate").ok()?;
+    if fps.numer() <= 0 || fps.denom() <= 0 {
+        return None;
+    }
+    Some(Duration::from_nanos(
+        1_000_000_000u64 * fps.denom() as u64 / fps.numer() as u64,
+    ))
+}
+
+/// `sample` again, stamped at running time `now` for one frame.
+fn restamp(sample: &gst::Sample, now: gst::ClockTime, interval: Duration) -> Option<gst::Sample> {
+    let mut buffer = sample.buffer()?.copy();
+    {
+        let buffer = buffer.get_mut()?;
+        buffer.set_pts(now);
+        buffer.set_dts(gst::ClockTime::NONE);
+        buffer.set_duration(gst::ClockTime::from_nseconds(interval.as_nanos() as u64));
+    }
+    let caps = sample.caps_owned();
+    let mut builder = gst::Sample::builder().buffer(&buffer);
+    if let Some(caps) = &caps {
+        builder = builder.caps(caps);
+    }
+    Some(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_interval_from_caps() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        assert_eq!(
+            frame_interval(&caps),
+            Some(Duration::from_nanos(33_333_333))
+        );
+        let still = gst::Caps::builder("video/x-raw")
+            .field("framerate", gst::Fraction::new(0, 1))
+            .build();
+        assert_eq!(frame_interval(&still), None);
+    }
+
+    /// A held frame keeps arriving with fresh timestamps until released.
+    #[test]
+    fn hold_repeats_until_release() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                sink.upcast_ref::<gst::Element>(),
+            ])
+            .unwrap();
+        appsrc.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "GRAY8")
+            .field("width", 2)
+            .field("height", 2)
+            .field("framerate", gst::Fraction::new(50, 1))
+            .build();
+        let sample = gst::Sample::builder()
+            .buffer(&gst::Buffer::from_slice([0u8; 4]))
+            .caps(&caps)
+            .build();
+        let still = Arc::new(StillFrame::default());
+        still.store(&sample);
+        still.hold(&appsrc, pipeline.downgrade());
+
+        let mut last_pts = None;
+        for _ in 0..3 {
+            let got = sink
+                .try_pull_sample(gst::ClockTime::from_seconds(2))
+                .expect("held frame repeats");
+            let pts = got.buffer().unwrap().pts();
+            assert!(pts > last_pts, "{:?} after {:?}", pts, last_pts);
+            last_pts = pts;
+        }
+
+        still.release();
+        std::thread::sleep(Duration::from_millis(100));
+        while sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+        assert!(
+            sink.try_pull_sample(gst::ClockTime::from_mseconds(200))
+                .is_none(),
+            "released frame stops"
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// Once released, the repeat holds no reference to the main pipeline,
+    /// so a flow torn down right after (paused clip removed) finalizes
+    /// instead of showing up as leaked.
+    #[test]
+    fn release_lets_go_of_pipeline() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                sink.upcast_ref::<gst::Element>(),
+            ])
+            .unwrap();
+        appsrc.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        // 2 fps: the repeat spends almost all its time asleep.
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "GRAY8")
+            .field("width", 2)
+            .field("height", 2)
+            .field("framerate", gst::Fraction::new(2, 1))
+            .build();
+        let sample = gst::Sample::builder()
+            .buffer(&gst::Buffer::from_slice([0u8; 4]))
+            .caps(&caps)
+            .build();
+        let still = Arc::new(StillFrame::default());
+        still.store(&sample);
+        still.hold(&appsrc, pipeline.downgrade());
+        sink.try_pull_sample(gst::ClockTime::from_seconds(2))
+            .expect("held frame repeats");
+
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        let weak = pipeline.downgrade();
+        drop((pipeline, appsrc, sink));
+        assert!(weak.upgrade().is_none(), "pipeline still referenced");
+    }
+
+    /// A live appsrc into an appsink, playing.
+    fn appsrc_into_appsink() -> (gst::Pipeline, gst_app::AppSrc, gst_app::AppSink) {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .format(gst::Format::Time)
+            .is_live(true)
+            .build();
+        let sink = gst_app::AppSink::builder().sync(false).build();
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gst::Element>(),
+                sink.upcast_ref::<gst::Element>(),
+            ])
+            .unwrap();
+        appsrc.link(&sink).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        (pipeline, appsrc, sink)
+    }
+
+    fn sample(caps: gst::Caps) -> gst::Sample {
+        gst::Sample::builder()
+            .buffer(&gst::Buffer::from_slice([0u8; 4]))
+            .caps(&caps)
+            .build()
+    }
+
+    fn gray_frame() -> gst::Sample {
+        sample(
+            gst::Caps::builder("video/x-raw")
+                .field("format", "GRAY8")
+                .field("width", 2)
+                .field("height", 2)
+                .field("framerate", gst::Fraction::new(50, 1))
+                .build(),
+        )
+    }
+
+    /// A player that passes its file through stores encoded frames; holding
+    /// one (mostly a delta frame, restamped without DTS) would break the
+    /// decoder or muxer behind it, so it sends nothing.
+    #[test]
+    fn encoded_frames_are_not_held() {
+        let (pipeline, appsrc, sink) = appsrc_into_appsink();
+        let still = Arc::new(StillFrame::default());
+        still.store(&gray_frame());
+        still.store(&sample(
+            gst::Caps::builder("video/x-h264")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .field("framerate", gst::Fraction::new(50, 1))
+                .build(),
+        ));
+        still.hold(&appsrc, pipeline.downgrade());
+        let got = sink.try_pull_sample(gst::ClockTime::from_mseconds(300));
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(got.is_none(), "an encoded frame was repeated: {:?}", got);
+    }
+
+    /// A release forgets the frame: holding again before a new one arrives
+    /// (a new file paused before its first frame) shows nothing rather than
+    /// the old file's last frame.
+    #[test]
+    fn release_forgets_the_frame() {
+        let (pipeline, appsrc, sink) = appsrc_into_appsink();
+        let still = Arc::new(StillFrame::default());
+        still.store(&gray_frame());
+        still.hold(&appsrc, pipeline.downgrade());
+        sink.try_pull_sample(gst::ClockTime::from_seconds(2))
+            .expect("held frame repeats");
+
+        still.release();
+        while sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+        still.hold(&appsrc, pipeline.downgrade());
+        let got = sink.try_pull_sample(gst::ClockTime::from_mseconds(300));
+        still.release();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(got.is_none(), "the released frame came back");
+    }
+}
