@@ -705,9 +705,9 @@ fn link_decoded_video(
 
 /// Build the best decoder for `caps` and link `parser_src` -> decoder ->
 /// [deinterlace if interlaced/mixed] -> `identity`. Tries the candidates by
-/// rank and takes the first that reaches the bin's state: a hardware decoder
-/// opens its device on the way to READY (no free NVDEC session, a VA device
-/// gone) and fails there, so the next candidate is tried.
+/// rank and takes the first that opens: a hardware decoder whose CUDA context
+/// or VA display cannot be opened fails on the way to READY, and the next
+/// candidate is tried (see `start_decoder`).
 fn link_decoder(
     bin: &gst::Bin,
     parser_src: &gst::Pad,
@@ -753,8 +753,15 @@ fn link_decoder(
     Ok(())
 }
 
-/// Add a decoder made by `factory` to `bin` and bring it to the bin's state;
-/// on failure take it out again and return `None`.
+/// Make a decoder with `factory`, open it and add it to `bin` in the bin's
+/// state; `None` when it cannot be built or opened.
+///
+/// The decoder is taken to READY (where a hardware decoder opens its CUDA
+/// context or VA display) before it is added: without a parent its error
+/// message goes nowhere, while in the bin it would reach the pipeline bus and
+/// fail the whole flow although the next candidate works. The top-level
+/// bin's contexts are set on it first, so it shares the pipeline's GPU
+/// contexts as it would when added.
 fn start_decoder(
     bin: &gst::Bin,
     factory: &gst::ElementFactory,
@@ -767,7 +774,20 @@ fn start_decoder(
             return None;
         }
     };
+    let mut top: gst::Element = bin.clone().upcast();
+    while let Some(parent) = top.parent().and_then(|p| p.downcast::<gst::Element>().ok()) {
+        top = parent;
+    }
+    for context in top.contexts() {
+        decoder.set_context(&context);
+    }
+    if let Err(e) = decoder.set_state(gst::State::Ready) {
+        debug!("{}: {} does not open: {}", name, factory.name(), e);
+        let _ = decoder.set_state(gst::State::Null);
+        return None;
+    }
     if bin.add(&decoder).is_err() {
+        let _ = decoder.set_state(gst::State::Null);
         return None;
     }
     if let Err(e) = decoder.sync_state_with_parent() {
@@ -1417,5 +1437,106 @@ mod tests {
     fn an_8_bit_420_stream_decodes() {
         let frames = frames_through_decode_chain("I420").expect("decodes");
         assert_eq!(frames, 10);
+    }
+    /// A test element that fails to open (NULL -> READY) with an error
+    /// message, as a hardware decoder does without its device.
+    mod fail_open {
+        use gst::glib;
+        use gst::prelude::*;
+        use gst::subclass::prelude::*;
+        use gstreamer as gst;
+
+        glib::wrapper! {
+            pub struct FailOpen(ObjectSubclass<imp::FailOpen>)
+                @extends gst::Element, gst::Object;
+        }
+
+        pub fn factory() -> gst::ElementFactory {
+            gst::init().unwrap();
+            if gst::ElementFactory::find("stromtestfailopen").is_none() {
+                gst::Element::register(
+                    None,
+                    "stromtestfailopen",
+                    gst::Rank::NONE,
+                    FailOpen::static_type(),
+                )
+                .unwrap();
+            }
+            gst::ElementFactory::find("stromtestfailopen").unwrap()
+        }
+
+        mod imp {
+            use super::*;
+            use std::sync::LazyLock;
+
+            #[derive(Default)]
+            pub struct FailOpen;
+
+            #[glib::object_subclass]
+            impl ObjectSubclass for FailOpen {
+                const NAME: &'static str = "StromTestFailOpen";
+                type Type = super::FailOpen;
+                type ParentType = gst::Element;
+            }
+            impl ObjectImpl for FailOpen {}
+            impl GstObjectImpl for FailOpen {}
+            impl ElementImpl for FailOpen {
+                fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+                    static META: LazyLock<gst::subclass::ElementMetadata> = LazyLock::new(|| {
+                        gst::subclass::ElementMetadata::new(
+                            "Fail open",
+                            "Codec/Decoder/Video",
+                            "Fails to open its device (test)",
+                            "Strom",
+                        )
+                    });
+                    Some(&META)
+                }
+                fn change_state(
+                    &self,
+                    transition: gst::StateChange,
+                ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+                    if transition == gst::StateChange::NullToReady {
+                        gst::element_imp_error!(self, gst::ResourceError::OpenRead, ["no device"]);
+                        return Err(gst::StateChangeError);
+                    }
+                    self.parent_change_state(transition)
+                }
+            }
+        }
+    }
+
+    /// A candidate that cannot open is skipped without touching the running
+    /// pipeline: no ERROR on its bus, its state stays settled.
+    #[test]
+    fn a_candidate_that_cannot_open_leaves_the_pipeline_alone() {
+        let failing = fail_open::factory();
+        let pipeline = gst::parse::launch("fakesrc is-live=true ! fakesink")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert!(
+            res.is_ok() && state == gst::State::Playing,
+            "{res:?} {state:?}"
+        );
+        let bin = pipeline.clone().upcast::<gst::Bin>();
+
+        assert!(start_decoder(&bin, &failing, "dec").is_none());
+        assert!(pipeline.by_name("dec").is_none());
+
+        let identity = gst::ElementFactory::find("identity").unwrap();
+        let started = start_decoder(&bin, &identity, "dec").expect("identity starts");
+        assert_eq!(started.current_state(), gst::State::Playing);
+
+        let error = pipeline
+            .bus()
+            .unwrap()
+            .pop_filtered(&[gst::MessageType::Error]);
+        let (res, _, _) = pipeline.state(gst::ClockTime::ZERO);
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(error.is_none(), "error on the bus: {error:?}");
+        assert!(res.is_ok(), "pipeline state: {res:?}");
     }
 }

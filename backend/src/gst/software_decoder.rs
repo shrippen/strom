@@ -121,7 +121,8 @@ mod tests {
     }
 
     /// `decoders_for` returns only decoders that take the whole caps, best
-    /// rank first.
+    /// rank first. Guards the filter and the order only: which decoder wins
+    /// on a host is up to its ranks.
     #[test]
     fn decoders_for_takes_the_caps_best_rank_first() {
         gst::init().unwrap();
