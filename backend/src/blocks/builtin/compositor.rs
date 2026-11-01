@@ -364,6 +364,12 @@ fn build_opengl_compositor(
                 BlockBuildError::ElementCreation(format!("glcolorconvert_{}: {}", i, e))
             })?;
 
+        // Whatever feeds glupload (the input queue, or the block's input
+        // directly) must not allocate from its udmabuf proposal where that
+        // loses the picture.
+        if let Some(sink) = upload.static_pad("sink") {
+            crate::gst::gl_input_front::keep_own_memory(&sink);
+        }
         elements.push((upload_id.clone(), upload));
         elements.push((colorconvert_id.clone(), colorconvert));
         let mixer_pad_name = sink_pad.name().to_string();

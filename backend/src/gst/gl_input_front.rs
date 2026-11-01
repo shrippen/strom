@@ -805,6 +805,46 @@ fn splice_when_idle(
     }
 }
 
+/// Where `glupload`'s udmabuf path is broken (see
+/// [`crate::gpu::udmabuf_upload_broken`]), hide its allocation proposal for
+/// system memory from everything upstream of `pad`, so the source keeps its
+/// own memory and `glupload` does a plain texture upload.
+pub(crate) fn keep_own_memory(pad: &gst::Pad) {
+    if crate::gpu::udmabuf_upload_broken() {
+        hide_system_memory_allocation(pad);
+    }
+}
+
+/// Drop ALLOCATION queries for raw video in system memory at `pad`; GL,
+/// CUDA or DMABuf producers keep theirs. What [`keep_own_memory`] installs
+/// on an affected host. The probe fires per allocation query (negotiation,
+/// reconfigure), never per buffer.
+///
+/// The dropped query also takes the `glupload` proposals for `VideoMeta`
+/// and overlay-composition meta with it: a decoder with padded strides then
+/// copies, overlays blend in software.
+pub fn hide_system_memory_allocation(pad: &gst::Pad) {
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_pad, info| match info
+        .query()
+        .map(|q| q.view())
+    {
+        Some(gst::QueryView::Allocation(q)) if is_raw_system_memory(q.get().0) => {
+            gst::PadProbeReturn::Drop
+        }
+        _ => gst::PadProbeReturn::Ok,
+    });
+}
+
+/// Raw video in system memory (no `memory:` feature but system memory).
+fn is_raw_system_memory(caps: Option<&gst::CapsRef>) -> bool {
+    caps.and_then(|c| c.iter_with_features().next())
+        .is_some_and(|(structure, features)| {
+            structure.name() == "video/x-raw"
+                && !features.is_any()
+                && video_adapt::is_system_memory(features)
+        })
+}
+
 /// Insert an `adapter_factory` element between `upload`'s sink pad and its peer,
 /// linking with `check`. The caller makes sure no buffer moves across that
 /// link meanwhile.
@@ -837,6 +877,9 @@ fn splice_adapter(
     };
     bin.add(&adapter)
         .map_err(|e| format!("{} could not be added to {}: {}", name, bin.name(), e))?;
+    // The adapter feeds `upload` directly: it must not get the udmabuf
+    // allocator either (black input on NVIDIA).
+    keep_own_memory(&src);
 
     // Unlink before linking: `glupload` accepts one upstream link only.
     if let Err(e) = feeder.unlink(&upload_sink) {
@@ -875,6 +918,48 @@ fn splice_adapter(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    /// Allocation queries that reach the peer of a pad carrying
+    /// `hide_system_memory_allocation`, for `caps`.
+    fn allocation_reaches_peer(caps: &str) -> bool {
+        gst::init().unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        let seen = reached.clone();
+        let src = gst::Pad::builder(gst::PadDirection::Src).build();
+        let sink = gst::Pad::builder(gst::PadDirection::Sink)
+            .query_function(move |_pad, _parent, query| {
+                if let gst::QueryViewMut::Allocation(_) = query.view_mut() {
+                    seen.store(true, Ordering::SeqCst);
+                }
+                true
+            })
+            .build();
+        src.link_full(&sink, gst::PadLinkCheck::empty()).unwrap();
+        src.set_active(true).unwrap();
+        sink.set_active(true).unwrap();
+        hide_system_memory_allocation(&src);
+        let caps = gst::Caps::from_str(caps).unwrap();
+        let mut query = gst::query::Allocation::new(Some(&caps), true);
+        src.peer_query(&mut query);
+        reached.load(Ordering::SeqCst)
+    }
+
+    /// With the udmabuf workaround on, a system-memory source never sees
+    /// `glupload`'s allocation proposal; GL memory negotiates as before.
+    #[test]
+    fn hides_the_allocation_query_for_system_memory_only() {
+        let system = "video/x-raw, format=RGBA, width=64, height=64, framerate=30/1";
+        assert!(!allocation_reaches_peer(system), "system memory: {system}");
+        let overlay = "video/x-raw(meta:GstVideoOverlayComposition), format=RGBA, \
+                       width=64, height=64, framerate=30/1";
+        assert!(!allocation_reaches_peer(overlay), "{overlay}");
+        let gl = "video/x-raw(memory:GLMemory), format=RGBA, width=64, height=64, \
+                  framerate=30/1, texture-target=2D";
+        assert!(allocation_reaches_peer(gl), "GL memory: {gl}");
+        assert!(allocation_reaches_peer(
+            "audio/x-raw, format=S16LE, rate=48000, channels=2, layout=interleaved"
+        ));
+    }
 
     fn caps(s: &str) -> gst::Caps {
         // Caps parsing needs the type system registered.

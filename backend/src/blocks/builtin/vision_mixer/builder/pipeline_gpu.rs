@@ -194,10 +194,14 @@ pub(super) fn build_gpu_pipeline(
         // Passes through what glupload takes and converts the rest: clips
         // decode to whatever their codec gives (10-bit 4:4:4 with alpha for
         // ProRes 4444), and each clip may differ from the last.
-        elems.push((
-            vc_id.clone(),
-            elements::make_element("videoconvert", &vc_id)?,
-        ));
+        let videoconvert = elements::make_element("videoconvert", &vc_id)?;
+        // When it converts, videoconvert allocates its output from what
+        // glupload proposes: the udmabuf path, which loses the picture where
+        // it is broken.
+        if let Some(src) = videoconvert.static_pad("src") {
+            crate::gst::gl_input_front::keep_own_memory(&src);
+        }
+        elems.push((vc_id.clone(), videoconvert));
         elems.push((up_id.clone(), glupload));
         elems.push((
             cc_id.clone(),
@@ -349,6 +353,11 @@ pub(super) fn build_gpu_pipeline(
                 .property("caps", &underlay_caps)
                 .build()
                 .map_err(|e| BlockBuildError::ElementCreation(format!("{}: {}", cf_id, e)))?;
+            // The underlay feeds glupload without a queue in between: without
+            // this, borders are empty textures on NVIDIA (no frame around boxes).
+            if let Some(src_pad) = cf.static_pad("src") {
+                crate::gst::gl_input_front::keep_own_memory(&src_pad);
+            }
             elems.push((src_id.clone(), src));
             elems.push((cf_id.clone(), cf));
             elems.push((up_id.clone(), elements::make_element("glupload", &up_id)?));
@@ -655,7 +664,15 @@ pub(super) fn build_gpu_pipeline(
 /// input's `queue` is where upstream's caps queries land, `glupload` is what
 /// they are answered by. `label` names the input in logs and errors, after its
 /// external pad. See [`crate::gst::gl_input_front`].
+///
+/// Where `glupload`'s udmabuf path is broken (see
+/// `gpu::udmabuf_upload_broken`), the queue also stops upstream from
+/// seeing its allocation proposal, so sources keep their own memory and
+/// `glupload` does a plain texture upload.
 fn install_input_front(queue: &gst::Element, glupload: &gst::Element, label: &str) {
+    if let Some(src) = queue.static_pad("src") {
+        crate::gst::gl_input_front::keep_own_memory(&src);
+    }
     if let Some(sink) = queue.static_pad("sink") {
         crate::gst::gl_input_front::install(&sink, glupload, label);
     }
