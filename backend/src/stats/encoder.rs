@@ -107,6 +107,7 @@ impl EncodeTiming {
         VideoEncoderStats {
             frames: self.frames.load(Ordering::Relaxed),
             encode_time_ns: self.busy_ns.load(Ordering::Relaxed),
+            hardware: false,
         }
     }
 }
@@ -216,7 +217,13 @@ pub fn encoder_stats(encoder: &gst::Element) -> Option<VideoEncoderStats> {
     // SAFETY: see `time_encoder`; the data lives as long as the element,
     // which the caller holds.
     let timing = unsafe { encoder.data::<Arc<EncodeTiming>>(KEY)? };
-    Some(unsafe { timing.as_ref() }.stats())
+    let hardware = encoder
+        .factory()
+        .is_some_and(|f| crate::gst::software_decoder::is_hardware(&f));
+    Some(VideoEncoderStats {
+        hardware,
+        ..unsafe { timing.as_ref() }.stats()
+    })
 }
 
 #[cfg(test)]
