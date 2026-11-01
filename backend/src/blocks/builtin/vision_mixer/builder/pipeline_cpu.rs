@@ -596,8 +596,11 @@ pub(crate) fn append_input_elements(
     let q_thumb_id = spec.id(&format!("queue_to_mv_thumb_{}", i));
     let q_pvw_id = spec.id(&format!("queue_to_mv_pvw_{}", i));
     elems.push((q_dist_id.clone(), elements::make_queue(&q_dist_id)?));
-    elems.push((q_thumb_id.clone(), elements::make_queue(&q_thumb_id)?));
-    elems.push((q_pvw_id.clone(), elements::make_queue(&q_pvw_id)?));
+    elems.push((
+        q_thumb_id.clone(),
+        elements::make_monitor_queue(&q_thumb_id)?,
+    ));
+    elems.push((q_pvw_id.clone(), elements::make_monitor_queue(&q_pvw_id)?));
 
     // The CPU `compositor` has no crop pad properties, so every croppable
     // branch (dist, PVW, PiP — not thumbnails, which never crop) gets a
@@ -638,7 +641,7 @@ pub(crate) fn append_input_elements(
     // PiP thumbnail pads on mv_comp.
     for pip_idx in 0..spec.num_pips {
         let q_pip_id = spec.id(&format!("queue_to_mv_pip_{}_{}", pip_idx, i));
-        elems.push((q_pip_id.clone(), elements::make_queue(&q_pip_id)?));
+        elems.push((q_pip_id.clone(), elements::make_monitor_queue(&q_pip_id)?));
         let crop_pip_id = spec.id(&format!("videocrop_pip_{}_{}", pip_idx, i));
         elems.push((
             crop_pip_id.clone(),

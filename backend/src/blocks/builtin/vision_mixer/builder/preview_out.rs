@@ -132,7 +132,7 @@ pub(crate) fn append_input_branch(
     links: &mut Vec<(ElementPadRef, ElementPadRef)>,
 ) -> Result<(), BlockBuildError> {
     let q_id = spec.id(&format!("queue_to_pvw_out_{}", i));
-    elems.push((q_id.clone(), elements::make_queue(&q_id)?));
+    elems.push((q_id.clone(), elements::make_monitor_queue(&q_id)?));
     links.push((
         ElementPadRef::pad(spec.id(&format!("tee_{}", i)), format!("src_{}", tee_src)),
         ElementPadRef::pad(&q_id, "sink"),
