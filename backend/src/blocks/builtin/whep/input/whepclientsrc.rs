@@ -399,7 +399,7 @@ pub(super) fn build_whepclientsrc(
 
     debug!(
         "WHEP Input configured: endpoint={}, stun={:?}, turn={:?}, ice_transport_policy={}",
-        crate::redact::url(&whep_endpoint),
+        crate::redact::origin(&whep_endpoint),
         stun_server,
         turn_server.as_deref().map(crate::redact::url),
         ice_transport_policy

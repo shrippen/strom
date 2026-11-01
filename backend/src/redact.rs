@@ -40,6 +40,9 @@ const SECRET_ENDINGS: &[&str] = &[
     "authorization",
     "cookie",
     "streamid",
+    "hash",
+    "hmac",
+    "md5",
 ];
 
 /// Values that name an authorization scheme, behind which the secret follows
@@ -83,16 +86,17 @@ fn plain_name(name: &str) -> String {
 /// value of a secret key is masked; the first part that is not plain is masked
 /// together with all after it. Userinfo runs to the last `@` before the query
 /// and is masked; an `@` in the query (a password with a raw `?`, or a value)
-/// masks everything after the scheme. `rtmp*` schemes: as [`rtmp_url`]. Text
-/// that does not start with `scheme://` is masked whole.
+/// masks everything after the scheme. `rtmp*` schemes: as [`rtmp_url`];
+/// `http`, `https`, `ws`, `wss`: as [`origin`]. Text that does not start
+/// with `scheme://` is masked whole.
 ///
 /// ```text
 /// srt://h:9000?mode=caller&passphrase=abc -> srt://h:9000?mode=caller&passphrase=***
-/// https://u:p@h/a.mp4?token=abc           -> https://***@h/a.mp4?token=***
+/// https://u:p@h/a.mp4?token=abc           -> https://***@h/***
 /// srt://u:p?w=x@h:9000                    -> srt://***
 /// ```
 pub fn url(raw: &str) -> String {
-    url_as(raw, false)
+    url_as(raw, Rules::PLAIN)
 }
 
 /// Mask the secrets in an RTMP URL.
@@ -106,11 +110,24 @@ pub fn url(raw: &str) -> String {
 /// rtmp://u:p@h/live/key?t=1 -> rtmp://***@h/live/***
 /// ```
 pub fn rtmp_url(raw: &str) -> String {
-    url_as(raw, true)
+    url_as(raw, Rules::RTMP)
 }
 
-/// [`url`], with the RTMP rules also for another scheme when `rtmp` is set.
-fn url_as(raw: &str, rtmp: bool) -> String {
+/// Only where a URL goes: `scheme://host[:port]`, the path and query masked.
+///
+/// For HTTP endpoints (WHIP, WHEP, web pages), whose path may be the whole
+/// credential: Cloudflare Stream publishes to
+/// `https://customer-<id>.cloudflarestream.com/<key>/webRTC/publish`.
+///
+/// ```text
+/// https://h:8443/abc/webRTC/publish?x=1 -> https://h:8443/***
+/// ```
+pub fn origin(raw: &str) -> String {
+    url_as(raw, Rules::ORIGIN)
+}
+
+/// [`url`] with `rules`, or stricter ones when the scheme asks for them.
+fn url_as(raw: &str, rules: Rules) -> String {
     if raw.is_empty() {
         return String::new();
     }
@@ -121,8 +138,53 @@ fn url_as(raw: &str, rtmp: bool) -> String {
     if !is_scheme(scheme) {
         return MASK.to_string();
     }
-    let rtmp = rtmp || scheme.to_ascii_lowercase().starts_with("rtmp");
-    mask_url(raw, sep, rtmp).shown
+    mask_url(raw, sep, rules.and(Rules::of(scheme))).shown
+}
+
+/// What of a URL's path and query may show.
+#[derive(Clone, Copy)]
+struct Rules {
+    /// How many path segments may show.
+    segments: usize,
+    /// Whether query pairs may show.
+    query: bool,
+}
+
+impl Rules {
+    const PLAIN: Rules = Rules {
+        segments: usize::MAX,
+        query: true,
+    };
+    /// The application; the stream key and query are masked.
+    const RTMP: Rules = Rules {
+        segments: 1,
+        query: false,
+    };
+    const ORIGIN: Rules = Rules {
+        segments: 0,
+        query: false,
+    };
+
+    /// The rules of a scheme: RTMP for `rtmp*`, origin only for HTTP and
+    /// WebSocket (a key in the path is common there), else plain.
+    fn of(scheme: &str) -> Rules {
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme.starts_with("rtmp") {
+            return Rules::RTMP;
+        }
+        match scheme.as_str() {
+            "http" | "https" | "ws" | "wss" => Rules::ORIGIN,
+            _ => Rules::PLAIN,
+        }
+    }
+
+    /// The stricter of both.
+    fn and(self, other: Rules) -> Rules {
+        Rules {
+            segments: self.segments.min(other.segments),
+            query: self.query && other.query,
+        }
+    }
 }
 
 /// Whether `name` is a URL scheme: a letter, then letters, digits, `+-.`.
@@ -159,7 +221,7 @@ impl Masked {
 }
 
 /// Mask `raw`, a URL whose scheme ends at `sep` (the `://`); see [`url`].
-fn mask_url(raw: &str, sep: usize, rtmp: bool) -> Masked {
+fn mask_url(raw: &str, sep: usize, rules: Rules) -> Masked {
     let body = sep + 3;
     let mut m = Masked {
         shown: raw[..body].to_string(),
@@ -196,7 +258,7 @@ fn mask_url(raw: &str, sep: usize, rtmp: bool) -> Masked {
             m.shown.push('/');
             at += 1;
             let plain = segment.bytes().all(|b| plain_byte(b) || b == b'%');
-            if (rtmp && n > 0) || !plain {
+            if !segment.is_empty() && (n >= rules.segments || !plain) {
                 m.mask(at);
                 return m;
             }
@@ -210,7 +272,7 @@ fn mask_url(raw: &str, sep: usize, rtmp: bool) -> Masked {
     };
     m.shown.push('?');
     let mut at = body + q + 1;
-    if rtmp {
+    if !rules.query {
         m.mask(at);
         return m;
     }
@@ -283,14 +345,16 @@ fn plain_host(authority: &str) -> bool {
 ///
 /// A word is a run of non-blanks; quotes do not end it.
 /// - A word with `://` is a URL behind a plain prefix (`uri=`, `String("`,
-///   `<`): the URL goes through [`url`], a trailing `:`, `,`, `)`, quote or
-///   the like stays outside it (`srt://h:9000: refused` keeps its host), and a
-///   URL behind a quote ends at the partner of that quote. Any other prefix
-///   masks the whole word.
+///   `<`): the URL goes through [`url`] (so HTTP shows only its origin), and
+///   a trailing `:`, `,`, `)`, quote or the like stays outside it
+///   (`srt://h:9000: refused` keeps its host). A URL behind a quote is the
+///   whole quoted run, blanks included, up to the partner of that quote (or
+///   to the end of the text when there is none). Any other prefix masks the
+///   whole word.
 /// - At each `=` or `:` of a word (quotes around the name allowed), a name
 ///   that ends in a secret ending ([`is_secret_name`]) masks the value: up to
 ///   the end of the word, or the next word when the separator ends this one
-///   (`passphrase: abc`, also behind `Bearer`).
+///   (`passphrase: abc`), and one more behind `Bearer`, `Basic`, `Digest`.
 /// - `user:pass@host` without `//` is masked whole.
 /// - A quote that opens in a masked part (`passphrase="two words"`,
 ///   `passphrase=(string)"a b"`, `\"` in a `{:?}` dump) masks through its
@@ -299,8 +363,9 @@ fn plain_host(authority: &str) -> bool {
 /// Not covered, because nothing tells them from prose: a raw blank inside a
 /// URL that is not quoted (`srt://u:a b@h` shows `b@h`), a raw `&` inside a
 /// secret query value followed by `name=` (`passphrase=a&b=c` shows `b=c`), a
-/// secret in a URL path other than an RTMP stream key, and a secret behind a
-/// name that has no secret ending or with no `=` or `:` between them.
+/// secret in the path of a URL that is neither HTTP nor RTMP, and a secret
+/// behind a name that has no secret ending or with no `=` or `:` between
+/// them. A property value is no prose: [`value`] masks a URL in it whole.
 pub fn text(s: &str) -> Cow<'_, str> {
     let mut out = String::with_capacity(s.len());
     let mut at = 0;
@@ -366,6 +431,13 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
             return (end, true);
         }
         out.push_str(MASK);
+        // `Authorization:Bearer abc`: the secret is the next word.
+        if AUTH_SCHEMES
+            .iter()
+            .any(|a| w[value..].eq_ignore_ascii_case(a))
+        {
+            return (end, true);
+        }
         return (masked_end(s, at + value, at + value, end), false);
     }
 
@@ -390,35 +462,58 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
     out.push_str(prefix);
     let url_at = at + start;
     let sep = sep - start;
-    let rtmp = scheme.to_ascii_lowercase().starts_with("rtmp");
+    let rules = Rules::of(scheme);
 
-    // `"srt://h?a=1","b":2`: the URL ends at the partner of its quote, unless
-    // an `@` follows (a password with a quote) or the URL ends masked (a
-    // value with a quote).
-    if let Some(cut) = quoted_url_end(s, at, url_at, end) {
-        if !word.at_sign.is_some_and(|a| a >= cut) {
-            let m = mask_url(&s[url_at..cut], sep, rtmp);
-            if !m.tail {
-                out.push_str(&m.shown);
-                let next = m
-                    .from
-                    .map_or(cut, |f| masked_end(s, url_at + f, url_at, cut));
-                return (next, false);
+    // A URL in quotes is the quoted run up to the partner of the quote
+    // (`"srt://h?a=1","b":2`), or to the end of the partner's word when an
+    // `@` follows it there (a password with a quote). Behind a blank the run
+    // counts when the URL in this word is masked (`"srt://h?passphrase=a b"`)
+    // or an `@` follows before the partner (`"srt://u:1 2@h"`); otherwise a
+    // clean URL ends with its word, so a quoted message that starts with one
+    // stays readable. A quote without a partner masks all to the end.
+    let mut stop = end;
+    let mut quoted = false;
+    if let Some((open, escapes)) = quote_before(s, at, url_at) {
+        let Some(close) = partner(s.as_bytes(), open, escapes, s.len()) else {
+            out.push_str(&s[url_at..url_at + sep + 3]);
+            out.push_str(MASK);
+            return (s.len(), false);
+        };
+        let (close_end, at_after) = match close < end {
+            true => (end, word.at_sign.is_some_and(|a| a > close)),
+            false => {
+                let close_end = s[close..]
+                    .find(char::is_whitespace)
+                    .map_or(s.len(), |i| close + i);
+                (close_end, s[close..close_end].contains('@'))
             }
+        };
+        let take = close < end
+            || at_after
+            || s[end..close].contains('@')
+            || mask_url(
+                &s[url_at..url_at + url_len(&s[url_at..end], sep)],
+                sep,
+                rules,
+            )
+            .from
+            .is_some();
+        if take {
+            stop = if at_after { close_end } else { close - escapes };
+            quoted = !at_after;
         }
     }
 
-    let part = &s[url_at..end];
-    let bracket = part.contains('[');
-    let mut url_end = part.len();
-    while url_end > sep + 3 && is_trailing(part.as_bytes()[url_end - 1], bracket) {
-        url_end -= 1;
-    }
-    let m = mask_url(&part[..url_end], sep, rtmp);
+    let part = &s[url_at..stop];
+    let url_end = match quoted {
+        true => part.len(),
+        false => url_len(part, sep),
+    };
+    let m = mask_url(&part[..url_end], sep, rules);
     out.push_str(&m.shown);
     let Some(from) = m.from else {
         out.push_str(&part[url_end..]);
-        return (end, false);
+        return (stop, false);
     };
     let url_stop = url_at + url_end;
     let next = masked_end(s, url_at + from, url_at, url_stop);
@@ -429,7 +524,18 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
     if !m.tail {
         out.push_str(&part[url_end..]);
     }
-    (end, false)
+    (stop, false)
+}
+
+/// The length of the URL at the start of `part` without the punctuation
+/// behind it ([`is_trailing`]); `sep` is where its `://` starts.
+fn url_len(part: &str, sep: usize) -> usize {
+    let bracket = part.contains('[');
+    let mut len = part.len();
+    while len > sep + 3 && is_trailing(part.as_bytes()[len - 1], bracket) {
+        len -= 1;
+    }
+    len
 }
 
 /// Characters that may stand before a URL in a word: `uri=`, `String("`,
@@ -479,17 +585,15 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%')
 }
 
-/// Where a URL at `url_at` ends when a quote stands right before it: before
-/// the partner of that quote, if there is one in the word.
-fn quoted_url_end(s: &str, word_at: usize, url_at: usize, end: usize) -> Option<usize> {
+/// The quote right before a URL at `url_at`, in the word from `word_at`,
+/// and how many backslashes escape it.
+fn quote_before(s: &str, word_at: usize, url_at: usize) -> Option<(usize, usize)> {
     let b = s.as_bytes();
     let open = url_at.checked_sub(1).filter(|&o| o >= word_at)?;
     if b[open] != b'"' && b[open] != b'\'' {
         return None;
     }
-    let escapes = backslashes_before(b, word_at, open);
-    let close = partner(b, open, escapes, end)?;
-    Some(close - escapes)
+    Some((open, backslashes_before(b, word_at, open)))
 }
 
 /// The end of a masked run from `from` to at least `end`: a quote that opens
@@ -534,7 +638,9 @@ fn partner(b: &[u8], open: usize, escapes: usize, end: usize) -> Option<usize> {
 }
 
 /// A property value as it may be logged: masked whole when its name is secret
-/// (`auth_token`, `passphrase`), its URLs masked when it is a string.
+/// (`auth_token`, `passphrase`); a string that is a URL as one URL (blanks in
+/// it are no word ends), only its origin when the name ends in `endpoint`
+/// (`whip_endpoint`: the path may be the key); any other string as [`text`].
 pub fn value<'a>(name: &str, v: &'a PropertyValue) -> Cow<'a, PropertyValue> {
     if is_secret_name(name) {
         return Cow::Owned(PropertyValue::String(MASK.to_string()));
@@ -542,10 +648,21 @@ pub fn value<'a>(name: &str, v: &'a PropertyValue) -> Cow<'a, PropertyValue> {
     let PropertyValue::String(s) = v else {
         return Cow::Borrowed(v);
     };
-    match text(s) {
-        Cow::Borrowed(_) => Cow::Borrowed(v),
-        Cow::Owned(masked) => Cow::Owned(PropertyValue::String(masked)),
+    let trimmed = s.trim();
+    let is_url = trimmed
+        .find("://")
+        .is_some_and(|sep| is_scheme(&trimmed[..sep]));
+    let shown = if plain_name(name).ends_with("endpoint") {
+        Cow::Owned(origin(trimmed))
+    } else if is_url {
+        Cow::Owned(url(trimmed))
+    } else {
+        text(s)
+    };
+    if shown == s.as_str() {
+        return Cow::Borrowed(v);
     }
+    Cow::Owned(PropertyValue::String(shown.into_owned()))
 }
 
 /// A copy of a flow with every property passed through [`value`], for a
@@ -748,6 +865,27 @@ mod tests {
         ("rtmp?://h/app/KEYX", &["KEYX"]),
         ("rtmp:/h/KEYX?r=http://x", &["KEYX"]),
         ("String(\"rtmp://h/live/KEYX\")", &["KEYX"]),
+        // A URL in quotes is the quoted run, blanks and all.
+        ("srtsink uri=\"srt://h:9000?passphrase=SEKA SEKB\" sync=false", &["SEKA", "SEKB"]),
+        ("uri='srt://h:9000?mode=caller&passphrase=SEKA SEKB'", &["SEKA", "SEKB"]),
+        ("uri=\"srt://u:SEKA SEKB@h:9000\"", &["SEKA", "SEKB"]),
+        ("\"srt://u:12 SEKRET@h:9000\"", &["SEKRET"]),
+        ("location=\"rtmp://h/live/SEKA SEKB\"", &["SEKA", "SEKB"]),
+        ("whip-endpoint=\"https://h/whip/ep?token=SEKA SEKB\"", &["SEKA", "SEKB"]),
+        ("\"srt://h:9000?passphrase=SEKA&x=1 SEKB\"", &["SEKA", "SEKB"]),
+        ("String(\"srt://h:9000?passphrase=SEKA SEKB\")", &["SEKA", "SEKB"]),
+        (
+            "{\"srt_uri\": String(\"srt://h:9000?mode=caller&passphrase=SEKA SEKB\")}",
+            &["SEKA", "SEKB"],
+        ),
+        ("x \"srt://h:9000?passphrase=SEKA SEKB", &["SEKA", "SEKB"]),
+        // A key in the path of an HTTP endpoint (Cloudflare Stream WHIP).
+        (
+            "whipclientsink0: Unexpected status 401 for https://customer-abc.cloudflarestream.com/SEKRETKEY0123/webRTC/publish",
+            &["SEKRETKEY0123"],
+        ),
+        ("error sending request for url (https://h/SEKRETKEY/webRTC/publish)", &["SEKRETKEY"]),
+        ("wss://h/SEKRETKEY", &["SEKRETKEY"]),
         // Pairs: names, several in a word, a secret name before `://`.
         ("auth_token=SEKRET", &["SEKRET"]),
         ("auth-token=SEKRET", &["SEKRET"]),
@@ -799,6 +937,11 @@ mod tests {
         ("\"passphrase\": \"SEKA SEKB\"", &["SEKA", "SEKB"]),
         ("Foo { passphrase: \"SEKRET\" }", &["SEKRET"]),
         ("Authorization: Bearer SEKRET", &["SEKRET"]),
+        ("Authorization:Bearer SEKRET", &["SEKRET"]),
+        ("Authorization=Bearer SEKRET", &["SEKRET"]),
+        ("srt://h?md5=SEKRET&expires=1", &["SEKRET"]),
+        ("srt://h?wowzatokenhash=SEKRET", &["SEKRET"]),
+        ("hdnts=exp=1~hmac=SEKRET", &["SEKRET"]),
         // Nothing to leak, nothing may panic.
         ("token=\"", &[]),
         ("token=\\\"", &[]),
@@ -830,7 +973,11 @@ mod tests {
         "Element { name: \"srtsink0\", uri: \"srt://h:9000?mode=caller\" }",
         "{\"uri\":\"srt://h:9000?mode=caller\",\"latency\":120}",
         "srt://kamera-büro.local:9000?latency=200",
-        "http://[fe80::1%eth0]:8080/x",
+        "http://[fe80::1%eth0]:8080",
+        "Failed to open srt://h:9000?mode=caller&latency=120: Connection refused",
+        "rtmp://a.rtmp.youtube.com/live2: Connection refused",
+        "srtsink uri=\"srt://h:9000?mode=caller\" sync=false",
+        "https://example.com/ refused",
         "rtmps://example.com/live",
         "Loading file: file:///home/user/My%20Video.mp4",
         "mail from user@example.com at 12:30:00 user=alice",
@@ -955,9 +1102,9 @@ mod tests {
     /// else masks the rest, and text without `scheme://` is masked whole.
     #[test]
     fn what_is_not_plain_is_masked() {
-        assert_eq!(url("https://h/a b/c?x=1"), "https://h/***");
-        assert_eq!(url("https://h/a?x=1&flag&y=2"), "https://h/a?x=1&***");
-        assert_eq!(url("https://h/a?cb=http%3A%2F%2Fx"), "https://h/a?cb=***");
+        assert_eq!(url("srt://h/a b/c?x=1"), "srt://h/***");
+        assert_eq!(url("srt://h/a?x=1&flag&y=2"), "srt://h/a?x=1&***");
+        assert_eq!(url("srt://h/a?cb=http%3A%2F%2Fx"), "srt://h/a?cb=***");
         assert_eq!(url("turn:user:pw@h"), "***");
         assert_eq!(url(" rtmp://h/live/key"), "***");
         assert_eq!(url(""), "");
@@ -972,8 +1119,8 @@ mod tests {
     #[test]
     fn userinfo_is_masked_by_the_last_at_sign() {
         assert_eq!(
-            url("https://user:p@ss/word@example.com/a.mp4"),
-            "https://***@example.com/a.mp4"
+            url("srt://user:p@ss/word@example.com/a"),
+            "srt://***@example.com/a"
         );
         assert_eq!(url("us@er://x"), "***");
     }
@@ -997,9 +1144,28 @@ mod tests {
     #[test]
     fn http_signature_is_masked() {
         assert_eq!(
-            url("https://example.com/a.mp4?X-Amz-Credential=c&X-Amz-Signature=s&x=1"),
-            "https://example.com/a.mp4?X-Amz-Credential=***&X-Amz-Signature=***&x=1"
+            url("s3://example.com/a.mp4?X-Amz-Credential=c&X-Amz-Signature=s&x=1"),
+            "s3://example.com/a.mp4?X-Amz-Credential=***&X-Amz-Signature=***&x=1"
         );
+    }
+
+    /// An HTTP path may be the whole key (Cloudflare Stream WHIP), so HTTP
+    /// shows only where it goes.
+    #[test]
+    fn http_shows_only_its_origin() {
+        let cloudflare = "https://customer-abc.cloudflarestream.com/0123abcd/webRTC/publish";
+        assert_eq!(
+            url(cloudflare),
+            "https://customer-abc.cloudflarestream.com/***"
+        );
+        assert_eq!(
+            origin(cloudflare),
+            "https://customer-abc.cloudflarestream.com/***"
+        );
+        assert_eq!(origin("https://u:p@h:8443?x=1"), "https://***@h:8443?***");
+        assert_eq!(origin("srt://h:9000/a?b=1"), "srt://h:9000/***");
+        assert_eq!(origin("https://h"), "https://h");
+        assert_eq!(origin("stage"), "***");
     }
 
     #[test]
@@ -1011,6 +1177,9 @@ mod tests {
             "authToken",
             "stream_key",
             "streamKey",
+            "wowzatokenhash",
+            "hmac",
+            "md5",
             "password",
             "streamid",
             "key",
@@ -1054,7 +1223,13 @@ mod tests {
 
         let dump = format!("{:?}", PropertyValue::String("rtmp://h/live/key".into()));
         // The stream key may hold a quote, so the mask runs to the blank.
-        assert_eq!(text(&dump), "String(\"rtmp://h/live/***");
+        assert_eq!(text(&dump), "String(\"rtmp://h/live/***\")");
+
+        let launch = "srtsink uri=\"srt://h:1?passphrase=two words\" sync=false";
+        assert_eq!(
+            text(launch),
+            "srtsink uri=\"srt://h:1?passphrase=***\" sync=false"
+        );
 
         let json = "{\"uri\":\"srt://h:1?mode=caller\",\"passphrase\":\"abc\"}";
         assert_eq!(
@@ -1081,6 +1256,20 @@ mod tests {
         assert_eq!(
             format!("{:?}", value("srt_uri", &uri)),
             "String(\"srt://h:1?passphrase=***\")"
+        );
+
+        // A URL property is one URL, blanks and all.
+        let spaced = PropertyValue::String("srt://h:1?passphrase=two words".into());
+        assert_eq!(
+            format!("{:?}", value("srt_uri", &spaced)),
+            "String(\"srt://h:1?passphrase=***\")"
+        );
+
+        // An endpoint shows only where it goes.
+        let endpoint = PropertyValue::String("https://h/0123abcd/webRTC/publish".into());
+        assert_eq!(
+            format!("{:?}", value("whip_endpoint", &endpoint)),
+            "String(\"https://h/***\")"
         );
 
         let latency = PropertyValue::Int(120);
