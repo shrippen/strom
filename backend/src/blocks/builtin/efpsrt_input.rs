@@ -619,8 +619,8 @@ impl BlockBuilder for EfpSrtInputBuilder {
 ///
 /// The decoder is picked once `h264parse` knows the stream (profile, chroma
 /// format, bit depth): the host's highest-ranked decoder that takes those
-/// caps, as `decodebin` picks it. A 4:2:2 or 10-bit stream thereby skips a
-/// hardware decoder that cannot take it instead of failing to negotiate.
+/// caps, by rank. A 4:2:2 or 10-bit stream thereby skips a hardware decoder
+/// that cannot take it instead of failing to negotiate.
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
@@ -675,6 +675,14 @@ fn link_decoded_video(
             &label,
         ) {
             error!("EFPSRT Input {}: {}", instance, e);
+            // Name the reason in the flow's error, not only a later not-linked.
+            if let Some(parser) = pad.parent_element() {
+                gst::element_error!(
+                    parser,
+                    gst::StreamError::CodecNotFound,
+                    ("EFPSRT Input {}: {}", instance, e)
+                );
+            }
         }
         gst::PadProbeReturn::Remove
     });
@@ -696,8 +704,10 @@ fn link_decoded_video(
 }
 
 /// Build the best decoder for `caps` and link `parser_src` -> decoder ->
-/// deinterlace -> `identity`. Tries the candidates by rank and takes the
-/// first that can be built (a hardware decoder without its device fails here).
+/// [deinterlace if interlaced/mixed] -> `identity`. Tries the candidates by
+/// rank and takes the first that reaches the bin's state: a hardware decoder
+/// opens its device on the way to READY (no free NVDEC session, a VA device
+/// gone) and fails there, so the next candidate is tried.
 fn link_decoder(
     bin: &gst::Bin,
     parser_src: &gst::Pad,
@@ -709,23 +719,13 @@ fn link_decoder(
 ) -> Result<(), String> {
     let decoder = crate::gst::software_decoder::decoders_for(&caps)
         .into_iter()
-        .find_map(
-            |factory| match factory.create().name(decoder_name).build() {
-                Ok(decoder) => Some(decoder),
-                Err(e) => {
-                    debug!("{}: {} unusable: {}", decoder_name, factory.name(), e);
-                    None
-                }
-            },
-        )
-        .ok_or_else(|| format!("no H.264 decoder takes {}", caps))?;
+        .find_map(|factory| start_decoder(bin, &factory, decoder_name))
+        .ok_or_else(|| format!("no usable H.264 decoder takes {}", caps))?;
 
-    bin.add(&decoder)
-        .map_err(|e| format!("add video decoder: {}", e))?;
-
-    // decoder -> deinterlace -> identity. Interlaced broadcast feeds (e.g.
+    // decoder -> [deinterlace] -> identity. Interlaced broadcast feeds (e.g.
     // 1080i50) must be deinterlaced before the GL vision mixer; the helper's
-    // caps probe forces deinterlacing only when the source is interlaced/mixed.
+    // caps probe inserts the deinterlacer only when the source is
+    // interlaced/mixed, progressive video links straight to identity.
     let decoder_src = decoder.static_pad("src").ok_or("decoder has no src pad")?;
     super::decode_chain::link_raw_video_through_deinterlace(
         bin,
@@ -734,10 +734,6 @@ fn link_decoder(
         instance_id,
         pad_label,
     )?;
-    decoder
-        .sync_state_with_parent()
-        .map_err(|e| format!("sync decoder: {}", e))?;
-
     let decoder_sink = decoder
         .static_pad("sink")
         .ok_or("decoder has no sink pad")?;
@@ -755,6 +751,32 @@ fn link_decoder(
             .unwrap_or_default(),
     );
     Ok(())
+}
+
+/// Add a decoder made by `factory` to `bin` and bring it to the bin's state;
+/// on failure take it out again and return `None`.
+fn start_decoder(
+    bin: &gst::Bin,
+    factory: &gst::ElementFactory,
+    name: &str,
+) -> Option<gst::Element> {
+    let decoder = match factory.create().name(name).build() {
+        Ok(decoder) => decoder,
+        Err(e) => {
+            debug!("{}: {} unusable: {}", name, factory.name(), e);
+            return None;
+        }
+    };
+    if bin.add(&decoder).is_err() {
+        return None;
+    }
+    if let Err(e) = decoder.sync_state_with_parent() {
+        debug!("{}: {} does not start: {}", name, factory.name(), e);
+        let _ = decoder.set_state(gst::State::Null);
+        let _ = bin.remove(&decoder);
+        return None;
+    }
+    Some(decoder)
 }
 
 /// Dynamically insert opusdec + audioconvert + audioresample between an efpdemux audio pad and identity.

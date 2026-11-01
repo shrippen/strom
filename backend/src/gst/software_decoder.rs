@@ -120,6 +120,34 @@ mod tests {
         assert!(!is_hardware(&picked), "{}", picked.name());
     }
 
+    /// `decoders_for` returns only decoders that take the whole caps, best
+    /// rank first.
+    #[test]
+    fn decoders_for_takes_the_caps_best_rank_first() {
+        gst::init().unwrap();
+        let caps: gst::Caps =
+            "video/x-h264, stream-format=byte-stream, alignment=au, profile=high-4:2:2"
+                .parse()
+                .unwrap();
+        let found = decoders_for(&caps);
+        assert!(!found.is_empty(), "no H.264 decoder (gst-libav)");
+        for f in &found {
+            assert!(
+                f.can_sink_all_caps(&caps),
+                "{} does not take {caps}",
+                f.name()
+            );
+        }
+        assert!(
+            found.windows(2).all(|w| w[0].rank() >= w[1].rank()),
+            "not ordered by rank: {:?}",
+            found
+                .iter()
+                .map(|f| (f.name().to_string(), f.rank()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn only_encoded_pictures_count() {
         gst::init().unwrap();
