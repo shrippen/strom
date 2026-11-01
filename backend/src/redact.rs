@@ -47,7 +47,7 @@ pub fn is_secret_name(name: &str) -> bool {
 
 /// Mask the secrets in one URL.
 ///
-/// - userinfo: see [`without_userinfo`].
+/// - userinfo: see [`userinfo_at`].
 /// - query: each value whose key is secret (`passphrase=***`).
 /// - `rtmp*` schemes: as [`rtmp_url`].
 ///
@@ -61,12 +61,28 @@ pub fn url(raw: &str) -> String {
         return rtmp_url(raw);
     }
 
-    let Some(plain) = without_userinfo(raw) else {
-        return MASK.to_string();
+    let Some(at) = userinfo_at(raw) else {
+        return masked_query(raw);
     };
-    match plain.split_once('?') {
+    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
+    if at < after_scheme {
+        // An '@' inside the scheme: nothing of that string is worth echoing.
+        return MASK.to_string();
+    }
+    let rest = &raw[at + 1..];
+    let prefix = format!("{}{}@", &raw[..after_scheme], MASK);
+    if in_query(raw, at) {
+        // The cut took the `?`: all that follows may be parameters.
+        return format!("{}{}", prefix, mask_params(rest));
+    }
+    format!("{}{}", prefix, masked_query(rest))
+}
+
+/// `s` with [`mask_params`] over its query, if it has one.
+fn masked_query(s: &str) -> String {
+    match s.split_once('?') {
         Some((head, query)) => format!("{}?{}", head, mask_params(query)),
-        None => plain,
+        None => s.to_string(),
     }
 }
 
@@ -81,8 +97,15 @@ pub fn url(raw: &str) -> String {
 /// rtmp://u:p@h/live/key?t=1 -> rtmp://***@h/live/***?***
 /// ```
 pub fn rtmp_url(raw: &str) -> String {
-    let Some(plain) = without_userinfo(raw) else {
-        return MASK.to_string();
+    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
+    let plain = match userinfo_at(raw) {
+        None => raw.to_string(),
+        Some(at) if at < after_scheme => return MASK.to_string(),
+        // Host, path and query can no longer be told apart.
+        Some(at) if in_query(raw, at) => {
+            return format!("{}{}@{}", &raw[..after_scheme], MASK, MASK)
+        }
+        Some(at) => format!("{}{}{}", &raw[..after_scheme], MASK, &raw[at..]),
     };
     let (head, query) = match plain.split_once('?') {
         Some((head, _)) => (head, true),
@@ -90,7 +113,6 @@ pub fn rtmp_url(raw: &str) -> String {
     };
 
     // Only with a path, so a bare host is left alone.
-    let after_scheme = head.find("://").map(|i| i + 3).unwrap_or(0);
     let head = match head[after_scheme..].rfind('/') {
         Some(rel) if rel > 0 => format!("{}{}", &head[..after_scheme + rel + 1], MASK),
         _ => head.to_string(),
@@ -102,33 +124,44 @@ pub fn rtmp_url(raw: &str) -> String {
     head
 }
 
-/// Mask userinfo: everything before the `@` that ends it.
+/// The `@` that ends userinfo, if any. Fails closed.
 ///
-/// Fails closed. A password with an unencoded `/` or `@` must not end the
-/// authority early, so that is the **last** `@` before the query. A password
-/// with an unencoded `?` must not hide behind the query either, so an `@`
-/// after the first `?` ends userinfo too, unless the text up to it is a
-/// parameter (holds `=` or `&`): `?streamid=u=a@b` stays a query for
-/// [`mask_params`]. `None` when the `@` sits inside the scheme: nothing of
-/// that string is worth echoing.
-fn without_userinfo(raw: &str) -> Option<String> {
-    let at = match raw.find('?') {
-        Some(q) => raw[..q].rfind('@').or_else(|| {
-            let tail = &raw[q + 1..];
-            tail.find('@')
-                .filter(|&i| !tail[..i].contains(['=', '&']))
-                .map(|i| q + 1 + i)
-        }),
-        None => raw.rfind('@'),
+/// - Without a query, the **last** `@`: a password with an unencoded `/` or
+///   `@` must not end the authority early.
+/// - With a query, the last `@` before the first `?`.
+/// - An `@` after the first `?` ends userinfo when what precedes the `?`
+///   cannot be `host[:port]` (`user:pw?x=1@host`: the last `@`), or when
+///   the text up to the `@` is no parameter (`?ss@host`: the first `@`).
+///   Otherwise (`?streamid=u=a@b`) it is a value for [`mask_params`].
+///
+/// A cut behind the `?` takes the query mark with it, so the callers mask
+/// everything after such an `@` as parameters, whatever it was.
+fn userinfo_at(raw: &str) -> Option<usize> {
+    let Some(q) = raw.find('?') else {
+        return raw.rfind('@');
     };
-    let Some(at) = at else {
-        return Some(raw.to_string());
-    };
-    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0);
-    if at < after_scheme {
-        return None;
+    if let Some(at) = raw[..q].rfind('@') {
+        return Some(at);
     }
-    Some(format!("{}{}{}", &raw[..after_scheme], MASK, &raw[at..]))
+
+    let tail = &raw[q + 1..];
+    let after_scheme = raw.find("://").map(|i| i + 3).unwrap_or(0).min(q);
+    let authority = raw[after_scheme..q].split('/').next().unwrap_or("");
+    let not_a_port = !authority.ends_with(']')
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| !port.chars().all(|c| c.is_ascii_digit()));
+    if not_a_port {
+        return tail.rfind('@').map(|i| q + 1 + i);
+    }
+    tail.find('@')
+        .filter(|&i| !tail[..i].contains(['=', '&']))
+        .map(|i| q + 1 + i)
+}
+
+/// Whether the `@` at `at` lies behind the first `?`.
+fn in_query(raw: &str, at: usize) -> bool {
+    raw.find('?').is_some_and(|q| q < at)
 }
 
 /// Mask the value of each secret `key=value` pair in a query string.
@@ -351,7 +384,28 @@ mod tests {
         // A password with an unencoded `?` still loses everything up to its `@`.
         let masked = url("rtmp://user:p?ss@example.com/live/key");
         assert!(!masked.contains("p?ss"), "{}", masked);
-        assert!(masked.contains("example.com/live/"), "{}", masked);
+    }
+
+    /// Whatever `@` ends userinfo, nothing after it escapes masking: a
+    /// parameter or key with an `@` before any `=`, and a password with an
+    /// unencoded `?` followed by `=`.
+    #[test]
+    fn an_at_sign_after_the_query_mark_fails_closed() {
+        assert_eq!(
+            url("https://h/a?foo@bar&token=abc"),
+            "https://***@bar&token=***"
+        );
+        assert_eq!(
+            url("https://h/a?mail@x.de=1&token=abc"),
+            "https://***@x.de=1&token=***"
+        );
+        assert_eq!(url("srt://user:pa?ss=x@h:9000"), "srt://***@h:9000");
+        let masked = url("rtmp://user:pw?x=1@host/app/key");
+        assert!(!masked.contains("pw"), "{}", masked);
+        assert!(!masked.contains("key"), "{}", masked);
+        let masked = url("rtmp://h/live/key?foo@bar&token=abc");
+        assert!(!masked.contains("abc"), "{}", masked);
+        assert!(!masked.contains("key"), "{}", masked);
     }
 
     /// gst-launch quotes a value with blanks: `passphrase="two words"`.
