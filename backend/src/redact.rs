@@ -199,8 +199,8 @@ fn is_scheme_char(c: char) -> bool {
 /// A URL as shown, and where masking began.
 struct Masked {
     shown: String,
-    /// Byte offset in the URL of the first masked part.
-    from: Option<usize>,
+    /// Byte offset in the URL of the first masked part, and in `shown`.
+    from: Option<(usize, usize)>,
     /// Whether the URL ends in a masked part.
     tail: bool,
 }
@@ -214,8 +214,8 @@ impl Masked {
     }
 
     fn mask(&mut self, at: usize) {
+        self.from.get_or_insert((at, self.shown.len()));
         self.shown.push_str(MASK);
-        self.from.get_or_insert(at);
         self.tail = true;
     }
 }
@@ -347,11 +347,10 @@ fn plain_host(authority: &str) -> bool {
 /// - A word with `://` is a URL behind a plain prefix (`uri=`, `String("`,
 ///   `<`): the URL goes through [`url`] (so HTTP shows only its origin), and
 ///   a trailing `:`, `,`, `)`, quote or the like stays outside it
-///   (`srt://h:9000: refused` keeps its host). A URL behind an open quote
-///   in its word (`uri="srt://…`, `"uri=srt://…`) is the whole quoted run,
-///   blanks included, up to the partner of that quote (or to the end of the
-///   text when there is none). Any other prefix masks the
-///   whole word.
+///   (`srt://h:9000: refused` keeps its host). A URL inside an open quote
+///   (`uri="srt://…`, `"uri=srt://…`) is the whole quoted run, blanks
+///   included, up to the partner of that quote, when it is masked or an `@`
+///   follows. Any other prefix masks the whole word.
 /// - At each `=` or `:` of a word (quotes around the name allowed), a name
 ///   that ends in a secret ending ([`is_secret_name`]) masks the value: up to
 ///   the end of the word, or the next word when the separator ends this one
@@ -360,6 +359,13 @@ fn plain_host(authority: &str) -> bool {
 /// - A quote that opens in a masked part (`passphrase="two words"`,
 ///   `passphrase=(string)"a b"`, `\"` in a `{:?}` dump) masks through its
 ///   partner with as many backslashes before it, or to the end of the text.
+/// - Quotes are followed from the start of the text: a `"`, `'` or `` ` ``
+///   at the start of a word or behind a non-letter opens, the same quote with
+///   as many backslashes closes. Whenever masking begins inside an open quote
+///   (`"passphrase=a b"`, `'uri=srt://h?passphrase=a b'`, a quote opened in
+///   an earlier word), the mask runs through the partner of the innermost
+///   one, or to the end of the text; on past it when a letter follows (an
+///   apostrophe in the value) or an `@` in its word.
 ///
 /// Not covered, because nothing tells them from prose: a raw blank inside a
 /// URL that is not quoted (`srt://u:a b@h` shows `b@h`), a raw `&` inside a
@@ -375,6 +381,7 @@ pub fn text(s: &str) -> Cow<'_, str> {
         at_sign: None,
     };
     let mut value_next = false;
+    let mut quotes = Quotes::default();
     while let Some(c) = s[at..].chars().next() {
         if c.is_whitespace() {
             out.push(c);
@@ -388,20 +395,170 @@ pub fn text(s: &str) -> Cow<'_, str> {
             let at_sign = s[at..end].rfind('@').map(|i| at + i);
             word = Word { end, at_sign };
         }
-        if value_next {
-            let w = &s[at..word.end];
-            value_next = AUTH_SCHEMES.iter().any(|a| w.eq_ignore_ascii_case(a));
-            out.push_str(MASK);
-            at = masked_end(s, at, at, word.end);
-            continue;
+        let step = match value_next {
+            true => {
+                let w = &s[at..word.end];
+                let shown_at = out.len();
+                out.push_str(MASK);
+                Step {
+                    next: masked_end(s, at, at, word.end),
+                    value_next: AUTH_SCHEMES.iter().any(|a| w.eq_ignore_ascii_case(a)),
+                    mask: Some((at, shown_at)),
+                }
+            }
+            false => mask_word(s, at, word, &mut quotes, &mut out),
+        };
+        (at, value_next) = (step.next, step.value_next);
+        // Masking began inside an open quote: the secret runs to its partner.
+        if let Some((from, shown_at)) = step.mask {
+            if let Some(stop) = quotes.masked_to(s, from) {
+                out.truncate(shown_at);
+                out.push_str(MASK);
+                (at, value_next) = (stop, false);
+            }
         }
-        (at, value_next) = mask_word(s, at, word, &mut out);
     }
 
     if out == s {
         return Cow::Borrowed(s);
     }
     Cow::Owned(out)
+}
+
+/// What [`mask_word`] did: where to go on, whether the next word is a
+/// secret value, and where masking began (in `s` and in the output).
+struct Step {
+    next: usize,
+    value_next: bool,
+    mask: Option<(usize, usize)>,
+}
+
+impl Step {
+    fn new(next: usize, value_next: bool, mask: Option<(usize, usize)>) -> Self {
+        Step {
+            next,
+            value_next,
+            mask,
+        }
+    }
+}
+
+/// The quotes open in the text read so far, innermost last: a `"`, `'` or
+/// `` ` `` at the start of a word or behind a non-letter opens (an
+/// apostrophe in `can't` does not), the same quote with as many backslashes
+/// before it closes it and any opened inside it.
+#[derive(Default)]
+struct Quotes {
+    open: Vec<(usize, usize)>,
+    /// How far the text is read.
+    read: usize,
+    /// The last partner looked up: a quote open over many words is asked
+    /// for once per URL in them.
+    known: Option<(usize, Option<usize>)>,
+    /// The next `@` from where it was last looked up, or none to the end.
+    at_sign: Option<(usize, Option<usize>)>,
+}
+
+impl Quotes {
+    /// How deep a closing quote looks for its opening one.
+    const DEPTH: usize = 16;
+
+    /// Read on to `to`.
+    fn read_to(&mut self, s: &str, to: usize) {
+        let b = s.as_bytes();
+        for i in self.read..to {
+            if !matches!(b[i], b'"' | b'\'' | b'`') {
+                continue;
+            }
+            let escapes = backslashes_before(b, 0, i);
+            let depth = self.open.len();
+            let matching = self
+                .open
+                .iter()
+                .rev()
+                .take(Self::DEPTH)
+                .position(|&(o, e)| b[o] == b[i] && e == escapes);
+            match matching {
+                Some(k) => self.open.truncate(depth - 1 - k),
+                None => {
+                    let after_letter = s[..i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphanumeric);
+                    if !after_letter {
+                        self.open.push((i, escapes));
+                    }
+                }
+            }
+        }
+        self.read = self.read.max(to);
+    }
+
+    /// The partner of the open quote at `open` ([`partner`]), cached.
+    fn partner(&mut self, s: &str, open: usize, escapes: usize) -> Option<usize> {
+        if let Some((o, close)) = self.known {
+            if o == open {
+                return close;
+            }
+        }
+        let close = partner(s.as_bytes(), open, escapes, s.len());
+        self.known = Some((open, close));
+        close
+    }
+
+    /// The first `@` at or behind `from`, cached: asked once per URL in a
+    /// quote open over many words.
+    fn at_sign_from(&mut self, s: &str, from: usize) -> Option<usize> {
+        if let Some((looked, found)) = self.at_sign {
+            if looked <= from && found.is_none_or(|a| a >= from) {
+                return found;
+            }
+        }
+        let found = s[from..].find('@').map(|i| from + i);
+        self.at_sign = Some((from, found));
+        found
+    }
+
+    /// The innermost quote open at `at`, and its backslashes.
+    fn open_at(&mut self, s: &str, at: usize) -> Option<(usize, usize)> {
+        self.read_to(s, at);
+        self.open.last().copied()
+    }
+
+    /// Where a mask that begins at `from` ends when a quote is open there:
+    /// behind its partner, or the end of `s`. Past the partner the mask goes
+    /// on when a quote opened in the value runs past it (`masked_end`), when
+    /// a letter follows (`'it's a'`: the partner was an apostrophe) or when
+    /// an `@` follows in its word (a password with a quote).
+    fn masked_to(&mut self, s: &str, from: usize) -> Option<usize> {
+        self.read_to(s, from);
+        let (open, escapes) = self.open.pop()?;
+        let b = s.as_bytes();
+        let Some(close) = self.partner(s, open, escapes) else {
+            self.open.clear();
+            self.read = b.len();
+            return Some(b.len());
+        };
+        let inner = masked_end(s, from, from, close);
+        let close_end = s[close..]
+            .find(char::is_whitespace)
+            .map_or(s.len(), |i| close + i);
+        let glued = s[close + 1..]
+            .chars()
+            .next()
+            .is_some_and(char::is_alphanumeric);
+        let stop = if inner > close {
+            inner
+        } else if glued {
+            masked_end(s, close, close - escapes, close + 1)
+        } else if s[close..close_end].contains('@') {
+            masked_end(s, close + 1, close + 1, close_end)
+        } else {
+            close + 1
+        };
+        self.read = self.read.max(stop);
+        Some(stop)
+    }
 }
 
 /// The word of [`text`] being masked: where it ends and its last `@`.
@@ -413,7 +570,7 @@ struct Word {
 
 /// Mask the word, or the rest of it, that starts at `at` into `out`. Returns
 /// where to go on, and whether the next word is a secret value.
-fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) {
+fn mask_word(s: &str, at: usize, word: Word, quotes: &mut Quotes, out: &mut String) -> Step {
     let end = word.end;
     let w = &s[at..end];
     let url = w.find("://").map(|sep| {
@@ -429,17 +586,18 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
     if let Some(value) = secret_value(names) {
         out.push_str(&w[..value]);
         if value == w.len() {
-            return (end, true);
+            return Step::new(end, true, None);
         }
+        let mask = Some((at + value, out.len()));
         out.push_str(MASK);
         // `Authorization:Bearer abc`: the secret is the next word.
         if AUTH_SCHEMES
             .iter()
             .any(|a| w[value..].eq_ignore_ascii_case(a))
         {
-            return (end, true);
+            return Step::new(end, true, mask);
         }
-        return (masked_end(s, at + value, at + value, end), false);
+        return Step::new(masked_end(s, at + value, at + value, end), false, mask);
     }
 
     let Some((start, sep)) = url else {
@@ -448,37 +606,40 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
             .at_sign
             .is_some_and(|a| a > at && s[at..a].contains(':'))
         {
+            let mask = Some((at, out.len()));
             out.push_str(MASK);
-            return (masked_end(s, at, at, end), false);
+            return Step::new(masked_end(s, at, at, end), false, mask);
         }
         out.push_str(w);
-        return (end, false);
+        return Step::new(end, false, None);
     };
     let prefix = &w[..start];
     let scheme = &w[start..sep];
     if !is_scheme(scheme) || !prefix.chars().all(is_prefix_char) {
+        let mask = Some((at, out.len()));
         out.push_str(MASK);
-        return (masked_end(s, at, at, end), false);
+        return Step::new(masked_end(s, at, at, end), false, mask);
     }
     out.push_str(prefix);
     let url_at = at + start;
     let sep = sep - start;
     let rules = Rules::of(scheme);
 
-    // A URL in quotes (`uri="srt://…"`, `"uri=srt://…"`) is the quoted run
-    // up to the partner of the quote (`"srt://h?a=1","b":2`), or to the end of the partner's word when an
+    // A URL in quotes (`uri="srt://…"`, `"uri=srt://…"`, a quote open since
+    // an earlier word) is the quoted run up to the partner of the quote
+    // (`"srt://h?a=1","b":2`), or to the end of the partner's word when an
     // `@` follows it there (a password with a quote). Behind a blank the run
     // counts when the URL in this word is masked (`"srt://h?passphrase=a b"`)
     // or an `@` follows before the partner (`"srt://u:1 2@h"`); otherwise a
     // clean URL ends with its word, so a quoted message that starts with one
     // stays readable. A quote without a partner masks all to the end.
     let mut stop = end;
-    let mut closing = None;
-    if let Some((open, escapes)) = quote_before(s, at, url_at) {
-        let Some(close) = partner(s.as_bytes(), open, escapes, s.len()) else {
+    if let Some((open, escapes)) = quotes.open_at(s, url_at) {
+        let Some(close) = quotes.partner(s, open, escapes) else {
             out.push_str(&s[url_at..url_at + sep + 3]);
+            let mask = Some((url_at + sep + 3, out.len()));
             out.push_str(MASK);
-            return (s.len(), false);
+            return Step::new(s.len(), false, mask);
         };
         let (close_end, at_after) = match close < end {
             true => (end, word.at_sign.is_some_and(|a| a > close)),
@@ -491,7 +652,7 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
         };
         let take = close < end
             || at_after
-            || s[end..close].contains('@')
+            || quotes.at_sign_from(s, end).is_some_and(|a| a < close)
             || mask_url(
                 &s[url_at..url_at + url_len(&s[url_at..end], sep)],
                 sep,
@@ -501,39 +662,29 @@ fn mask_word(s: &str, at: usize, word: Word, out: &mut String) -> (usize, bool) 
             .is_some();
         if take {
             stop = if at_after { close_end } else { close - escapes };
-            closing = (!at_after).then_some((close, escapes));
         }
     }
 
     let part = &s[url_at..stop];
     let url_end = url_len(part, sep);
     let m = mask_url(&part[..url_end], sep, rules);
+    let shown_at = out.len();
     out.push_str(&m.shown);
-    let Some(from) = m.from else {
+    let Some((from, from_shown)) = m.from else {
         out.push_str(&part[url_end..]);
-        return (stop, false);
+        return Step::new(stop, false, None);
     };
+    let mask = Some((url_at + from, shown_at + from_shown));
     let url_stop = url_at + url_end;
     let next = masked_end(s, url_at + from, url_at, url_stop);
     if next > url_stop {
-        return (next, false);
-    }
-    // `'srt://h?passphrase=it's a'`: a masked end glued to a letter behind
-    // the partner was a quote inside the value; mask on through the next.
-    if let Some((close, escapes)) = closing {
-        let glued = s[close + 1..]
-            .chars()
-            .next()
-            .is_some_and(char::is_alphanumeric);
-        if m.tail && glued {
-            return (masked_end(s, close, close - escapes, close + 1), false);
-        }
+        return Step::new(next, false, mask);
     }
     // A masked end may go on behind the punctuation: drop it.
     if !m.tail {
         out.push_str(&part[url_end..]);
     }
-    (stop, false)
+    Step::new(stop, false, mask)
 }
 
 /// The length of the URL at the start of `part` without the punctuation
@@ -592,30 +743,6 @@ fn secret_value(w: &str) -> Option<usize> {
 
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '%')
-}
-
-/// The quote that opens before a URL at `url_at`, in the word from
-/// `word_at`, and how many backslashes escape it: the last `"`, `'` or `` ` ``
-/// in the prefix whose partner is not in the prefix too (the innermost one),
-/// right before the URL
-/// (`uri="srt://…`) or before the whole argument (`"uri=srt://…`).
-fn quote_before(s: &str, word_at: usize, url_at: usize) -> Option<(usize, usize)> {
-    let b = s.as_bytes();
-    // Quotes nest in dumps (`"\"srt://`): the innermost open one counts.
-    let mut open: Vec<(usize, usize)> = Vec::new();
-    for i in word_at..url_at {
-        if !matches!(b[i], b'"' | b'\'' | b'`') {
-            continue;
-        }
-        let escapes = backslashes_before(b, word_at, i);
-        match open.last() {
-            Some(&(o, e)) if b[o] == b[i] && e == escapes => {
-                open.pop();
-            }
-            _ => open.push((i, escapes)),
-        }
-    }
-    open.pop()
 }
 
 /// The end of a masked run from `from` to at least `end`: a quote that opens
@@ -909,6 +1036,17 @@ mod tests {
         ("'location=rtmp://h/live/SEKA SEKB' x", &["SEKA", "SEKB"]),
         ("uri=`srt://h?passphrase=SEKA SEKB`", &["SEKA", "SEKB"]),
         ("uri='srt://h?passphrase=SEKA's SEKB'", &["SEKA", "SEKB"]),
+        // A quote around the whole argument holds a secret value too.
+        (
+            "gst-launch-1.0 srtsrc \"passphrase=SEKA SEKB\" uri=srt://h:9000 ! fakesink",
+            &["SEKA", "SEKB"],
+        ),
+        ("srtsrc 'passphrase=SEKA SEKB' latency=120", &["SEKA", "SEKB"]),
+        ("srtsink \"streamid=#!::r=live,passphrase=SEKA SEKB\"", &["SEKA", "SEKB"]),
+        ("\"name=out uri=srt://h:9000?passphrase=SEKA SEKB\"", &["SEKA", "SEKB"]),
+        ("\"name=out passphrase=SEKA SEKB\" x", &["SEKA", "SEKB"]),
+        ("srtsrc 'passphrase=SEKA's SEKB' x", &["SEKA", "SEKB"]),
+        ("\"srt://u:pa\"-SEKRET@h\"", &["SEKRET"]),
         // A key in the path of an HTTP endpoint (Cloudflare Stream WHIP).
         (
             "whipclientsink0: Unexpected status 401 for https://customer-abc.cloudflarestream.com/SEKRETKEY0123/webRTC/publish",
@@ -1009,6 +1147,7 @@ mod tests {
         "srtsink uri=\"srt://h:9000?mode=caller\" sync=false",
         "srtsink \"uri=srt://h:9000?mode=caller\" sync=false",
         "name=\"a\" uri=srt://h:9000 sync=false",
+        "can't open srt://h:9000: Connection refused",
         "https://example.com/ refused",
         "rtmps://example.com/live",
         "Loading file: file:///home/user/My%20Video.mp4",
@@ -1255,12 +1394,13 @@ mod tests {
 
         let dump = format!("{:?}", PropertyValue::String("rtmp://h/live/key".into()));
         // The stream key may hold a quote, so the mask runs to the blank.
-        assert_eq!(text(&dump), "String(\"rtmp://h/live/***\")");
+        // The mask runs through the quote the key is in.
+        assert_eq!(text(&dump), "String(\"rtmp://h/live/***)");
 
         let launch = "srtsink uri=\"srt://h:1?passphrase=two words\" sync=false";
         assert_eq!(
             text(launch),
-            "srtsink uri=\"srt://h:1?passphrase=***\" sync=false"
+            "srtsink uri=\"srt://h:1?passphrase=*** sync=false"
         );
 
         let json = "{\"uri\":\"srt://h:1?mode=caller\",\"passphrase\":\"abc\"}";
