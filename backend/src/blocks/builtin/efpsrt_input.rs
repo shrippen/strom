@@ -616,6 +616,11 @@ impl BlockBuilder for EfpSrtInputBuilder {
 
 /// Dynamically insert h264parse + video decoder between an efpdemux video pad and identity.
 /// efpdemux pad -> h264parse -> H.264 decoder -> [deinterlace if interlaced] -> identity
+///
+/// The decoder is picked once `h264parse` knows the stream (profile, chroma
+/// format, bit depth): the host's highest-ranked decoder that takes those
+/// caps, as `decodebin` picks it. A 4:2:2 or 10-bit stream thereby skips a
+/// hardware decoder that cannot take it instead of failing to negotiate.
 fn link_decoded_video(
     element: &gst::Element,
     src_pad: &gst::Pad,
@@ -634,36 +639,45 @@ fn link_decoded_video(
         .build()
         .map_err(|e| format!("h264parse: {}", e))?;
 
-    // Hardware decoder of this host's vendor first, software otherwise.
-    let decoder_name = format!("{}:video_decoder_{}", instance_id, src_pad.name());
-    let decoder = super::decode_chain::make_h264_decoder(&decoder_name)?;
-
-    bin.add_many([&parser, &decoder])
-        .map_err(|e| format!("add video decode chain: {}", e))?;
-
-    // Link downstream: h264parse -> decoder
-    parser
-        .link(&decoder)
-        .map_err(|e| format!("link h264parse -> decoder: {}", e))?;
-
+    bin.add(&parser)
+        .map_err(|e| format!("add h264parse: {}", e))?;
     parser
         .sync_state_with_parent()
         .map_err(|e| format!("sync h264parse: {}", e))?;
-    decoder
-        .sync_state_with_parent()
-        .map_err(|e| format!("sync decoder: {}", e))?;
 
-    // decoder -> [deinterlace] -> identity. Interlaced broadcast feeds (e.g.
-    // 1080i50) must be deinterlaced before the GL vision mixer; the helper's
-    // caps probe inserts a deinterlacer only when the source is interlaced/mixed.
-    let decoder_src = decoder.static_pad("src").ok_or("decoder has no src pad")?;
-    super::decode_chain::link_raw_video_through_deinterlace(
-        &bin,
-        &decoder_src,
-        identity,
-        instance_id,
-        &src_pad.name(),
-    )?;
+    // One-shot CAPS probe on the parser's output: fires per event, never per
+    // buffer, and captures only weak references and owned strings. It runs
+    // before the event goes to a peer, so the decoder linked here gets the
+    // CAPS event itself, and the sticky events before it.
+    let parser_src = parser.static_pad("src").ok_or("h264parse has no src pad")?;
+    let weak_bin = bin.downgrade();
+    let weak_identity = identity.downgrade();
+    let decoder_name = format!("{}:video_decoder_{}", instance_id, src_pad.name());
+    let label = src_pad.name().to_string();
+    let instance = instance_id.to_string();
+    parser_src.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(caps_event) = event.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let (Some(bin), Some(identity)) = (weak_bin.upgrade(), weak_identity.upgrade()) else {
+            return gst::PadProbeReturn::Remove;
+        };
+        if let Err(e) = link_decoder(
+            &bin,
+            pad,
+            caps_event.caps_owned(),
+            &identity,
+            &decoder_name,
+            &instance,
+            &label,
+        ) {
+            error!("EFPSRT Input {}: {}", instance, e);
+        }
+        gst::PadProbeReturn::Remove
+    });
 
     // Link source pad last
     let parser_sink = parser
@@ -674,14 +688,71 @@ fn link_decoded_video(
         .map_err(|e| format!("link efpdemux -> h264parse: {:?}", e))?;
 
     debug!(
-        "EFPSRT Input {}: Linked video decode chain: {} -> h264parse -> {} -> {}",
+        "EFPSRT Input {}: Linked {} -> h264parse; the decoder follows the stream's caps",
         instance_id,
         src_pad.name(),
+    );
+    Ok(())
+}
+
+/// Build the best decoder for `caps` and link `parser_src` -> decoder ->
+/// deinterlace -> `identity`. Tries the candidates by rank and takes the
+/// first that can be built (a hardware decoder without its device fails here).
+fn link_decoder(
+    bin: &gst::Bin,
+    parser_src: &gst::Pad,
+    caps: gst::Caps,
+    identity: &gst::Element,
+    decoder_name: &str,
+    instance_id: &str,
+    pad_label: &str,
+) -> Result<(), String> {
+    let decoder = crate::gst::software_decoder::decoders_for(&caps)
+        .into_iter()
+        .find_map(
+            |factory| match factory.create().name(decoder_name).build() {
+                Ok(decoder) => Some(decoder),
+                Err(e) => {
+                    debug!("{}: {} unusable: {}", decoder_name, factory.name(), e);
+                    None
+                }
+            },
+        )
+        .ok_or_else(|| format!("no H.264 decoder takes {}", caps))?;
+
+    bin.add(&decoder)
+        .map_err(|e| format!("add video decoder: {}", e))?;
+
+    // decoder -> deinterlace -> identity. Interlaced broadcast feeds (e.g.
+    // 1080i50) must be deinterlaced before the GL vision mixer; the helper's
+    // caps probe forces deinterlacing only when the source is interlaced/mixed.
+    let decoder_src = decoder.static_pad("src").ok_or("decoder has no src pad")?;
+    super::decode_chain::link_raw_video_through_deinterlace(
+        bin,
+        &decoder_src,
+        identity,
+        instance_id,
+        pad_label,
+    )?;
+    decoder
+        .sync_state_with_parent()
+        .map_err(|e| format!("sync decoder: {}", e))?;
+
+    let decoder_sink = decoder
+        .static_pad("sink")
+        .ok_or("decoder has no sink pad")?;
+    parser_src
+        .link(&decoder_sink)
+        .map_err(|e| format!("link h264parse -> decoder: {:?}", e))?;
+
+    debug!(
+        "EFPSRT Input {}: {} decodes with {}",
+        instance_id,
+        pad_label,
         decoder
             .factory()
             .map(|f| f.name().to_string())
             .unwrap_or_default(),
-        identity.name()
     );
     Ok(())
 }
@@ -1256,5 +1327,73 @@ mod tests {
             }
             other => panic!("expected InvalidProperty, got {:?}", other),
         }
+    }
+
+    /// Decode `format` H.264 through the block's own decode chain
+    /// (`link_decoded_video`) and count the frames that reach its output.
+    fn frames_through_decode_chain(format: &str) -> Result<u64, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(&format!(
+            "videotestsrc num-buffers=10 ! \
+             video/x-raw,format={format},width=320,height=240,framerate=30/1 ! \
+             x264enc name=enc tune=zerolatency \
+             identity name=out ! fakesink sync=false"
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let encoder = pipeline.by_name("enc").unwrap();
+        let identity = pipeline.by_name("out").unwrap();
+        let frames = Arc::new(AtomicU64::new(0));
+        let counter = frames.clone();
+        identity
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        link_decoded_video(
+            &encoder,
+            &encoder.static_pad("src").unwrap(),
+            &identity,
+            "efp",
+        )?;
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let msg = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gst::ClockTime::from_seconds(20),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+            .ok_or("timed out")?;
+        pipeline.set_state(gst::State::Null).unwrap();
+        if let gst::MessageView::Error(e) = msg.view() {
+            return Err(format!("{} ({:?})", e.error(), e.debug()));
+        }
+        Ok(frames.load(Ordering::Relaxed))
+    }
+
+    /// A 4:2:2 10-bit stream (High 4:2:2) is decoded by a decoder that takes
+    /// it. NVDEC, VA and D3D advertise only the profiles their hardware has;
+    /// picked without the parsed caps, such a decoder fails with
+    /// not-negotiated.
+    #[test]
+    fn a_422_10_bit_stream_gets_a_decoder_that_takes_it() {
+        let frames = frames_through_decode_chain("I422_10LE").expect("decodes");
+        assert_eq!(frames, 10);
+    }
+
+    /// An ordinary 8-bit 4:2:0 stream still decodes, on the host's best
+    /// decoder for it.
+    #[test]
+    fn an_8_bit_420_stream_decodes() {
+        let frames = frames_through_decode_chain("I420").expect("decodes");
+        assert_eq!(frames, 10);
     }
 }
