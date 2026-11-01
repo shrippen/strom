@@ -541,6 +541,9 @@ impl ThumbnailTap {
         state.branch_elements.clear();
         state.tee_src_pad = None;
         state.active = false;
+        // The picture showed what the branch saw; without the branch it
+        // goes stale and would pass for a live one after the next attach.
+        state.cached_jpeg = None;
 
         debug!("Thumbnail branch deactivated for {}", self.name_prefix);
         Ok(())
@@ -608,4 +611,57 @@ use std::collections::HashMap;
 /// Create a new empty thumbnail tap store.
 pub fn new_tap_store() -> ThumbnailTapStore {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A picture belongs to the branch that made it. Once the branch is
+    /// detached the tee's frames go nowhere, so after the next attach the
+    /// old picture is no proof that anything still flows: a chain that
+    /// stopped meanwhile must answer Timeout, not its last frame from
+    /// before (a stalled lmix input looked live in its vm-check).
+    #[test]
+    fn test_reattached_tap_does_not_serve_a_picture_from_before() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! video/x-raw,width=320,height=180,framerate=30/1 ! \
+             tee name=t allow-not-linked=true ! queue ! fakesink sync=true",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let tee = pipeline.by_name("t").unwrap();
+        let tap =
+            ThumbnailTap::new_with_tee(&pipeline, "stale_test", tee.clone(), Default::default());
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut picture = tap.get_thumbnail();
+        while picture.is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            picture = tap.get_thumbnail();
+        }
+        assert!(picture.is_ok(), "no picture while the chain runs");
+
+        tap.deactivate_branch().unwrap();
+        // The chain stops: no frame reaches the tee any more.
+        tee.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, |_, _| gst::PadProbeReturn::Drop);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !tap.state.lock().unwrap().active && Instant::now() < deadline {
+            let _ = tap.get_thumbnail();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let picture = tap.get_thumbnail();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        assert!(
+            matches!(picture, Err(ThumbnailError::Timeout)),
+            "reattached tap answered {:?} without a new frame",
+            picture.map(|jpeg| jpeg.len())
+        );
+    }
 }
